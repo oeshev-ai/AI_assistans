@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -65,7 +66,7 @@ def test_sanitize_ignores_user_messages() -> None:
 
 
 def test_image_completion_text_uses_prompt() -> None:
-    messages = [
+    messages: list[dict[str, Any]] = [
         {
             "role": "tool",
             "tool_call_id": "call_1",
@@ -93,7 +94,7 @@ async def test_remember_model_turn_stores_tool_round_without_base64() -> None:
     await storage.append_message(
         1, AID, topic_id, {"role": "user", "content": "нарисуй кота"}, 50
     )
-    new_messages = [
+    new_messages: list[dict[str, Any]] = [
         {
             "role": "assistant",
             "content": "",

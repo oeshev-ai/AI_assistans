@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from history_storage import trim_messages
 
 
 def test_trim_does_not_start_with_orphan_tool() -> None:
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "user", "content": "нарисуй"},
         {
             "role": "assistant",
@@ -29,7 +31,7 @@ def test_trim_does_not_start_with_orphan_tool() -> None:
 
 
 def test_trim_keeps_latest_user_turn() -> None:
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "user", "content": "1"},
         {"role": "assistant", "content": "a"},
         {"role": "user", "content": "2"},
@@ -45,7 +47,7 @@ def test_trim_keeps_latest_user_turn() -> None:
 
 
 def test_trim_keeps_system_and_aligns_to_user() -> None:
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "draw"},
         {

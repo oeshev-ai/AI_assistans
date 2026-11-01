@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from typing import TypeVar
 
 import pytest
 import pytest_asyncio
@@ -16,6 +17,15 @@ from topic_history import (
     TopicHistoryStorage,
     TopicStorageError,
 )
+
+_T = TypeVar("_T")
+
+
+async def _await_redis(value: Awaitable[_T] | _T) -> _T:
+    """fakeredis/redis-py: ответ может быть и значением, и awaitable."""
+    if isinstance(value, Awaitable):
+        return await value
+    return value
 
 pytestmark = pytest.mark.asyncio
 
@@ -254,14 +264,18 @@ async def test_legacy_catalog_moves_to_the_reader(
 ) -> None:
     """Старый каталог чата забирает первая персона, которая его прочитала."""
     client = redis_storage._redis
-    await client.rpush(
-        "chat:10:topics",
-        json.dumps({"id": "abc", "name": "Старая"}, ensure_ascii=False),
+    await _await_redis(
+        client.rpush(
+            "chat:10:topics",
+            json.dumps({"id": "abc", "name": "Старая"}, ensure_ascii=False),
+        )
     )
-    await client.set("chat:10:active", "abc")
-    await client.rpush(
-        "chat:10:topic:abc:history",
-        json.dumps({"role": "user", "content": "привет"}, ensure_ascii=False),
+    await _await_redis(client.set("chat:10:active", "abc"))
+    await _await_redis(
+        client.rpush(
+            "chat:10:topic:abc:history",
+            json.dumps({"role": "user", "content": "привет"}, ensure_ascii=False),
+        )
     )
 
     topics = await redis_storage.list_topics(10, AID)
@@ -270,6 +284,6 @@ async def test_legacy_catalog_moves_to_the_reader(
     assert await redis_storage.get_history(10, AID, "abc") == [
         {"role": "user", "content": "привет"}
     ]
-    assert await client.get("chat:10:topics") is None
-    assert await client.lrange("chat:10:topic:abc:history", 0, -1) == []
+    assert await _await_redis(client.get("chat:10:topics")) is None
+    assert await _await_redis(client.lrange("chat:10:topic:abc:history", 0, -1)) == []
     assert await redis_storage.list_topics(10, OTHER) == []
