@@ -27,6 +27,7 @@ async def _await_redis(value: Awaitable[_T] | _T) -> _T:
         return await value
     return value
 
+
 pytestmark = pytest.mark.asyncio
 
 AID = "standard"
