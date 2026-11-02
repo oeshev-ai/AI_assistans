@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from assistant_storage import DEFAULT_SYSTEM_PROMPT, AssistantProfile
+from assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
 from bot import _should_send_voice_reply
 
 
 def _profile(mode: str) -> AssistantProfile:
     return AssistantProfile(
         name="Тест",
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=DEFAULT_PERSONA_PROMPT,
         voice_mode=mode,  # type: ignore[arg-type]
     )
 

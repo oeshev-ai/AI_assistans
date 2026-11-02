@@ -142,21 +142,24 @@ def _reasoning_piece(delta: dict[str, Any]) -> str:
     return ""
 
 
-def _assistant_stream_message(
+def _assistant_stream_tool_message(
     reasoning: str,
     content: str,
-    tool_calls: list[dict[str, Any]] | None,
+    tool_calls: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Сообщение ассистента для следующего запроса после потокового круга."""
-    payload: dict[str, Any] = {"role": "assistant"}
+    """Сообщение ассистента с tool_calls для следующего круга потока.
+
+    ``reasoning_content`` нужен DeepSeek: без него следующий запрос с tools
+    отвечает 400. В чат и в финальный ответ рассуждение не попадает.
+    """
+    payload: dict[str, Any] = {
+        "role": "assistant",
+        "tool_calls": tool_calls,
+    }
     if reasoning:
         payload["reasoning_content"] = reasoning
-    if tool_calls:
-        payload["tool_calls"] = tool_calls
-        if content:
-            payload["content"] = content
-        return payload
-    payload["content"] = content
+    if content:
+        payload["content"] = content
     return payload
 
 
@@ -246,7 +249,7 @@ class AssistAIConfig(BaseModel):
     openweather_api_key: str = Field(default="", repr=False)
     exchangerate_api_key: str = Field(default="", repr=False)
     base_url: str = "https://api.proxyapi.ru/v1"
-    default_text_model: str = "openai/gpt-4o"
+    default_text_model: str = "qwen/qwen3.8-flash"
     default_image_model: str = "openai/gpt-image-1-mini"
     default_transcribe_model: str = "openai/whisper-1"
     default_tts_model: str = "openai/gpt-4o-mini-tts"
@@ -1000,6 +1003,8 @@ _FLUX_ASPECTS: tuple[tuple[int, int], ...] = (
     (9, 21),
 )
 _PIXEL_SIZE = re.compile(r"(\d+)\s*[xX×]\s*(\d+)")
+_ASPECT_RATIO = re.compile(r"^(\d+)\s*:\s*(\d+)$")
+ImageModelFamily = Literal["openai", "flux", "qwen", "seedream", "recraft"]
 
 
 class ImageModelScope:
@@ -1082,9 +1087,10 @@ class GenerateImageTool(BaseTool):
                 "size": {
                     "type": "string",
                     "description": (
-                        "Размер. Для OpenAI — пиксели, например 1024x1024. "
-                        "Для FLUX пиксели автоматически становятся ярусом "
-                        "768, 1K, 1.5K, 2K или 4K. По умолчанию 1024x1024."
+                        "Размер. OpenAI — пиксели (1024x1024). "
+                        "FLUX/Seedream — ярус 1K или 2K (пиксели тоже принимаются). "
+                        "Qwen/Recraft — соотношение сторон 1:1, 16:9, 9:16. "
+                        "По умолчанию 1024x1024."
                     ),
                 },
             },
@@ -1169,10 +1175,23 @@ class GenerateImageTool(BaseTool):
         )
 
 
+def image_model_family(model: str) -> ImageModelFamily:
+    """Семейство image-модели: от него зависит формат размера в запросе."""
+    lowered = model.casefold()
+    if "flux" in lowered or "black-forest" in lowered:
+        return "flux"
+    if "qwen-image" in lowered:
+        return "qwen"
+    if "seedream" in lowered or "bytedance-seed" in lowered:
+        return "seedream"
+    if "recraft" in lowered:
+        return "recraft"
+    return "openai"
+
+
 def _is_flux_model(model: str) -> bool:
     """FLUX не принимает пиксельный ``size`` вроде ``1024x1024``."""
-    lowered = model.lower()
-    return "flux" in lowered or "black-forest" in lowered
+    return image_model_family(model) == "flux"
 
 
 def _snap_aspect_ratio(width: int, height: int) -> str:
@@ -1187,21 +1206,22 @@ def _snap_aspect_ratio(width: int, height: int) -> str:
     return f"{numer}:{denom}"
 
 
-def _image_generation_body(model: str, prompt: str, size: str) -> dict[str, Any]:
-    """Тело ``images/generations``. Для FLUX пиксели становятся ярусом разрешения."""
-    fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
-    cleaned = size.strip()
-    if not _is_flux_model(model):
-        fields["size"] = cleaned
-        return fields
+def _normalize_aspect_ratio(value: str) -> str | None:
+    """``16:9`` / ``16 : 9`` → ``16:9``. Иначе ``None``."""
+    match = _ASPECT_RATIO.fullmatch(value.strip())
+    if match is None:
+        return None
+    return f"{int(match.group(1))}:{int(match.group(2))}"
+
+
+def _flux_size_fields(cleaned: str) -> dict[str, Any]:
+    """Ярус FLUX и при необходимости ``aspect_ratio`` из пикселей."""
     known = _FLUX_TIER_NAMES.get(cleaned.upper())
     if known is not None:
-        fields["size"] = known
-        return fields
+        return {"size": known}
     match = _PIXEL_SIZE.fullmatch(cleaned)
     if match is None:
-        fields["size"] = cleaned
-        return fields
+        return {"size": cleaned}
     width = int(match.group(1))
     height = int(match.group(2))
     long_side = max(width, height)
@@ -1209,10 +1229,80 @@ def _image_generation_body(model: str, prompt: str, size: str) -> dict[str, Any]
         _FLUX_SIZE_TIERS,
         key=lambda item: (abs(item[0] - long_side), item[0]),
     )[1]
-    fields["size"] = tier
+    fields: dict[str, Any] = {"size": tier}
     ratio = _snap_aspect_ratio(width, height)
     if ratio != "1:1":
         fields["aspect_ratio"] = ratio
+    return fields
+
+
+def _qwen_size_fields(cleaned: str) -> dict[str, Any]:
+    """Qwen: ``aspect_ratio``, пиксели дополнительно как ``size``."""
+    aspect = _normalize_aspect_ratio(cleaned)
+    if aspect is not None:
+        return {"aspect_ratio": aspect}
+    match = _PIXEL_SIZE.fullmatch(cleaned)
+    if match is not None:
+        width = int(match.group(1))
+        height = int(match.group(2))
+        return {
+            "aspect_ratio": _snap_aspect_ratio(width, height),
+            "size": f"{width}x{height}",
+        }
+    known = _FLUX_TIER_NAMES.get(cleaned.upper())
+    if known is not None:
+        return {"aspect_ratio": "1:1"}
+    return {"aspect_ratio": cleaned}
+
+
+def _seedream_size_fields(cleaned: str) -> dict[str, Any]:
+    """Seedream: ``size_preset`` или ``width``/``height``, не OpenAI ``size``."""
+    known = _FLUX_TIER_NAMES.get(cleaned.upper())
+    if known is not None:
+        return {"size_preset": known}
+    match = _PIXEL_SIZE.fullmatch(cleaned)
+    if match is not None:
+        return {
+            "width": int(match.group(1)),
+            "height": int(match.group(2)),
+        }
+    aspect = _normalize_aspect_ratio(cleaned)
+    if aspect is not None:
+        return {"size_preset": "1K", "aspect_ratio": aspect}
+    return {"size_preset": cleaned}
+
+
+def _recraft_size_fields(cleaned: str) -> dict[str, Any]:
+    """Recraft предпочитает ``size`` как ``w:h``; пиксели сводим к соотношению."""
+    aspect = _normalize_aspect_ratio(cleaned)
+    if aspect is not None:
+        return {"size": aspect}
+    match = _PIXEL_SIZE.fullmatch(cleaned)
+    if match is not None:
+        return {
+            "size": _snap_aspect_ratio(int(match.group(1)), int(match.group(2))),
+        }
+    return {"size": cleaned}
+
+
+def _image_generation_body(model: str, prompt: str, size: str) -> dict[str, Any]:
+    """Тело ``images/generations`` с учётом семейства модели."""
+    fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
+    cleaned = size.strip()
+    family = image_model_family(model)
+    if family == "openai":
+        fields["size"] = cleaned
+        return fields
+    if family == "flux":
+        fields.update(_flux_size_fields(cleaned))
+        return fields
+    if family == "qwen":
+        fields.update(_qwen_size_fields(cleaned))
+        return fields
+    if family == "seedream":
+        fields.update(_seedream_size_fields(cleaned))
+        return fields
+    fields.update(_recraft_size_fields(cleaned))
     return fields
 
 
@@ -1440,12 +1530,13 @@ class AssistAIClient:
         """Потоковый диалог с теми же инструментами, что и ``chat_completion``.
 
         В запрос добавляется ``stream: true``. Наружу выходят только текст
-        ответа и отметки об инструментах. Куски рассуждения в поток не попадают.
+        ответа и отметки об инструментах. Куски рассуждения в поток и в
+        финальное сообщение ассистента не попадают.
 
         Вызовы инструментов собираются из ``delta.tool_calls`` и выполняются
-        после закрытия потока. Для DeepSeek рассуждение сохраняется в истории
-        запроса как ``reasoning_content``: при включённых tools его нужно
-        вернуть в следующем круге, иначе сервис отвечает 400.
+        после закрытия потока. Для DeepSeek рассуждение сохраняется только
+        во внутренних tool-кругах как ``reasoning_content``: без него
+        следующий запрос с tools отвечает 400.
 
         Таймаут чтения не короче 180 секунд. Соединение ограничено ``config.timeout``.
 
@@ -1533,7 +1624,9 @@ class AssistAIClient:
                 names = ", ".join(call["function"]["name"] for call in tool_calls)
                 logger.info("Модель запросила инструменты: %s", names)
                 messages.append(
-                    _assistant_stream_message(reasoning_text, content_text, tool_calls)
+                    _assistant_stream_tool_message(
+                        reasoning_text, content_text, tool_calls
+                    )
                 )
                 results = await asyncio.gather(
                     *(self._execute_registered_tool(call) for call in tool_calls)
@@ -1563,9 +1656,7 @@ class AssistAIClient:
                     )
                 continue
 
-            messages.append(
-                _assistant_stream_message(reasoning_text, content_text, None)
-            )
+            messages.append({"role": "assistant", "content": content_text})
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,
@@ -1596,8 +1687,8 @@ class AssistAIClient:
         Args:
             prompt: Текстовое описание изображения.
             model: Модель генерации. По умолчанию ``default_image_model``.
-            size: Размер. Для OpenAI — пиксели, например ``1024x1024``.
-                Для FLUX пиксели переводятся в ярус ``1K`` и соседние.
+            size: Размер в формате семейства модели (пиксели, ярус или ``w:h``).
+                Преобразование в поля запроса делает ``_image_generation_body``.
 
         Returns:
             Список URL или base64-строк, по одному элементу на картинку.
@@ -1615,10 +1706,16 @@ class AssistAIClient:
         payload = _image_generation_body(selected_model, prompt, size.strip())
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        size_label = (
+            payload.get("size")
+            or payload.get("size_preset")
+            or payload.get("aspect_ratio")
+            or size.strip()
+        )
         logger.info(
             "generate_image: модель=%s, size=%s, символов в prompt=%s",
             selected_model,
-            payload.get("size"),
+            size_label,
             len(prompt),
         )
         data = await self._post_json(_IMAGES_PATH, payload, timeout=timeout)

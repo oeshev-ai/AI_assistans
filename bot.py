@@ -48,13 +48,20 @@ from aiogram.types import (
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from Assist_ai import AssistAIClient, AssistAIConfig, AssistAIError, ImageModelScope
+from Assist_ai import (
+    AssistAIClient,
+    AssistAIConfig,
+    AssistAIError,
+    ImageModelScope,
+    image_model_family,
+)
 from assistant_storage import (
     DEFAULT_ASSISTANT_ID,
     DEFAULT_ASSISTANT_NAME,
     AssistantProfile,
     AssistantStorage,
     AssistantStorageError,
+    compose_system_prompt,
     create_assistant_storage,
 )
 from history_storage import RedisConfig
@@ -64,6 +71,16 @@ from topic_history import (
     TopicHistoryStorage,
     TopicStorageError,
     create_topic_storage,
+)
+from vision import (
+    MAX_IMAGE_SIZE_MB,
+    VisionError,
+    build_image_content,
+    build_multimodal_content,
+    download_telegram_file,
+    ensure_within_size_limit,
+    extract_image_from_message,
+    process_pdf,
 )
 
 logging.basicConfig(
@@ -79,12 +96,13 @@ WELCOME = (
     "Привет. Я ассистент: отвечаю на обычные вопросы и умею получать актуальные данные.\n\n"
     "Погода: текущая, прогноз, качество воздуха, сравнение городов.\n"
     "Валюты: конвертация суммы из одной валюты в другую.\n"
-    "Изображения: генерация по текстовому описанию.\n\n"
+    "Изображения: генерация по текстовому описанию.\n"
+    "Фото и документы: отправьте фото или PDF — я проанализирую содержимое.\n\n"
     "🎤 Голосовые сообщения:\n"
     "Отправьте голосовое — я распознаю речь и отвечу.\n"
     "Если у персоны включён голосовой режим, ответ будет также озвучен.\n\n"
     "🎙 Настройки голоса:\n"
-    "Откройте настройки персоны и выберите режим: off / auto / always.\n"
+    "Откройте настройки → «Голосовой ответ»: выкл / авто / всегда.\n"
     "Команда /voice открывает те же настройки.\n\n"
     "Команды:\n"
     "/assistants — персоны и кнопка «Использовать»\n"
@@ -125,13 +143,12 @@ MAIN_MENU_TEXT = {
     "settings": "⚙️ Настройки",
 }
 _OPENAI_IMAGE_SIZES: tuple[str, ...] = ("1024x1024", "1024x1792", "1792x1024")
-_FLUX_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K")
+_TIER_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K")
+_ASPECT_IMAGE_SIZES: tuple[str, ...] = ("1:1", "16:9", "9:16")
 IMAGE_SIZES: tuple[str, ...] = (
-    "1024x1024",
-    "1024x1792",
-    "1792x1024",
-    "1K",
-    "2K",
+    *_OPENAI_IMAGE_SIZES,
+    *_TIER_IMAGE_SIZES,
+    *_ASPECT_IMAGE_SIZES,
 )
 _FLOW_KEYS = (
     "flow_name",
@@ -160,6 +177,11 @@ _SCREEN_KEYS = (
     _SCREEN_PICKER,
     _SCREEN_IMAGE,
 )
+_VOICE_MODE_LABELS: dict[str, str] = {
+    "off": "выкл",
+    "auto": "авто",
+    "always": "всегда",
+}
 
 
 class NewAssistantSG(StatesGroup):
@@ -171,8 +193,9 @@ class NewAssistantSG(StatesGroup):
 
 
 class EditAssistantSG(StatesGroup):
-    """Ввод нового системного промпта существующей персоны."""
+    """Правка имени или системного промпта существующей персоны."""
 
+    name = State()
     prompt = State()
 
 
@@ -247,20 +270,23 @@ def _reply_menu(assistant_name: str, topic_name: str) -> ReplyKeyboardMarkup:
     )
 
 
-def _is_flux_image_model(model_id: str) -> bool:
-    """FLUX просит ярус разрешения, остальные модели из каталога — пиксели."""
-    folded = model_id.casefold()
-    return "flux" in folded or "black-forest" in folded
-
-
 def _size_choices(model_id: str) -> tuple[str, ...]:
-    if _is_flux_image_model(model_id):
-        return _FLUX_IMAGE_SIZES
+    """Кнопки размера зависят от семейства image-модели."""
+    family = image_model_family(model_id)
+    if family in {"flux", "seedream"}:
+        return _TIER_IMAGE_SIZES
+    if family in {"qwen", "recraft"}:
+        return _ASPECT_IMAGE_SIZES
     return _OPENAI_IMAGE_SIZES
 
 
 def _default_image_size(model_id: str) -> str:
-    return "1K" if _is_flux_image_model(model_id) else "1024x1024"
+    family = image_model_family(model_id)
+    if family in {"flux", "seedream"}:
+        return "1K"
+    if family in {"qwen", "recraft"}:
+        return "1:1"
+    return "1024x1024"
 
 
 def _display_image_size(profile: AssistantProfile, assistant: AssistAIClient) -> str:
@@ -344,7 +370,54 @@ async def _prepare_messages(
         await storage.clear_topic(chat_id, assistant_id, topic_id)
         for item in dialog:
             await storage.append_message(chat_id, assistant_id, topic_id, item, limit)
-    return [{"role": "system", "content": profile.system_prompt}, *dialog]
+    return [
+        {"role": "system", "content": compose_system_prompt(profile.system_prompt)},
+        *dialog,
+    ]
+
+
+async def _prepare_messages_with_image(
+    chat_id: int,
+    assistant_id: str,
+    multimodal_content: list[dict[str, Any]],
+    history_placeholder: str,
+    topic_id: str,
+    storage: TopicHistoryStorage,
+    profile: AssistantProfile,
+) -> list[dict[str, Any]]:
+    """Пишет текстовый заменитель в тему, а в модель отдаёт multimodal user."""
+    limit = storage.max_length
+    await storage.append_message(
+        chat_id,
+        assistant_id,
+        topic_id,
+        {"role": "user", "content": history_placeholder},
+        limit,
+    )
+    stored = await storage.get_history(chat_id, assistant_id, topic_id)
+    dialog = [dict(item) for item in stored if item.get("role") != "system"]
+    if len(dialog) != len(stored):
+        await storage.clear_topic(chat_id, assistant_id, topic_id)
+        for item in dialog:
+            await storage.append_message(chat_id, assistant_id, topic_id, item, limit)
+    prior = dialog[:-1] if dialog else []
+    return [
+        {
+            "role": "system",
+            "content": compose_system_prompt(profile.system_prompt),
+        },
+        *prior,
+        {"role": "user", "content": multimodal_content},
+    ]
+
+
+def _vision_model_of(profile: AssistantProfile, assistant: AssistAIClient) -> str:
+    """Модель анализа картинок: vision → text → дефолт клиента."""
+    return (
+        profile.vision_model
+        or profile.text_model
+        or assistant.config.default_text_model
+    )
 
 
 def _compact_tool_content(content: str) -> str:
@@ -734,17 +807,34 @@ async def cmd_start(
 async def cmd_cancel(
     message: Message,
     state: FSMContext,
+    assistant: AssistAIClient,
     assistant_storage: AssistantStorage,
     topic_storage: TopicHistoryStorage,
 ) -> None:
     """Сбрасывает текущий пошаговый ввод. Без шага отвечает, что отменять нечего."""
     menu = await _menu_for(message.chat.id, assistant_storage, topic_storage)
-    if await state.get_state() is None:
+    current = await state.get_state()
+    if current is None:
         await _apply_reply_menu(message, menu, state)
         await message.answer("Нечего отменять.")
         return
+    return_to_settings = current in {
+        EditAssistantSG.name.state,
+        EditAssistantSG.prompt.state,
+        NewAssistantSG.name.state,
+        NewAssistantSG.prompt.state,
+        NewAssistantSG.models.state,
+    }
+    return_to_topics = current in {
+        RenameTopicSG.name.state,
+        NewTopicSG.name.state,
+    }
     await _reset_flow(state)
     await _apply_reply_menu(message, menu, state)
+    if return_to_settings:
+        await _open_settings(message, assistant, assistant_storage, state)
+    elif return_to_topics:
+        await _open_topics(message, topic_storage, assistant_storage, state)
 
 
 async def cmd_unknown(message: Message) -> None:
@@ -1247,6 +1337,266 @@ async def handle_video_note_stub(message: Message) -> None:
     )
 
 
+async def _process_vision_message(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+    *,
+    multimodal_content: list[dict[str, Any]],
+    history_placeholder: str,
+    status_text: str = "Анализирую изображение…",
+) -> None:
+    """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
+    chat_id = message.chat.id
+    try:
+        profile = await _active_profile(chat_id, assistant_storage)
+        topic_id = await _active_topic(chat_id, profile.id, topic_storage)
+        history_copy = await _prepare_messages_with_image(
+            chat_id,
+            profile.id,
+            multimodal_content,
+            history_placeholder,
+            topic_id,
+            topic_storage,
+            profile,
+        )
+    except AssistantStorageError:
+        await _reply_profile_error(message)
+        return
+    except TopicStorageError:
+        await _reply_history_error(message)
+        return
+    vision_model = _vision_model_of(profile, assistant)
+    logger.info(
+        "Vision, chat_id=%s topic_id=%s, модель=%s, сообщений в запросе=%s",
+        chat_id,
+        topic_id,
+        vision_model,
+        len(history_copy),
+    )
+    keep: Token[bool] | None = _KEEP_OUTGOING.set(True)
+    status = await message.answer(status_text)
+    parts: list[str] = []
+    shown = ""
+    last_edit = 0.0
+    scope = ImageModelScope(profile.image_model, profile.image_size)
+    turn_start = len(history_copy)
+    try:
+        if message.bot is not None:
+            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        with scope:
+            async for delta in assistant.stream_chat(
+                messages=history_copy, model=vision_model
+            ):
+                if delta.kind != "content" or not delta.text:
+                    continue
+                parts.append(delta.text)
+                now = asyncio.get_running_loop().time()
+                if now - last_edit < STREAM_EDIT_INTERVAL:
+                    continue
+                shown = await _edit_stream(status, "".join(parts), shown)
+                last_edit = now
+        answer = "".join(parts).strip()
+        images = scope.images
+        if not answer and not images:
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            await _edit_stream(status, "Пустой ответ.", shown)
+            keep = _release_outgoing(keep)
+            await _append_chrome(state, [status.message_id])
+            return
+        if answer:
+            visible = await _edit_stream(status, answer, shown)
+            head = answer[:TELEGRAM_TEXT_LIMIT]
+            if visible == head:
+                await _send_overflow(message, answer)
+            else:
+                await _send_text(message, answer)
+        else:
+            await _delete_bot_message(status)
+        keep = _release_outgoing(keep)
+        try:
+            await _remember_model_turn(
+                chat_id,
+                profile.id,
+                topic_id,
+                topic_storage,
+                history_copy[turn_start:],
+                answer=answer,
+                images=images,
+            )
+        except TopicStorageError:
+            fallback = answer.strip()
+            if not fallback and images:
+                fallback = _image_completion_text(
+                    history_copy[turn_start:], len(images)
+                )
+            if fallback:
+                try:
+                    await topic_storage.append_message(
+                        chat_id,
+                        profile.id,
+                        topic_id,
+                        {"role": "assistant", "content": fallback},
+                        topic_storage.max_length,
+                    )
+                except TopicStorageError:
+                    await _reply_history_error(message)
+            else:
+                await _reply_history_error(message)
+        await _send_extracted_images(message, images)
+        logger.info(
+            "Vision-ответ, chat_id=%s topic_id=%s, символов=%s, картинок=%s",
+            chat_id,
+            topic_id,
+            len(answer),
+            len(images),
+        )
+        if answer and _should_send_voice_reply(profile, "text"):
+            await _send_voice_reply(message, assistant, profile, answer)
+    except (AssistAIError, httpx.TimeoutException) as exc:
+        keep = _release_outgoing(keep)
+        await _send_extracted_images(message, scope.images)
+        _log_handler_error(exc)
+        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+        await _report_stream_error(message, status, parts, _public_error(exc), state)
+    except Exception as exc:  # noqa: BLE001
+        keep = _release_outgoing(keep)
+        await _send_extracted_images(message, scope.images)
+        _log_handler_error(exc)
+        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+        await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
+    finally:
+        _release_outgoing(keep)
+
+
+async def handle_photo(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Анализирует фото через multimodal stream_chat."""
+    if not message.photo:
+        return
+    if await state.get_state() is not None:
+        return
+    bot = message.bot
+    if bot is None:
+        await message.answer("Не удалось загрузить файл")
+        return
+    largest = message.photo[-1]
+    if (
+        largest.file_size is not None
+        and largest.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024
+    ):
+        await message.answer(
+            f"Файл слишком большой. Максимум — {MAX_IMAGE_SIZE_MB} МБ."
+        )
+        return
+    try:
+        data = await download_telegram_file(bot, largest.file_id)
+        ensure_within_size_limit(data, label="Фото")
+        logger.info(
+            "Фото, chat_id=%s size=%s",
+            message.chat.id,
+            len(data),
+        )
+        image_part = build_image_content(data, "image/jpeg")
+        caption = message.caption or ""
+        multimodal = build_multimodal_content(caption, [image_part])
+        placeholder = f"[Изображение: {caption.strip() or 'без подписи'}]"
+    except VisionError as exc:
+        await message.answer(exc.message)
+        return
+    await _process_vision_message(
+        message,
+        assistant,
+        topic_storage,
+        assistant_storage,
+        state,
+        multimodal_content=multimodal,
+        history_placeholder=placeholder,
+    )
+
+
+async def handle_document(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Анализирует документ-картинку или первые страницы PDF."""
+    if await state.get_state() is not None:
+        return
+    extracted = extract_image_from_message(message)
+    if isinstance(extracted, str):
+        await message.answer(extracted)
+        return
+    file_id, mime, file_name = extracted
+    bot = message.bot
+    if bot is None:
+        await message.answer("Не удалось загрузить файл")
+        return
+    document = message.document
+    if (
+        document is not None
+        and document.file_size is not None
+        and document.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024
+    ):
+        await message.answer(
+            f"Файл слишком большой. Максимум — {MAX_IMAGE_SIZE_MB} МБ."
+        )
+        return
+    try:
+        data = await download_telegram_file(bot, file_id)
+        ensure_within_size_limit(data, label="Файл")
+        caption = message.caption or ""
+        if mime == "application/pdf":
+            pages = process_pdf(data)
+            logger.info(
+                "PDF, chat_id=%s name=%s size=%s pages=%s",
+                message.chat.id,
+                file_name,
+                len(data),
+                len(pages),
+            )
+            image_parts = [build_image_content(page, "image/png") for page in pages]
+            multimodal = build_multimodal_content(caption, image_parts)
+            placeholder = f"[Документ: {file_name}, {len(pages)} стр.]"
+            status_text = "Анализирую документ…"
+        else:
+            logger.info(
+                "Документ-картинка, chat_id=%s name=%s mime=%s size=%s",
+                message.chat.id,
+                file_name,
+                mime,
+                len(data),
+            )
+            image_parts = [build_image_content(data, mime)]
+            multimodal = build_multimodal_content(caption, image_parts)
+            placeholder = (
+                f"[Изображение: {caption.strip() or file_name or 'без подписи'}]"
+            )
+            status_text = "Анализирую изображение…"
+    except VisionError as exc:
+        await message.answer(exc.message)
+        return
+    await _process_vision_message(
+        message,
+        assistant,
+        topic_storage,
+        assistant_storage,
+        state,
+        multimodal_content=multimodal,
+        history_placeholder=placeholder,
+        status_text=status_text,
+    )
+
+
 async def _rollback_user(
     chat_id: int,
     assistant_id: str,
@@ -1290,15 +1640,25 @@ def _parse_create_args(raw: str) -> tuple[str, str] | str:
     return parts[0], " ".join(parts[1:])
 
 
-def _model_keyboard(models: tuple[str, ...], prefix: str) -> InlineKeyboardMarkup:
-    """Кнопки моделей и сброс на дефолт клиента. В callback кладётся индекс, не имя."""
+def _model_keyboard(
+    models: tuple[str, ...],
+    prefix: str,
+    *,
+    include_default: bool = True,
+) -> InlineKeyboardMarkup:
+    """Кнопки моделей. В callback кладётся индекс, не имя."""
     rows = [
         [InlineKeyboardButton(text=model, callback_data=f"{prefix}:{index}")]
         for index, model in enumerate(models)
     ]
-    rows.append(
-        [InlineKeyboardButton(text="По умолчанию", callback_data=f"{prefix}:default")]
-    )
+    if include_default:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="По умолчанию", callback_data=f"{prefix}:default"
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1500,7 +1860,7 @@ async def _apply_model_choice(
             old_model = _image_model_of(profile, assistant)
             new_model = selected or assistant.config.default_image_model
             fields: dict[str, Any] = {"image_model": selected}
-            if _is_flux_image_model(old_model) != _is_flux_image_model(new_model):
+            if image_model_family(old_model) != image_model_family(new_model):
                 fields["image_size"] = _default_image_size(new_model)
             updated = profile.model_copy(update=fields)
         else:
@@ -1510,6 +1870,10 @@ async def _apply_model_choice(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer("Модель обновлена")
+    if kind == "image":
+        text, markup = _model_picker_parts(updated, assistant, "image")
+        await _edit_inline(message, text, markup)
+        return
     await _return_to_settings(message, state, updated, assistant)
 
 
@@ -1707,6 +2071,38 @@ async def _sweep_chrome(
     await state.set_data(refreshed)
 
 
+async def _cleanup_wizard_ui(
+    message: Message,
+    state: FSMContext,
+    assistant_storage: AssistantStorage,
+    topic_storage: TopicHistoryStorage,
+    *,
+    also_delete: list[int] | None = None,
+) -> None:
+    """Сразу убирает UI мастера. Нужно после шагов, которые заканчиваются callback.
+
+    Обычная очистка срабатывает только на Message; «Готово» при создании
+    персоны — callback, поэтому экран моделей иначе остаётся в чате.
+    """
+    stored = await state.get_data()
+    merged: list[int] = []
+    raw_ids = stored.get(_CHROME)
+    if isinstance(raw_ids, list):
+        merged.extend(item for item in raw_ids if isinstance(item, int))
+    for item in also_delete or []:
+        if item not in merged:
+            merged.append(item)
+    await state.update_data({_CHROME: merged})
+    await _sweep_chrome(
+        message,
+        state,
+        {
+            "assistant_storage": assistant_storage,
+            "topic_storage": topic_storage,
+        },
+    )
+
+
 async def _drop_user_noise(message: Message, state: FSMContext) -> None:
     """Убирает команды, нажатия меню и шаги мастера. Вопрос к персоне остаётся."""
     text = message.text or ""
@@ -1735,6 +2131,16 @@ class _CleanChat(BaseMiddleware):
         token = _CHROME_BUCKET.set(bucket)
         try:
             if isinstance(event, Message) and isinstance(state, FSMContext):
+                current = await state.get_state()
+                if current is not None and (event.photo or event.document):
+                    keep = _KEEP_OUTGOING.set(True)
+                    try:
+                        await event.answer(
+                            "Сначала завершите текущий шаг или нажмите /cancel."
+                        )
+                    finally:
+                        _release_outgoing(keep)
+                    return None
                 await _sweep_chrome(event, state, data)
                 await _drop_user_noise(event, state)
             return await handler(event, data)
@@ -1987,15 +2393,43 @@ def _model_picker_parts(
         current = _chosen_model_line(
             profile.image_model, assistant.config.default_image_model
         )
-        title = "Модель изображений"
-        keyboard = _model_keyboard(AVAILABLE_IMAGE_MODELS, "set_image")
-    else:
-        current = _chosen_model_line(
-            profile.text_model, assistant.config.default_text_model
+        shown_size = _display_image_size(profile, assistant)
+        image_model = _image_model_of(profile, assistant)
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, model in enumerate(AVAILABLE_IMAGE_MODELS):
+            mark = "✅ " if image_model == model else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=_clip_label(mark, model),
+                        callback_data=f"set_image:{index}",
+                    )
+                ]
+            )
+        size_row: list[InlineKeyboardButton] = []
+        for item in _size_choices(image_model):
+            mark = "✅ " if item == shown_size else ""
+            size_row.append(
+                InlineKeyboardButton(
+                    text=f"{mark}{item}", callback_data=f"set_size:{item}"
+                )
+            )
+        rows.append(size_row)
+        rows.append([InlineKeyboardButton(text="Готово", callback_data="picker:done")])
+        text = (
+            f"Модель картинок ассистента «{profile.name}»:\n"
+            f"{current}\n"
+            f"Размер: {shown_size}\n\n"
+            "Выберите модель или размер:"
         )
-        title = "Текстовая модель"
-        keyboard = _model_keyboard(AVAILABLE_TEXT_MODELS, "set_text")
-    text = f"{title} ассистента «{profile.name}»:\n{current}\n\nВыберите модель:"
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    current = _chosen_model_line(
+        profile.text_model, assistant.config.default_text_model
+    )
+    keyboard = _model_keyboard(AVAILABLE_TEXT_MODELS, "set_text")
+    text = (
+        f"Текстовая модель ассистента «{profile.name}»:\n{current}\n\nВыберите модель:"
+    )
     return text, keyboard
 
 
@@ -2007,9 +2441,10 @@ def _voice_settings_lines(
     tts_voice = profile.tts_voice or assistant.config.default_tts_voice
     tts_format = profile.tts_format or assistant.config.default_tts_format
     stt_language = profile.stt_language or "авто"
+    mode_label = _VOICE_MODE_LABELS.get(profile.voice_mode, profile.voice_mode)
     return [
         "🎙 Голос:",
-        f"Режим: {profile.voice_mode}",
+        f"Режим: {mode_label}",
         f"TTS модель: {tts_model}",
         f"Голос: {tts_voice}",
         f"Формат: {tts_format}",
@@ -2017,44 +2452,23 @@ def _voice_settings_lines(
     ]
 
 
-def _settings_view(
+def _voice_view(
     profile: AssistantProfile, assistant: AssistAIClient
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Настройки только активной персоны: модели, размер, голос, промпт."""
-    image_model = _image_model_of(profile, assistant)
-    shown_size = _display_image_size(profile, assistant)
+    """Экран голосового ответа: режим, голос TTS, язык STT."""
     lines = [
-        f"Текущая персона: ✅ {profile.name}",
-        (
-            "Текстовая модель: "
-            f"{_chosen_model_line(profile.text_model, assistant.config.default_text_model)}"
-        ),
-        (
-            "Модель картинок: "
-            f"{_chosen_model_line(profile.image_model, assistant.config.default_image_model)}"
-        ),
-        f"Размер картинки: {shown_size}",
+        f"Голосовой ответ — «{profile.name}»",
         "",
         *_voice_settings_lines(profile, assistant),
     ]
     text = "\n".join(lines)
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="Текстовая модель", callback_data="set_text_menu")],
-        [InlineKeyboardButton(text="Модель картинок", callback_data="set_image_menu")],
-    ]
-    size_row: list[InlineKeyboardButton] = []
-    for item in _size_choices(image_model):
-        mark = "✅ " if item == shown_size else ""
-        size_row.append(
-            InlineKeyboardButton(text=f"{mark}{item}", callback_data=f"set_size:{item}")
-        )
-    rows.append(size_row)
+    rows: list[list[InlineKeyboardButton]] = []
     mode_row: list[InlineKeyboardButton] = []
     for mode in ("off", "auto", "always"):
         mark = "✅ " if profile.voice_mode == mode else ""
         mode_row.append(
             InlineKeyboardButton(
-                text=f"{mark}🎙 {mode}",
+                text=f"{mark}{_VOICE_MODE_LABELS[mode]}",
                 callback_data=f"voice_mode:{mode}",
             )
         )
@@ -2080,27 +2494,80 @@ def _settings_view(
             )
         )
     rows.append(lang_row)
-    rows.append(
+    rows.append([InlineKeyboardButton(text="Готово", callback_data="settings:open")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _settings_view(
+    profile: AssistantProfile, assistant: AssistAIClient
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Настройки активной персоны: имя, промпт, модели, голос."""
+    shown_size = _display_image_size(profile, assistant)
+    mode_label = _VOICE_MODE_LABELS.get(profile.voice_mode, profile.voice_mode)
+    lines = [
+        f"Текущая персона: ✅ {profile.name}",
+        (
+            "Текстовая модель: "
+            f"{_chosen_model_line(profile.text_model, assistant.config.default_text_model)}"
+        ),
+        (
+            "Модель картинок: "
+            f"{_chosen_model_line(profile.image_model, assistant.config.default_image_model)}"
+        ),
+        f"Размер картинки: {shown_size}",
+        f"Голосовой ответ: {mode_label}",
+    ]
+    text = "\n".join(lines)
+    rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="Редактировать промпт",
+                text="Изменить имя",
+                callback_data=f"asst_rename:{profile.id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Изменить промпт",
                 callback_data=f"asst_edit:{profile.id}",
             )
-        ]
-    )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Выбрать текстовую модель",
+                callback_data="set_text_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Выбрать модель картинок",
+                callback_data="set_image_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Голосовой ответ",
+                callback_data="voice_menu",
+            )
+        ],
+    ]
     if profile.id != DEFAULT_ASSISTANT_ID:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Удалить персону",
+                    text="Удалить ассистента",
                     callback_data=f"asst:del_ask:{profile.id}",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="Новая персона", callback_data="asst:new")])
     rows.append(
-        [InlineKeyboardButton(text="Закрыть настройки", callback_data="settings:close")]
+        [
+            InlineKeyboardButton(
+                text="Создать нового ассистента",
+                callback_data="asst:new",
+            )
+        ]
     )
+    rows.append([InlineKeyboardButton(text="Готово", callback_data="settings:close")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2279,6 +2746,22 @@ async def on_menu_topics(
     await _open_topics(message, topic_storage, assistant_storage, state)
 
 
+async def _open_settings(
+    message: Message,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Открывает или обновляет экран настроек активной персоны."""
+    try:
+        profile = await _active_profile(message.chat.id, assistant_storage)
+    except AssistantStorageError:
+        await _reply_profile_error(message)
+        return
+    text, markup = _settings_view(profile, assistant)
+    await _upsert_screen(message, state, _SCREEN_SETTINGS, text, markup)
+
+
 async def on_menu_settings(
     message: Message,
     assistant: AssistAIClient,
@@ -2287,13 +2770,7 @@ async def on_menu_settings(
 ) -> None:
     """Кнопка «Настройки» показывает модели активной персоны."""
     await _drop_flow(state)
-    try:
-        profile = await _active_profile(message.chat.id, assistant_storage)
-    except AssistantStorageError:
-        await _reply_profile_error(message)
-        return
-    text, markup = _settings_view(profile, assistant)
-    await _upsert_screen(message, state, _SCREEN_SETTINGS, text, markup)
+    await _open_settings(message, assistant, assistant_storage, state)
 
 
 async def on_menu_image(
@@ -2392,6 +2869,74 @@ async def on_assistants_page(
     )
 
 
+async def on_asst_rename_ask(
+    query: CallbackQuery, state: FSMContext, assistant_storage: AssistantStorage
+) -> None:
+    """Просит новое имя активной или выбранной персоны."""
+    message = query.message
+    if not isinstance(message, Message):
+        await query.answer()
+        return
+    profile_id = (query.data or "").removeprefix("asst_rename:")
+    try:
+        profiles = await assistant_storage.list_assistants(message.chat.id)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    profile = next((item for item in profiles if item.id == profile_id), None)
+    if profile is None:
+        await query.answer("Ассистент не найден", show_alert=True)
+        return
+    await state.set_state(EditAssistantSG.name)
+    await state.update_data(id=profile.id, name=profile.name)
+    await query.answer()
+    await _edit_or_answer(
+        query,
+        f"Текущее имя: «{profile.name}»\n\n"
+        "Введите новое имя (1–50 символов). /cancel — отмена.",
+    )
+
+
+async def sg_edit_name(
+    message: Message,
+    state: FSMContext,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Сохраняет новое имя выбранной персоны."""
+    name = (message.text or "").strip()
+    if not name or len(name) > 50:
+        await message.answer("Имя: 1–50 символов. /cancel — отмена.")
+        return
+    data = await state.get_data()
+    profile_id = data.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        await _reset_flow(state)
+        await message.answer("Ассистент не найден.")
+        return
+    try:
+        profiles = await assistant_storage.list_assistants(message.chat.id)
+        old = next((item for item in profiles if item.id == profile_id), None)
+        if old is None:
+            await _reset_flow(state)
+            await message.answer("Ассистент не найден.")
+            return
+        updated = old.model_copy(update={"name": name})
+        await assistant_storage.save_assistant(message.chat.id, updated)
+    except AssistantStorageError:
+        await _reply_profile_error(message)
+        return
+    except ValidationError:
+        await message.answer("Имя: 1–50 символов. /cancel — отмена.")
+        return
+    await _reset_flow(state)
+    logger.info(
+        "Обновлено имя ассистента chat_id=%s id=%s", message.chat.id, updated.id
+    )
+    await message.answer(f"✅ Имя ассистента изменено на «{updated.name}».")
+    await _open_settings(message, assistant, assistant_storage, state)
+
+
 async def on_asst_edit_ask(
     query: CallbackQuery, state: FSMContext, assistant_storage: AssistantStorage
 ) -> None:
@@ -2421,7 +2966,10 @@ async def on_asst_edit_ask(
 
 
 async def sg_edit_prompt(
-    message: Message, state: FSMContext, assistant_storage: AssistantStorage
+    message: Message,
+    state: FSMContext,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
 ) -> None:
     """Сохраняет новый системный промпт выбранной персоны."""
     prompt = message.text or ""
@@ -2454,6 +3002,7 @@ async def sg_edit_prompt(
         "Обновлён промпт ассистента chat_id=%s id=%s", message.chat.id, updated.id
     )
     await message.answer(f"✅ Промпт ассистента «{updated.name}» обновлён.")
+    await _open_settings(message, assistant, assistant_storage, state)
 
 
 async def on_asst_edit(
@@ -2669,6 +3218,7 @@ async def on_asst_new_default(
 
 async def on_asst_new_commit(
     query: CallbackQuery,
+    assistant: AssistAIClient,
     assistant_storage: AssistantStorage,
     topic_storage: TopicHistoryStorage,
     state: FSMContext,
@@ -2709,21 +3259,24 @@ async def on_asst_new_commit(
     try:
         await assistant_storage.save_assistant(chat_id, profile)
         await assistant_storage.set_active_assistant(chat_id, profile.id)
-        menu = await _menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError as exc:
-        await query.answer(exc.message, show_alert=True)
-        return
-    except TopicStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
     await _reset_flow(state)
     logger.info("Сохранён ассистент chat_id=%s id=%s", chat_id, profile.id)
     await query.answer("Сохранено")
-    verb = "Обновлён" if isinstance(edit_id, str) and edit_id else "Создан"
-    await message.answer(
-        f"✅ {verb} ассистент «{profile.name}» ({profile.id}).",
-        reply_markup=menu,
+    await _cleanup_wizard_ui(
+        message,
+        state,
+        assistant_storage,
+        topic_storage,
+        also_delete=[message.message_id],
     )
+    verb = "Обновлён" if isinstance(edit_id, str) and edit_id else "Создан"
+    # Меню уже на невидимом якоре: не вешаем его на текст, иначе удаление
+    # подтверждения снова спрячет кнопки.
+    await message.answer(f"✅ {verb} ассистент «{profile.name}» ({profile.id}).")
+    await _open_settings(message, assistant, assistant_storage, state)
 
 
 async def _persona_id_for_query(
@@ -2818,7 +3371,7 @@ async def on_topic_delete_ask(
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
 ) -> None:
-    """Спрашивает удаление темы отдельным сообщением."""
+    """Спрашивает удаление темы в том же сообщении списка."""
     message = query.message
     if not isinstance(message, Message):
         await query.answer()
@@ -2837,11 +3390,10 @@ async def on_topic_delete_ask(
         await query.answer("Тема не найдена.", show_alert=True)
         return
     await query.answer()
-    await message.answer(
+    await _edit_inline(
+        message,
         f"Удалить тему «{name}» со всей историей?",
-        reply_markup=_confirm_row(
-            "✅ Да, удалить", f"topic_del_yes:{topic_id}", "topic_list"
-        ),
+        _confirm_row("✅ Да, удалить", f"topic_del_yes:{topic_id}", "topic:list"),
     )
 
 
@@ -2849,8 +3401,9 @@ async def on_topic_delete_yes(
     query: CallbackQuery,
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
+    state: FSMContext,
 ) -> None:
-    """Удаляет тему и историю, затем показывает список с первой страницы."""
+    """Удаляет тему и историю, затем обновляет тот же список тем."""
     message = query.message
     if not isinstance(message, Message):
         await query.answer()
@@ -2869,8 +3422,9 @@ async def on_topic_delete_yes(
         return
     logger.info("Удалена тема chat_id=%s topic_id=%s", chat_id, topic_id)
     await query.answer("Тема удалена")
-    await _edit_or_answer(query, text, markup)
-    await message.answer("Тема удалена.", reply_markup=menu)
+    await _edit_inline(message, text, markup)
+    await state.update_data({_SCREEN_TOPICS: message.message_id})
+    await _apply_reply_menu(message, menu, state)
 
 
 async def on_topic_list(
@@ -3075,7 +3629,7 @@ async def on_topic_del_yes(
     await query.answer("Тема удалена")
     await _edit_inline(message, text, markup)
     await state.update_data({_SCREEN_TOPICS: message.message_id})
-    await message.answer("Тема удалена.", reply_markup=menu)
+    await _apply_reply_menu(message, menu, state)
 
 
 async def on_topic_new(query: CallbackQuery, state: FSMContext) -> None:
@@ -3121,7 +3675,6 @@ async def sg_new_topic_name(
         f"✅ Создана новая тема: '{name}'. Контекст обнулен.",
         reply_markup=menu,
     )
-    await _open_topics(message, topic_storage, assistant_storage, state)
 
 
 async def sg_rename_topic_name(
@@ -3157,7 +3710,8 @@ async def sg_rename_topic_name(
         return
     await _reset_flow(state)
     logger.info("Тема переименована chat_id=%s topic_id=%s", chat_id, topic_id)
-    await message.answer(f"Тема переименована в «{name}».", reply_markup=menu)
+    await _apply_reply_menu(message, menu, state)
+    await message.answer(f"Тема переименована в «{name}».")
     await _open_topics(message, topic_storage, assistant_storage, state)
 
 
@@ -3203,7 +3757,7 @@ async def on_image_model(
     )
     new_model = selected or assistant.config.default_image_model
     fields: dict[str, Any] = {"image_model": selected}
-    if _is_flux_image_model(old_model) != _is_flux_image_model(new_model):
+    if image_model_family(old_model) != image_model_family(new_model):
         fields["image_size"] = _default_image_size(new_model)
     await state.update_data(fields)
     await _refresh_image_screen(query, state, assistant)
@@ -3329,7 +3883,7 @@ async def on_set_persona_size(
     assistant: AssistAIClient,
     assistant_storage: AssistantStorage,
 ) -> None:
-    """Записывает размер картинки активной персоны."""
+    """Записывает размер картинки активной персоны (экран выбора модели)."""
     message = _query_message(query)
     if message is None:
         await query.answer()
@@ -3347,8 +3901,50 @@ async def on_set_persona_size(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer("Размер обновлён")
-    text, markup = _settings_view(updated, assistant)
+    text, markup = _model_picker_parts(updated, assistant, "image")
     await _edit_or_answer(query, text, markup)
+
+
+async def on_picker_done(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Закрывает выбор модели картинок и возвращает к настройкам."""
+    message = _query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    try:
+        profile = await _active_profile(message.chat.id, assistant_storage)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer()
+    await _return_to_settings(message, state, profile, assistant)
+
+
+async def on_voice_menu(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Открывает экран голосового ответа поверх сообщения настроек."""
+    message = _query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    try:
+        profile = await _active_profile(message.chat.id, assistant_storage)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer()
+    text, markup = _voice_view(profile, assistant)
+    await _edit_inline(message, text, markup)
+    await state.update_data({_SCREEN_SETTINGS: message.message_id})
 
 
 async def cmd_voice(
@@ -3370,7 +3966,8 @@ async def cmd_voice(
             await _reply_profile_error(message)
             return
         menu = await _menu_for(message.chat.id, assistant_storage, topic_storage)
-        await message.answer(f"Голосовой режим: {raw}.", reply_markup=menu)
+        label = _VOICE_MODE_LABELS[raw]
+        await message.answer(f"Голосовой режим: {label}.", reply_markup=menu)
         return
     await on_menu_settings(message, assistant, assistant_storage, state)
 
@@ -3396,8 +3993,9 @@ async def on_voice_mode(
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
-    await query.answer(f"Режим: {mode}")
-    text, markup = _settings_view(updated, assistant)
+    label = _VOICE_MODE_LABELS[mode]
+    await query.answer(f"Режим: {label}")
+    text, markup = _voice_view(updated, assistant)
     await _edit_or_answer(query, text, markup)
 
 
@@ -3425,7 +4023,7 @@ async def on_voice_name(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer(f"Голос: {voice}")
-    text, markup = _settings_view(updated, assistant)
+    text, markup = _voice_view(updated, assistant)
     await _edit_or_answer(query, text, markup)
 
 
@@ -3453,7 +4051,7 @@ async def on_stt_language(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer(f"STT: {label}")
-    text, markup = _settings_view(updated, assistant)
+    text, markup = _voice_view(updated, assistant)
     await _edit_or_answer(query, text, markup)
 
 
@@ -3548,6 +4146,9 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     )
     dispatcher.callback_query.register(on_topics_page, F.data.startswith("topic_page:"))
     dispatcher.callback_query.register(
+        on_asst_rename_ask, F.data.startswith("asst_rename:")
+    )
+    dispatcher.callback_query.register(
         on_asst_edit_ask, F.data.startswith("asst_edit:")
     )
     dispatcher.callback_query.register(on_topics_refresh, F.data == "topic_list")
@@ -3559,6 +4160,7 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     )
     dispatcher.message.register(cmd_unknown, F.text.startswith("/"))
     dispatcher.message.register(sg_new_assistant_name, NewAssistantSG.name)
+    dispatcher.message.register(sg_edit_name, EditAssistantSG.name)
     dispatcher.message.register(sg_edit_prompt, EditAssistantSG.prompt)
     dispatcher.message.register(sg_new_assistant_prompt, NewAssistantSG.prompt)
     dispatcher.message.register(sg_new_assistant_models, NewAssistantSG.models)
@@ -3612,6 +4214,8 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_settings_close, F.data == "settings:close")
     dispatcher.callback_query.register(on_set_text_menu, F.data == "set_text_menu")
     dispatcher.callback_query.register(on_set_image_menu, F.data == "set_image_menu")
+    dispatcher.callback_query.register(on_picker_done, F.data == "picker:done")
+    dispatcher.callback_query.register(on_voice_menu, F.data == "voice_menu")
     dispatcher.callback_query.register(
         on_set_persona_size, F.data.startswith("set_size:")
     )
@@ -3626,6 +4230,8 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     )
     dispatcher.message.register(handle_voice, F.voice)
     dispatcher.message.register(handle_video_note_stub, F.video_note)
+    dispatcher.message.register(handle_photo, F.photo)
+    dispatcher.message.register(handle_document, F.document)
     dispatcher.message.register(handle_text, F.text & ~F.text.startswith("/"))
 
 

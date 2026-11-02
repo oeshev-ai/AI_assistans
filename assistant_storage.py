@@ -23,15 +23,35 @@ logger = logging.getLogger("AssistantStorage")
 
 DEFAULT_ASSISTANT_ID = "standard"
 DEFAULT_ASSISTANT_NAME = "Стандартный"
-DEFAULT_SYSTEM_PROMPT = (
+# Промпт персоны «Стандартный» (то, что пользователь может заменить своим).
+DEFAULT_PERSONA_PROMPT = (
     "Ты полезный, вежливый и компетентный ассистент. "
-    "Отвечай кратко, по делу, на русском языке. "
+    "Отвечай кратко, по делу, на русском языке."
+)
+# Общие правила инструментов и Vision — дописываются ко всем персонам в запрос.
+DEFAULT_SYSTEM_PROMPT = (
     "Если пользователь спрашивает о погоде или курсах валют, обязательно используй доступные функции для получения актуальных данных, а не полагайся на память. "
     "Если пользователь просит нарисовать, сгенерировать или создать изображение, схему или иллюстрацию, вызови generate_image и не отказывайся. "
+    "Если пользователь присылает изображение или документ, проанализируй его содержимое и дай подробный ответ. "
     "Не выдумывай факты. Если информации недостаточно, честно скажи об этом."
 )
 _ASSISTANT_TTL_DAYS = 30
 _T = TypeVar("_T")
+
+
+def compose_system_prompt(user_prompt: str) -> str:
+    """Собирает system для модели: промпт персоны + общие правила.
+
+    В профиле хранится только ``user_prompt``. Общий хвост не дублируем,
+    если он уже есть в тексте (старые сохранённые профили).
+    """
+    user = user_prompt.strip()
+    shared = DEFAULT_SYSTEM_PROMPT.strip()
+    if not user:
+        return shared
+    if shared in user:
+        return user
+    return f"{user}\n\n{shared}"
 
 
 class AssistantStorageError(Exception):
@@ -55,6 +75,7 @@ class AssistantProfile(BaseModel):
     text_model: str | None = None
     image_model: str | None = None
     image_size: str | None = None
+    vision_model: str | None = None
     voice_mode: Literal["off", "auto", "always"] = "auto"
     tts_model: str | None = None
     tts_voice: str | None = None
@@ -67,7 +88,7 @@ def default_assistant_profile() -> AssistantProfile:
     return AssistantProfile(
         id=DEFAULT_ASSISTANT_ID,
         name=DEFAULT_ASSISTANT_NAME,
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        system_prompt=DEFAULT_PERSONA_PROMPT,
     )
 
 
@@ -440,12 +461,14 @@ async def create_assistant_storage(config: RedisConfig) -> AssistantStorage:
 __all__ = [
     "DEFAULT_ASSISTANT_ID",
     "DEFAULT_ASSISTANT_NAME",
+    "DEFAULT_PERSONA_PROMPT",
     "DEFAULT_SYSTEM_PROMPT",
     "AssistantProfile",
     "AssistantStorage",
     "AssistantStorageError",
     "InMemoryAssistantStorage",
     "RedisAssistantStorage",
+    "compose_system_prompt",
     "create_assistant_storage",
     "default_assistant_profile",
 ]

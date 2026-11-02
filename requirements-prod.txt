@@ -5,3 +5,4 @@ pydantic>=2.4,<2.14
 tenacity
 aiogram>=3.31,<4
 redis[hiredis]>=5.0.0,<6
+PyMuPDF>=1.24,<2

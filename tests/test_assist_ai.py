@@ -241,6 +241,69 @@ async def test_stream_chat_tool_call_stitching(
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_keeps_reasoning_only_for_tool_rounds(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """reasoning_content не yield’ится и не остаётся в финальном assistant."""
+    stub = _RecordingTool("get_weather_by_city")
+    assist_client.register_tool(stub)
+    first_stream = _sse(
+        [
+            _stream_delta({"reasoning_content": "сначала подумаю"}),
+            _stream_delta(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_r_1",
+                            "function": {
+                                "name": "get_weather_by_city",
+                                "arguments": '{"city_name": "Казань"}',
+                            },
+                        }
+                    ]
+                }
+            ),
+            _stream_delta({}, "tool_calls"),
+        ]
+    )
+    second_stream = _sse(
+        [
+            _stream_delta({"reasoning_content": "уже не в чат"}),
+            _stream_delta({"content": "В Казани "}),
+            _stream_delta({"content": "облачно."}, "stop"),
+        ]
+    )
+    respx_mock.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=first_stream),
+            httpx.Response(200, text=second_stream),
+        ]
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "Погода в Казани?"}]
+
+    deltas = [delta async for delta in assist_client.stream_chat(messages)]
+
+    assert all(delta.kind in {"content", "tool"} for delta in deltas)
+    assert "".join(delta.text for delta in deltas if delta.kind == "content") == (
+        "В Казани облачно."
+    )
+    assert not any(
+        "подумаю" in delta.text or "не в чат" in delta.text for delta in deltas
+    )
+
+    tool_assistant = next(item for item in messages if item.get("tool_calls"))
+    assert tool_assistant["reasoning_content"] == "сначала подумаю"
+
+    final_assistant = messages[-1]
+    assert final_assistant["role"] == "assistant"
+    assert final_assistant["content"] == "В Казани облачно."
+    assert "reasoning_content" not in final_assistant
+    assert "reasoning" not in final_assistant
+
+
+@pytest.mark.asyncio
 async def test_http_timeout_handling(
     assist_client: AssistAIClient,
     respx_mock: MockRouter,
@@ -439,6 +502,83 @@ async def test_openai_image_keeps_pixel_size(
     body = json.loads(route.calls.last.request.content)
     assert body["size"] == "1024x1024"
     assert "aspect_ratio" not in body
+
+
+@pytest.mark.asyncio
+async def test_qwen_image_sends_aspect_ratio(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Qwen получает aspect_ratio, а не только OpenAI size."""
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
+        )
+    )
+
+    await assist_client.generate_image(
+        "кот",
+        model="qwen/qwen-image-2.1-turbo",
+        size="16:9",
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["aspect_ratio"] == "16:9"
+    assert body.get("size") is None
+
+
+@pytest.mark.asyncio
+async def test_seedream_uses_size_preset_or_width_height(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Seedream: ярус → size_preset, пиксели → width/height."""
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
+        )
+    )
+
+    await assist_client.generate_image(
+        "кот",
+        model="bytedance-seed/seedream-5-0-flash",
+        size="2K",
+    )
+    preset_body = json.loads(route.calls.last.request.content)
+    assert preset_body["size_preset"] == "2K"
+    assert "size" not in preset_body
+
+    await assist_client.generate_image(
+        "кот",
+        model="bytedance-seed/seedream-5-0-flash",
+        size="1280x720",
+    )
+    pixel_body = json.loads(route.calls.last.request.content)
+    assert pixel_body["width"] == 1280
+    assert pixel_body["height"] == 720
+    assert "size" not in pixel_body
+
+
+@pytest.mark.asyncio
+async def test_recraft_size_is_aspect_ratio(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Recraft предпочитает size в формате w:h."""
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
+        )
+    )
+
+    await assist_client.generate_image(
+        "логотип",
+        model="recraft/recraft-v4.1",
+        size="1:1",
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["size"] == "1:1"
 
 
 def test_extract_generated_images_matches_tool_call_id() -> None:
