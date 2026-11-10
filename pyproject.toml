@@ -1,0 +1,39 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+# Явный select: в ruff 0.17 дефолт слишком широкий для текущего кода.
+select = [
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "I",
+  "UP",
+  "ASYNC",
+  "S",
+  "RUF",
+]
+ignore = [
+  "E402",  # load_dotenv() до локальных импортов
+  "E501",
+  "RUF001",
+  "RUF002",
+  "RUF003",
+  "RUF006",
+  "S101",
+  "S104",
+  "S105",
+  "S106",
+  "S107",
+  "S110",
+  "S311",
+  "ASYNC109",
+  "ASYNC230",
+  "ASYNC240",
+  "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]

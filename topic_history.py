@@ -947,6 +947,7 @@ async def _demo() -> None:
 
 if __name__ == "__main__":
     import asyncio
+    import logging
     import sys
 
     logging.basicConfig(

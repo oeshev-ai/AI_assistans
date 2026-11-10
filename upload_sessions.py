@@ -131,9 +131,7 @@ class UploadSessionStore:
             return None
         return session
 
-    async def get_authorized(
-        self, upload_id: str, token: str
-    ) -> UploadSession | None:
+    async def get_authorized(self, upload_id: str, token: str) -> UploadSession | None:
         session = await self.get(upload_id)
         if session is None or not secrets.compare_digest(session.token, token):
             return None

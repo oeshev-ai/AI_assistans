@@ -24,6 +24,7 @@ def set_billing_user(user_id: int | None) -> None:
 def get_billing_user() -> int | None:
     return _billing_user_id.get()
 
+
 LLM_SPEND_USD = Counter(
     "llm_spend_usd_total",
     "Estimated LLM spend in USD",
@@ -175,7 +176,7 @@ class CostTracker:
             try:
                 raw = await self._redis.get(key)
                 return float(raw) if raw is not None else 0.0
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("cost_tracker_redis_get_failed", error=str(exc))
         return float(self._memory.get(key, 0.0))
 
@@ -187,7 +188,7 @@ class CostTracker:
                 pipe.expire(key, ttl_seconds)
                 await pipe.execute()
                 return
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("cost_tracker_redis_incr_failed", error=str(exc))
         self._memory[key] = self._memory.get(key, 0.0) + amount
         # Soft expiry for memory mode: drop keys older than ~3 days by day stamp.

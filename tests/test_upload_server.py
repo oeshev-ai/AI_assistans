@@ -31,8 +31,9 @@ class FakeStorage:
     async def upload_file(
         self, *, object_key: str, file_path: str, content_type: str
     ) -> None:
-        with open(file_path, "rb") as handle:
-            self.objects[object_key] = handle.read()
+        from pathlib import Path
+
+        self.objects[object_key] = Path(file_path).read_bytes()
 
     async def head_object(self, object_key: str) -> dict[str, Any]:
         data = self.objects.get(object_key)
@@ -61,7 +62,10 @@ async def test_same_origin_file_upload_flow() -> None:
     session = await store.create(chat_id=42, user_id=7, purpose="transcribe")
     app = web.Application(client_max_size=10 * 1024 * 1024)
     setup_upload_routes(
-        app, store=store, storage=storage, on_complete=on_complete  # type: ignore[arg-type]
+        app,
+        store=store,
+        storage=storage,
+        on_complete=on_complete,  # type: ignore[arg-type]
     )
 
     server = TestServer(app)

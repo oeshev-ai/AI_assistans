@@ -322,7 +322,9 @@ class TranscribeMediaTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> str:
         language = kwargs.get("language")
-        lang = language.strip() if isinstance(language, str) and language.strip() else None
+        lang = (
+            language.strip() if isinstance(language, str) and language.strip() else None
+        )
         source = _last_user_media("audio", "video")
         if source is None:
             return _error_json(

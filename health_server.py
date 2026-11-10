@@ -36,7 +36,7 @@ async def health_check(
             await redis_client.ping()
             health["components"]["redis"] = "ok"
             await refresh_redis_gauge(redis_client)
-        except Exception as exc:  # noqa: BLE001 — report any probe failure
+        except Exception as exc:
             health["components"]["redis"] = f"error: {exc}"
             health["status"] = "degraded"
 
@@ -46,7 +46,7 @@ async def health_check(
         try:
             await proxy_probe()
             health["components"]["proxy_api"] = "ok"
-        except Exception as exc:  # noqa: BLE001 — report any probe failure
+        except Exception as exc:
             health["components"]["proxy_api"] = f"error: {exc}"
             health["status"] = "degraded"
 

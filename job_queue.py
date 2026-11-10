@@ -51,7 +51,7 @@ async def init_job_queue(redis_url: str) -> None:
 
         _pool = await create_pool(_redis_settings_from_url(redis_url))
         logger.info("arq_pool_ready")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error("arq_pool_failed", error=str(exc), fallback="inline")
         _pool = None
         _enabled = False
@@ -122,7 +122,9 @@ async def synthesize_speech(
                 voice=voice,
                 response_format=response_format,
             )
-        logger.info("arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id)
+        logger.info(
+            "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
+        )
         payload = await job.result(timeout=timeout)
         from Assist_ai import SpeechResult
 
@@ -172,11 +174,11 @@ async def transcribe_audio(
                 "arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id
             )
             return str(await job.result(timeout=timeout))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("arq_stt_failed_inline", error=str(exc))
             try:
                 await _pool.delete(key)
-            except Exception:  # noqa: BLE001, S110
+            except Exception:
                 pass
     return await assistant.transcribe_audio(
         audio_bytes,

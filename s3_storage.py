@@ -84,9 +84,7 @@ class S3Storage:
         self.config = config
         self._client = _build_client(config)
 
-    async def create_presigned_put(
-        self, *, object_key: str, content_type: str
-    ) -> str:
+    async def create_presigned_put(self, *, object_key: str, content_type: str) -> str:
         def _sign() -> str:
             return self._client.generate_presigned_url(
                 "put_object",
@@ -101,7 +99,7 @@ class S3Storage:
 
         try:
             return await asyncio.to_thread(_sign)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("s3_presign_failed", key=object_key)
             raise S3StorageError(f"Не удалось создать ссылку загрузки: {exc}") from exc
 
@@ -120,19 +118,17 @@ class S3Storage:
 
         try:
             await asyncio.to_thread(_upload)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("s3_upload_file_failed", key=object_key)
             raise S3StorageError(f"Не удалось загрузить объект: {exc}") from exc
 
     async def head_object(self, object_key: str) -> dict[str, Any]:
         def _head() -> dict[str, Any]:
-            return self._client.head_object(
-                Bucket=self.config.bucket, Key=object_key
-            )
+            return self._client.head_object(Bucket=self.config.bucket, Key=object_key)
 
         try:
             return await asyncio.to_thread(_head)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise S3StorageError(f"Объект не найден в бакете: {object_key}") from exc
 
     async def download_bytes(self, object_key: str) -> bytes:
@@ -148,7 +144,7 @@ class S3Storage:
 
         try:
             return await asyncio.to_thread(_get)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("s3_download_failed", key=object_key)
             raise S3StorageError(f"Не удалось скачать объект: {exc}") from exc
 
@@ -158,7 +154,7 @@ class S3Storage:
 
         try:
             await asyncio.to_thread(_delete)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("s3_delete_failed", key=object_key, error=str(exc))
 
 

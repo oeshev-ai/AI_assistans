@@ -91,9 +91,7 @@ def track_api_call(
                 API_CALLS.labels(
                     service=service, endpoint=endpoint, status="error"
                 ).inc()
-                ERRORS.labels(
-                    error_type=type(exc).__name__, module=service
-                ).inc()
+                ERRORS.labels(error_type=type(exc).__name__, module=service).inc()
                 raise
             finally:
                 LATENCY.labels(service=service, endpoint=endpoint).observe(
@@ -119,6 +117,6 @@ async def refresh_redis_gauge(redis_client: Any | None) -> None:
         info = await redis_client.info("memory")
         used = int(info.get("used_memory", 0))
         REDIS_SIZE.set(used)
-    except Exception:  # noqa: BLE001, S110 — gauge is best-effort
+    except Exception:
         # Gauge stays at the last known value; health check reports Redis separately.
         pass

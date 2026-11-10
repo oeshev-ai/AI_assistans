@@ -61,7 +61,7 @@ async def startup(ctx: dict[str, Any]) -> None:
             await billing_redis.ping()
             cost_tracker.attach_redis(billing_redis)
             ctx["billing_redis"] = billing_redis
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("worker_cost_redis_failed", error=str(exc))
     logger.info("worker_started")
 
@@ -121,7 +121,7 @@ async def transcribe_audio_task(
     raw = await redis.get(redis_key)
     try:
         await redis.delete(redis_key)
-    except Exception:  # noqa: BLE001, S110
+    except Exception:
         pass
     if not raw:
         raise ValueError("STT payload missing or expired in Redis")

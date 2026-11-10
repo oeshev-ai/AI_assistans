@@ -58,9 +58,7 @@ async def test_recovers_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         recovery_timeout=10.0,
     )
     clock = {"t": 100.0}
-    monkeypatch.setattr(
-        "circuit_breaker.time.monotonic", lambda: clock["t"]
-    )
+    monkeypatch.setattr("circuit_breaker.time.monotonic", lambda: clock["t"])
 
     async def boom() -> None:
         raise RuntimeError("down")

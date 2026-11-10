@@ -122,7 +122,7 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
   <div class="card">
     <h1>Большой файл для расшифровки</h1>
     <p>Выберите аудио или видео (до {max_mb} МБ). Допустимо: {allowed}. Файл уйдёт напрямую в облако, минуя лимит Telegram.</p>
-    <input id="file" type="file" accept="{','.join(ALLOWED_EXTENSIONS)},audio/*,video/*"/>
+    <input id="file" type="file" accept="{",".join(ALLOWED_EXTENSIONS)},audio/*,video/*"/>
     <button id="btn" type="button">Загрузить</button>
     <div class="bar" id="bar"><span id="fill"></span></div>
     <div class="status" id="status"></div>
@@ -172,11 +172,13 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
         setStatus('Загружаю файл…');
         const form = new FormData();
         form.append('file', file, file.name);
+        const uploadUrl = '/api/uploads/' + UPLOAD_ID + '/file?t=' + encodeURIComponent(TOKEN);
 
         await new Promise((resolve, reject) => {{
           const xhr = new XMLHttpRequest();
-          xhr.open('POST', '/api/uploads/' + UPLOAD_ID + '/file?t=' + encodeURIComponent(TOKEN));
+          xhr.open('POST', uploadUrl);
           xhr.setRequestHeader('X-Upload-Token', TOKEN);
+          xhr.timeout = 60 * 60 * 1000;
           xhr.upload.onprogress = (e) => {{
             if (e.lengthComputable) fill.style.width = Math.round(e.loaded / e.total * 100) + '%';
           }};
@@ -184,9 +186,17 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
             let payload = null;
             try {{ payload = JSON.parse(xhr.responseText || '{{}}'); }} catch (_e) {{}}
             if (xhr.status >= 200 && xhr.status < 300) resolve(payload);
-            else reject(new Error((payload && payload.error) || ('Ошибка загрузки (' + xhr.status + ')')));
+            else if (xhr.status === 413) {{
+              reject(new Error('Файл слишком большой для nginx (нужен client_max_body_size 512m)'));
+            }} else {{
+              reject(new Error((payload && payload.error) || ('Ошибка загрузки (' + xhr.status + ')')));
+            }}
           }};
-          xhr.onerror = () => reject(new Error('Сеть: не удалось связаться с сервером загрузки'));
+          xhr.ontimeout = () => reject(new Error('Таймаут загрузки. Проверьте proxy_read_timeout в nginx.'));
+          xhr.onerror = () => reject(new Error(
+            'Обрыв соединения с сервером. Чаще всего: в nginx нет client_max_body_size 512m, ' +
+            'или бот не слушает 8082. Проверьте: curl -s https://assist.mrischool.ru/health'
+          ));
           xhr.send(form);
         }});
 
@@ -247,7 +257,7 @@ def setup_upload_routes(
 
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return web.json_response({"error": "Некорректный JSON"}, status=400)
 
         file_name = str(body.get("fileName") or "").strip()
@@ -257,8 +267,14 @@ def setup_upload_routes(
             return web.json_response({"error": "fileName обязателен"}, status=400)
         lower_name = file_name.lower()
         if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
-            return web.json_response({"error": "Недопустимое расширение файла"}, status=400)
-        if file_type and file_type not in allowed_mimes and file_type != "application/octet-stream":
+            return web.json_response(
+                {"error": "Недопустимое расширение файла"}, status=400
+            )
+        if (
+            file_type
+            and file_type not in allowed_mimes
+            and file_type != "application/octet-stream"
+        ):
             return web.json_response(
                 {"error": f"MIME не разрешён: {file_type}"}, status=400
             )
@@ -268,7 +284,11 @@ def setup_upload_routes(
                 status=400,
             )
 
-        effective_type = file_type if file_type and file_type != "application/octet-stream" else _guess_mime(file_name)
+        effective_type = (
+            file_type
+            if file_type and file_type != "application/octet-stream"
+            else _guess_mime(file_name)
+        )
         key = object_key_for(session, file_name)
         try:
             signed = await storage.create_presigned_put(
@@ -302,15 +322,17 @@ def setup_upload_routes(
         if session.status not in {"pending", "uploaded"}:
             return web.json_response({"error": "Сессия уже обработана"}, status=409)
 
-        try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001
-            return web.json_response({"error": "Некорректный JSON"}, status=400)
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "Некорректный JSON"}, status=400)
 
-        object_key = str(body.get("objectKey") or session.object_key or "").strip()
+            object_key = str(body.get("objectKey") or session.object_key or "").strip()
         expected_prefix = f"uploads/{session.upload_id}/"
         if not object_key.startswith(expected_prefix):
-            return web.json_response({"error": "objectKey не принадлежит сессии"}, status=400)
+            return web.json_response(
+                {"error": "objectKey не принадлежит сессии"}, status=400
+            )
 
         try:
             head = await storage.head_object(object_key)
@@ -345,7 +367,7 @@ def setup_upload_routes(
         async def _run() -> None:
             try:
                 await on_complete(session)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "upload_complete_handler_failed", upload_id=session.upload_id
                 )
@@ -374,9 +396,13 @@ def setup_upload_routes(
         file_name = Path(field.filename or "media.bin").name
         lower_name = file_name.lower()
         if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
-            return web.json_response({"error": "Недопустимое расширение файла"}, status=400)
+            return web.json_response(
+                {"error": "Недопустимое расширение файла"}, status=400
+            )
 
-        header_ctype = (field.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        header_ctype = (
+            (field.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        )
         effective_type = header_ctype or _guess_mime(file_name)
         if effective_type == "application/octet-stream":
             effective_type = _guess_mime(file_name)
@@ -390,8 +416,11 @@ def setup_upload_routes(
 
         tmp_path: str | None = None
         size = 0
+        too_large = False
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as tmp:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=Path(file_name).suffix
+            ) as tmp:
                 tmp_path = tmp.name
                 while True:
                     chunk = await field.read_chunk(size=1024 * 1024)
@@ -399,12 +428,17 @@ def setup_upload_routes(
                         break
                     size += len(chunk)
                     if size > max_bytes:
-                        return web.json_response(
-                            {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
-                            status=400,
-                        )
-                    tmp.write(chunk)
+                        too_large = True
+                        # Дочитываем тело, иначе клиент видит обрыв (xhr.onerror).
+                        continue
+                    if not too_large:
+                        tmp.write(chunk)
 
+            if too_large:
+                return web.json_response(
+                    {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
+                    status=400,
+                )
             if size <= 0:
                 return web.json_response({"error": "Пустой файл"}, status=400)
 
@@ -425,7 +459,7 @@ def setup_upload_routes(
             async def _run() -> None:
                 try:
                     await on_complete(session)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception(
                         "upload_file_handler_failed", upload_id=session.upload_id
                     )
@@ -444,15 +478,15 @@ def setup_upload_routes(
             )
         except S3StorageError as exc:
             return web.json_response({"error": exc.message}, status=500)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("upload_file_failed", upload_id=upload_id)
             return web.json_response({"error": f"Ошибка загрузки: {exc}"}, status=500)
         finally:
             if tmp_path:
                 try:
                     Path(tmp_path).unlink(missing_ok=True)
-                except Exception:  # noqa: BLE001, S110
-                    pass
+                except Exception:
+                    logger.debug("upload_temp_cleanup_failed", path=tmp_path)
 
     app.router.add_get("/upload/{upload_id}", page)
     app.router.add_post("/api/uploads/{upload_id}/presign", presign)

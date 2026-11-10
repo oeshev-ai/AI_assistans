@@ -733,9 +733,7 @@ async def _send_extracted_images(
             logger.exception("Не удалось отправить изображение из generate_image")
 
 
-async def _send_outbound_media(
-    message: Message, items: list[OutboundMedia]
-) -> None:
+async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> None:
     """Отправляет файлы из media-tools (видео, аудио, транскрипт, правки)."""
     for item in items:
         try:
@@ -787,7 +785,9 @@ async def _send_generated_image(message: Message, image: str, index: int) -> Non
     await message.answer_photo(photo=BufferedInputFile(raw, filename=filename))
 
 
-def filter_sensitive_data(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any]:
+def filter_sensitive_data(
+    event: dict[str, Any], hint: dict[str, Any]
+) -> dict[str, Any]:
     """Strip secrets from Sentry payloads before upload."""
     _ = hint
     request = event.get("request")
@@ -844,7 +844,7 @@ async def create_fsm_storage(redis_url: str) -> BaseStorage:
         storage = RedisStorage.from_url(redis_url)
         logger.info("fsm_redis_storage", url=redis_url)
         return storage
-    except Exception as exc:  # noqa: BLE001 — any Redis/aiogram failure falls back
+    except Exception as exc:
         logger.error("fsm_redis_failed", error=str(exc), fallback="memory")
         return MemoryStorage()
 
@@ -862,7 +862,7 @@ async def _open_shared_redis(redis_url: str) -> Redis | None:
         )
         await client.ping()
         return client
-    except Exception as exc:  # noqa: BLE001 — optional Redis for limits/health
+    except Exception as exc:
         logger.warning("shared_redis_unavailable", error=str(exc))
         return None
 
@@ -1040,9 +1040,7 @@ async def cmd_cancel(
 
 async def cmd_unknown(message: Message) -> None:
     """Отвечает на команду, для которой нет отдельного хендлера."""
-    await message.answer(
-        "Команды убраны. Пользуйтесь кнопками внизу или /help."
-    )
+    await message.answer("Команды убраны. Пользуйтесь кнопками внизу или /help.")
 
 
 def _should_send_voice_reply(profile: AssistantProfile, input_kind: InputKind) -> bool:
@@ -1153,7 +1151,9 @@ async def _process_user_message(
     try:
         await cost_tracker.check_budget(
             user_id,
-            cost_tracker.estimate_chat_cost(input_chars=len(user_text), output_chars=500),
+            cost_tracker.estimate_chat_cost(
+                input_chars=len(user_text), output_chars=500
+            ),
         )
     except BudgetExceededError as exc:
         await message.answer(exc.message)
@@ -1278,7 +1278,7 @@ async def _process_user_message(
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
         await _send_outbound_media(message, media_scope.bucket.items)
@@ -1307,9 +1307,7 @@ async def handle_text(
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not security.validate_message_length(user_text):
-        await message.answer(
-            "⚠️ Сообщение слишком длинное. Максимум 4000 символов."
-        )
+        await message.answer("⚠️ Сообщение слишком длинное. Максимум 4000 символов.")
         return
     if not await rate_limiter.check_text_limit(user_id):
         retry_after = await rate_limiter.get_retry_after(user_id, "text")
@@ -1474,9 +1472,7 @@ async def handle_voice(
     )
 
 
-def _infer_upload_media_kind(
-    *, mime_type: str, filename: str, preferred: str
-) -> str:
+def _infer_upload_media_kind(*, mime_type: str, filename: str, preferred: str) -> str:
     if preferred in {"audio", "video"}:
         return preferred
     mime = (mime_type or "").lower()
@@ -1504,7 +1500,9 @@ async def _process_s3_upload_session(
     filename = session.filename or "media.bin"
     mime_type = session.mime_type or "application/octet-stream"
     if not object_key:
-        await bot.send_message(chat_id, "Загрузка без object key — нечего обрабатывать.")
+        await bot.send_message(
+            chat_id, "Загрузка без object key — нечего обрабатывать."
+        )
         session.status = "failed"
         session.error = "missing_object_key"
         await store.update(session)
@@ -1551,8 +1549,8 @@ async def _process_s3_upload_session(
         )
         try:
             await status_msg.delete()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("upload_status_delete_failed", chat_id=chat_id)
 
         # Короткая запись в историю активной темы.
         try:
@@ -1581,7 +1579,7 @@ async def _process_s3_upload_session(
                 },
                 topic_storage.max_length,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("upload_history_append_failed", chat_id=chat_id)
 
         session.status = "done"
@@ -1600,7 +1598,7 @@ async def _process_s3_upload_session(
         session.status = "failed"
         session.error = message[:500]
         await store.update(session)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("s3_upload_process_failed", upload_id=session.upload_id)
         sentry_sdk.capture_exception(exc)
         await bot.send_message(chat_id, "Не удалось обработать загруженный файл.")
@@ -1611,7 +1609,7 @@ async def _process_s3_upload_session(
         data = None
         try:
             await storage.delete_object(object_key)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("s3_cleanup_failed", key=object_key)
 
 
@@ -1636,9 +1634,7 @@ async def _process_attached_media(
             "вызови transcribe_media."
         )
         media = [
-            UserMedia(
-                kind="audio", filename=filename, mime_type=mime_type, data=data
-            )
+            UserMedia(kind="audio", filename=filename, mime_type=mime_type, data=data)
         ]
     else:
         placeholder = f"[Видеофайл: {filename}]"
@@ -1647,9 +1643,7 @@ async def _process_attached_media(
             "вызови transcribe_media (аудио извлекается автоматически)."
         )
         media = [
-            UserMedia(
-                kind="video", filename=filename, mime_type=mime_type, data=data
-            )
+            UserMedia(kind="video", filename=filename, mime_type=mime_type, data=data)
         ]
     user_text = caption if caption else f"{placeholder}\n{default_ask}"
     status = await message.answer("Обрабатываю файл…")
@@ -1909,7 +1903,7 @@ async def _process_vision_message(
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
         await _send_outbound_media(message, media_scope.bucket.items)
@@ -3116,12 +3110,8 @@ async def _generate_and_send(
     finally:
         _KEEP_OUTGOING.reset(keep)
     try:
-        await cost_tracker.check_budget(
-            user_id, cost_tracker.estimate_image_cost(1)
-        )
-        images = await job_queue.generate_image(
-            assistant, prompt, model, size
-        )
+        await cost_tracker.check_budget(user_id, cost_tracker.estimate_image_cost(1))
+        images = await job_queue.generate_image(assistant, prompt, model, size)
         await _delete_bot_message(progress)
         if not images:
             await message.answer(MSG_IMAGE_FAILED, reply_markup=reply_markup)

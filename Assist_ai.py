@@ -360,7 +360,7 @@ def _parse_country(raw: Any) -> str | None:
     if raw is None or raw == "":
         return None
     if not isinstance(raw, str):
-        raise ValueError("country_code должен быть строкой, например RU.")  # noqa: TRY004
+        raise ValueError("country_code должен быть строкой, например RU.")
     stripped = raw.strip()
     return stripped or None
 
@@ -395,7 +395,7 @@ def _parse_days(raw: Any) -> int:
     if raw is None:
         return 5
     if isinstance(raw, bool):
-        raise ValueError("days должен быть целым числом от 1 до 5.")  # noqa: TRY004
+        raise ValueError("days должен быть целым числом от 1 до 5.")
     if isinstance(raw, float) and not raw.is_integer():
         raise ValueError("days должен быть целым числом от 1 до 5.")
     try:
@@ -1750,9 +1750,7 @@ class AssistAIClient:
             raise AssistAIError(exc.message) from exc
 
         selected_model = model or self.config.default_image_model
-        payload = _image_generation_body(
-            selected_model, sanitized_prompt, size.strip()
-        )
+        payload = _image_generation_body(selected_model, sanitized_prompt, size.strip())
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         size_label = (
@@ -1817,7 +1815,9 @@ class AssistAIClient:
             "model": selected_model,
             "prompt": security.sanitize_prompt(prompt.strip()),
         }
-        files = {"image": (filename, image_bytes, mime_type or "application/octet-stream")}
+        files = {
+            "image": (filename, image_bytes, mime_type or "application/octet-stream")
+        }
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
@@ -1910,9 +1910,7 @@ class AssistAIClient:
             connect=self.config.timeout,
         )
         logger.info("generate_video_create", model=selected_model, payload=payload)
-        created = await self._post_json(
-            _VIDEOS_PATH, payload, timeout=create_timeout
-        )
+        created = await self._post_json(_VIDEOS_PATH, payload, timeout=create_timeout)
         job_id = created.get("id")
         if not isinstance(job_id, str) or not job_id:
             raise AssistAIError("ProxyAPI не вернул id видео-задачи.")
@@ -2262,9 +2260,7 @@ class AssistAIClient:
         except httpx.HTTPError as exc:
             raise AssistAIError(f"ProxyAPI недоступен: {exc}") from exc
         if response.status_code >= 500:
-            raise AssistAIError(
-                f"ProxyAPI недоступен: HTTP {response.status_code}"
-            )
+            raise AssistAIError(f"ProxyAPI недоступен: HTTP {response.status_code}")
 
     async def _record_chat_usage(
         self, data: dict[str, Any], messages: list[dict[str, Any]]
@@ -2500,7 +2496,7 @@ class AssistAIClient:
         if isinstance(raw, str):
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
-                raise ValueError("arguments должны быть JSON-объектом.")  # noqa: TRY004
+                raise ValueError("arguments должны быть JSON-объектом.")
             return parsed
         raise ValueError("Неподдерживаемый тип arguments.")
 

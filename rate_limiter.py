@@ -72,7 +72,7 @@ class RateLimiter:
                 if count < limit or not oldest:
                     return 0.0
                 return max(0.0, float(oldest[0][1]) + window - now)
-            except Exception as exc:  # noqa: BLE001 — fall back to memory math
+            except Exception as exc:
                 logger.warning("rate_limiter_redis_retry_after_failed", error=str(exc))
 
         async with self._lock:
@@ -88,7 +88,7 @@ class RateLimiter:
         if self._redis is not None:
             try:
                 return await self._allow_redis(user_id, operation, limit, window)
-            except Exception as exc:  # noqa: BLE001 — degrade to in-memory limiter
+            except Exception as exc:
                 logger.warning(
                     "rate_limiter_redis_failed_fallback_memory",
                     error=str(exc),

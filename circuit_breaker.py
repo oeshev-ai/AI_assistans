@@ -144,7 +144,9 @@ def circuit(
     return decorator
 
 
-llm_breaker = AsyncCircuitBreaker(name="llm_api", failure_threshold=5, recovery_timeout=60.0)
+llm_breaker = AsyncCircuitBreaker(
+    name="llm_api", failure_threshold=5, recovery_timeout=60.0
+)
 weather_breaker = AsyncCircuitBreaker(
     name="weather_api", failure_threshold=5, recovery_timeout=60.0
 )

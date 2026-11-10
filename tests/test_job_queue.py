@@ -32,12 +32,12 @@ async def test_transcribe_inline_when_disabled() -> None:
     job_queue._pool = None
 
     class FakeAssistant:
-        async def transcribe_audio(self, audio_bytes, filename="voice.ogg", model=None, language=None):
+        async def transcribe_audio(
+            self, audio_bytes, filename="voice.ogg", model=None, language=None
+        ):
             return f"heard:{audio_bytes.decode()}:{language}"
 
-    text = await job_queue.transcribe_audio(
-        FakeAssistant(), b"hi", language="ru"
-    )
+    text = await job_queue.transcribe_audio(FakeAssistant(), b"hi", language="ru")
     assert text == "heard:hi:ru"
 
 
@@ -58,7 +58,9 @@ async def test_synthesize_speech_inline() -> None:
     speech = SimpleNamespace(audio=b"abc", filename="a.ogg", mime_type="audio/ogg")
 
     class FakeAssistant:
-        async def synthesize_speech(self, text, model=None, voice=None, response_format=None):
+        async def synthesize_speech(
+            self, text, model=None, voice=None, response_format=None
+        ):
             return speech
 
     result = await job_queue.synthesize_speech(FakeAssistant(), "hello", voice="alloy")
