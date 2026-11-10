@@ -7,19 +7,19 @@
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
 from typing import Literal, TypeVar
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from history_storage import RedisConfig
 
-logger = logging.getLogger("AssistantStorage")
+logger = structlog.get_logger("AssistantStorage")
 
 DEFAULT_ASSISTANT_ID = "standard"
 DEFAULT_ASSISTANT_NAME = "Стандартный"
@@ -32,7 +32,16 @@ DEFAULT_PERSONA_PROMPT = (
 DEFAULT_SYSTEM_PROMPT = (
     "Если пользователь спрашивает о погоде или курсах валют, обязательно используй доступные функции для получения актуальных данных, а не полагайся на память. "
     "Если пользователь просит нарисовать, сгенерировать или создать изображение, схему или иллюстрацию, вызови generate_image и не отказывайся. "
-    "Если пользователь присылает изображение или документ, проанализируй его содержимое и дай подробный ответ. "
+    "Если нужно изменить уже присланную картинку — вызови edit_image. "
+    "Если просят ролик, клип или видео — вызови generate_video. "
+    "Если просят расшифровать аудио/видео или сделать транскрипт — вызови transcribe_media "
+    "(полный текст уйдёт пользователю файлом, не копируй его целиком в ответ). "
+    "Если файл слишком большой для Telegram (~20 МБ), не влезает, пользователь просит "
+    "ссылку на загрузку большого аудио/видео — вызови request_large_media_upload и "
+    "обязательно отдай пользователю полученный upload_url. После загрузки бот сам "
+    "расшифрует файл. "
+    "Если просят озвучить текст — вызови synthesize_speech. "
+    "Если пользователь присылает изображение или PDF, проанализируй содержимое. "
     "Не выдумывай факты. Если информации недостаточно, честно скажи об этом."
 )
 _ASSISTANT_TTL_DAYS = 30

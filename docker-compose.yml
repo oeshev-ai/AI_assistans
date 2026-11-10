@@ -18,6 +18,46 @@ services:
       - .env
     environment:
       REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: production
+      # Не пересекаться с neurophoto webhook на хосте :8081
+      METRICS_PORT: ${METRICS_PORT:-8083}
+      HEALTH_PORT: ${HEALTH_PORT:-8082}
+    ports:
+      # Только localhost: наружу отдаёт nginx (assist.mrischool.ru → 8082)
+      - "127.0.0.1:${METRICS_PORT:-8083}:${METRICS_PORT:-8083}"
+      - "127.0.0.1:${HEALTH_PORT:-8082}:${HEALTH_PORT:-8082}"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ARQ_ENABLED: "1"
+      ENVIRONMENT: production
+    command: ["arq", "worker.WorkerSettings"]
+    profiles: ["arq"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis-backup:
+    image: redis:7-alpine
+    profiles: ["backup"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      BACKUP_DIR: /backups
+      KEEP_DAYS: "7"
+    volumes:
+      - redis_data:/data:ro
+      - ./backups/redis:/backups
+      - ./scripts/backup_redis.sh:/backup_redis.sh:ro
+    entrypoint: ["/bin/sh", "/backup_redis.sh"]
     depends_on:
       redis:
         condition: service_healthy

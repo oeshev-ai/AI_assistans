@@ -43,3 +43,6 @@ Thumbs.db
 *.webp
 !docs/**
 prompt.md
+
+# Redis RDB backups
+backups/

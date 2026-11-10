@@ -19,6 +19,17 @@ LLM и изображения идут через [ProxyAPI](https://proxyapi.ru
 | `models_config.py` | Списки текстовых и image-моделей для кнопок настроек |
 | `OpenWeatherAPI.py` | OpenWeatherMap: погода, прогноз, воздух, сравнение городов |
 | `ExchangerateAPI.py` | Конвертация валют через `api.exchangerate.host` |
+| `logging_setup.py` | JSON structured logging (structlog) |
+| `metrics.py` | Prometheus-метрики |
+| `health_server.py` | HTTP `/health` |
+| `rate_limiter.py` | Лимиты LLM/картинок (Redis или память) |
+| `security.py` | Санитизация prompt injection и валидация длины |
+| `circuit_breaker.py` | Async circuit breaker для внешних API |
+| `job_queue.py` | Очередь тяжёлых задач (arq) с inline fallback |
+| `worker.py` | arq worker: image / TTS / STT |
+| `cost_tracker.py` | Учёт расходов и дневные бюджеты LLM |
+| `scripts/backup_redis.sh` | Бэкап Redis RDB (Linux/cron/compose) |
+| `scripts/backup_redis.ps1` | Бэкап Redis RDB (Windows) |
 
 ## Требования
 
@@ -51,14 +62,69 @@ copy .env.example .env
 | `OPENWEATHER_API_KEY` | Инструменты погоды |
 | `EXCHANGERATE_API_KEY` | Конвертация валют |
 | `TELEGRAM_BOT_TOKEN` | Токен от @BotFather |
-| `REDIS_URL` | История и профили. Пусто — память одного процесса |
+| `REDIS_URL` | История, профили и FSM. Пусто — память одного процесса |
 | `HISTORY_TTL_DAYS` | TTL вспомогательного хранилища (по умолчанию 7) |
 | `TOPIC_TTL_DAYS` | Через сколько дней Redis удаляет неактивную тему (30) |
 | `MAX_HISTORY_LENGTH` | Сколько последних сообщений хранить в одной теме |
+| `METRICS_PORT` | Prometheus scrape (`/metrics`), по умолчанию `8083` |
+| `HEALTH_PORT` | Health + страница загрузки больших файлов, по умолчанию `8082` (не `8081` — на VPS его занимает neurophoto) |
+| `YC_BUCKET_NAME` / `YC_ACCESS_KEY_ID` / `YC_SECRET_ACCESS_KEY` | Yandex Object Storage для больших аудио/видео |
+| `UPLOAD_PUBLIC_BASE_URL` | Публичный HTTPS до `HEALTH_PORT`, напр. `https://assist.mrischool.ru` |
+| `UPLOAD_MAX_MB` | Лимит размера файла в бакет (по умолчанию 512) |
+| `SENTRY_DSN` | Опциональный DSN для Sentry |
+| `ENVIRONMENT` | Окружение для Sentry (`development` / `production`) |
+| `APP_VERSION` | Версия релиза для Sentry |
+| `ARQ_ENABLED` | `1` — тяжёлые задачи через arq worker |
+| `LLM_DAILY_BUDGET_USD` | Глобальный дневной бюджет (0 = без лимита) |
+| `LLM_USER_DAILY_BUDGET_USD` | Дневной бюджет на пользователя (0 = без лимита) |
 
 Без ключа погоды или курса соответствующий инструмент не регистрируется.
 Без `PROXYAPI_API_KEY` клиент LLM не стартует. Без `TELEGRAM_BOT_TOKEN` не
-стартует бот. Если Redis недоступен, профили и темы остаются в памяти процесса.
+стартует бот. Если Redis недоступен, профили, темы и FSM остаются в памяти процесса.
+
+## Production observability
+
+- JSON-логи через `structlog` (поля `user_id`, `chat_id`, `assistant_id`, `topic_id`)
+- Prometheus: `http://127.0.0.1:8083/metrics`
+- Health / upload: `http://127.0.0.1:8082/health` (Redis + ProxyAPI; наружу — через nginx)
+- Rate limits: 10 LLM-запросов/мин и 5 картинок/час на пользователя
+- Circuit breaker для LLM, погоды и валют
+- Sentry при заданном `SENTRY_DSN`
+- Учёт расходов LLM (`llm_spend_usd_total`) и дневные бюджеты
+
+## Очереди (arq)
+
+По умолчанию image/TTS/STT выполняются в процессе бота. Чтобы вынести их в worker:
+
+```powershell
+# .env
+ARQ_ENABLED=1
+REDIS_URL=redis://localhost:6379/0
+
+# терминал 1
+docker compose up -d redis
+python bot.py
+
+# терминал 2
+arq worker.WorkerSettings
+```
+
+В Docker: `docker compose --profile arq up -d --build` (сервисы `bot` + `worker`).
+
+## Backup Redis
+
+```powershell
+# Windows (нужен redis-cli в PATH)
+.\scripts\backup_redis.ps1
+
+# Linux / WSL / cron
+REDIS_HOST=127.0.0.1 ./scripts/backup_redis.sh
+
+# одноразовый контейнер
+docker compose --profile backup run --rm redis-backup
+```
+
+Снимки пишутся в `backups/redis/` (каталог в `.gitignore`).
 
 ## Docker
 
@@ -69,8 +135,14 @@ docker compose up -d --build
 ```
 
 Compose поднимает Redis (`redis:7-alpine`) и бота. `REDIS_URL` в контейнере
-подставляется как `redis://redis:6379/0`. Образ собирается из `Dockerfile`
-(Python 3.11-slim, зависимости из `requirements-prod.txt`).
+подставляется как `redis://redis:6379/0`. Порты `8083` (metrics) и `8082`
+(health/upload) слушаются только на `127.0.0.1`, чтобы не конфликтовать с
+neurophoto (`8081`) и не торчать в интернет без nginx. Образ — из `Dockerfile`
+(Python 3.11-slim, `requirements-prod.txt`).
+
+На VPS с `mrischool.ru`: DNS `assist` → IP сервера, nginx
+`assist.mrischool.ru` → `http://127.0.0.1:8082`, в `.env`
+`UPLOAD_PUBLIC_BASE_URL=https://assist.mrischool.ru`.
 
 После изменений кода: `docker compose up -d --build`.
 
@@ -93,17 +165,17 @@ tools/Vision).
 - Текст со стримингом ответа
 - Персоны: имя, системный промпт, текстовая и image-модель, размер картинки, голос
 - Темы диалога с отдельной историей на персону
-- Генерация изображений (`/image` и tool `generate_image`; семейства OpenAI / FLUX / Qwen / Seedream / Recraft)
-- Vision: фото и PDF (первые страницы) через multimodal chat
-- Голос: STT входящих голосовых; TTS ответа по режиму персоны (`выкл` / `авто` / `всегда`)
+- Медиа-tools персоны: `generate_image`, `edit_image`, `generate_video`, `transcribe_media`, `synthesize_speech`, `request_large_media_upload`
+- Транскрипт длинного аудио/видео уходит файлом `transcript.txt` (из видео сначала извлекается аудио через ffmpeg)
+- Файлы > ~20 МБ: персона выдаёт одноразовую ссылку → загрузка в Yandex Object Storage → авто-STT (нужны `YC_*` и `UPLOAD_PUBLIC_BASE_URL`)
+- Vision: фото и PDF через multimodal chat
+- Голосовые сообщения: авто-STT как текст диалога; TTS ответа по `voice_mode`
 - Погода и валюты через Function Calling
 
-Нижнее меню: **Ассистенты**, **Темы**, **Настройки**. Модели и голос правятся
-в настройках или командами ниже.
+Нижнее меню: **Ассистенты**, **Темы**, **Картинка**, **Настройки**.
+Модели и голос правятся только в настройках.
 
-**Команды:** `/help`, `/assistants`, `/create_assistant`, `/delete_assistant`,
-`/model`, `/image_model`, `/voice`, `/new_topic`, `/topics`, `/switch`,
-`/clear_topic`, `/image <описание>`, `/cancel`.
+**Команды:** `/help` (справка), `/cancel` (отмена мастера). `/start` — то же, что `/help`.
 
 ### Демо клиента LLM
 

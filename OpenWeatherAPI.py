@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from tenacity import (
@@ -23,19 +24,18 @@ from tenacity import (
     wait_exponential,
 )
 
+from circuit_breaker import APIUnavailableError, safe_api_call, weather_breaker
+from metrics import track_api_call
+
 load_dotenv()
 
 # ==============================================================================
 # 1. Конфигурация и Логирование
 # ==============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-logger = logging.getLogger("OpenWeatherAPI")
+logger = structlog.get_logger("OpenWeatherAPI")
 
 
 @dataclass
@@ -245,18 +245,36 @@ class OpenWeatherClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+    async def _make_request(self, url: str, params: dict[str, Any]) -> dict:
+        """HTTP-запрос с circuit breaker, метриками и retry."""
+        try:
+            return await safe_api_call(
+                weather_breaker,
+                self._make_request_raw,
+                url,
+                params,
+                user_message="⚠️ Сервис погоды временно недоступен. Попробуйте позже.",
+            )
+        except APIUnavailableError as exc:
+            raise OpenWeatherAPIError(message=exc.message) from exc
+
     @retry(
         retry=retry_if_exception(is_retryable_exception),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         stop=stop_after_attempt(3),
         reraise=True,
         before_sleep=lambda retry_state: logger.warning(
-            "Попытка %s не удалась. Повтор через %sс...",
-            retry_state.attempt_number,
-            retry_state.next_action.sleep if retry_state.next_action is not None else 0,
+            "weather_retry",
+            attempt=retry_state.attempt_number,
+            sleep=(
+                retry_state.next_action.sleep
+                if retry_state.next_action is not None
+                else 0
+            ),
         ),
     )
-    async def _make_request(self, url: str, params: dict[str, Any]) -> dict:
+    @track_api_call(service="weather", endpoint="request")
+    async def _make_request_raw(self, url: str, params: dict[str, Any]) -> dict:
         """Внутренний метод для выполнения HTTP-запросов с retry-логикой."""
         params["appid"] = self.config.api_key
         try:
@@ -264,7 +282,9 @@ class OpenWeatherClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            logger.error("HTTP ошибка %s для %s", e.response.status_code, url)
+            logger.error(
+                "weather_http_error", status_code=e.response.status_code, url=url
+            )
             raise OpenWeatherAPIError(
                 message=f"API вернул ошибку {e.response.status_code}",
                 status_code=e.response.status_code,
@@ -273,10 +293,10 @@ class OpenWeatherClient:
                 else None,
             )
         except httpx.TimeoutException:
-            logger.error("Таймаут запроса к %s", url)
+            logger.error("weather_timeout", url=url)
             raise OpenWeatherAPIError(message="Превышено время ожидания ответа от API")
         except httpx.RequestError:
-            logger.error("Ошибка сети при запросе к %s", url)
+            logger.error("weather_network_error", url=url)
             raise OpenWeatherAPIError(message="Ошибка сети при запросе к API")
 
     async def get_weather_by_coords(

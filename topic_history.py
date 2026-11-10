@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
@@ -15,6 +14,7 @@ from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any
 
+import structlog
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
@@ -22,7 +22,7 @@ from redis.exceptions import RedisError, WatchError
 
 from history_storage import trim_messages
 
-logger = logging.getLogger("TopicHistory")
+logger = structlog.get_logger("TopicHistory")
 
 _APPEND_ATTEMPTS = 64
 _DEFAULT_TOPIC_NAME = "General"

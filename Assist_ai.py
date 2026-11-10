@@ -15,6 +15,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -26,6 +27,7 @@ from types import TracebackType
 from typing import Any, Literal, Self
 
 import httpx
+import structlog
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -34,7 +36,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv()
 
+from circuit_breaker import (
+    APIUnavailableError,
+    CircuitBreakerError,
+    llm_breaker,
+    safe_api_call,
+)
+from cost_tracker import BudgetExceededError, cost_tracker
 from ExchangerateAPI import Conversion, ExchangeAPIError, get_exchange_rate
+from metrics import API_CALLS, ERRORS, LATENCY, track_api_call
 from OpenWeatherAPI import (
     AirPollutionData,
     CurrentWeather,
@@ -43,22 +53,28 @@ from OpenWeatherAPI import (
     OpenWeatherClient,
     OWMConfig,
 )
+from security import security
 
 # URL с access_key не должен попадать в лог при уровне INFO.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-logger = logging.getLogger("AssistAI")
+logger = structlog.get_logger("AssistAI")
 
 _CHAT_PATH = "chat/completions"
 _IMAGES_PATH = "images/generations"
+_IMAGES_EDIT_PATH = "images/edits"
 _TRANSCRIBE_PATH = "audio/transcriptions"
 _SPEECH_PATH = "audio/speech"
+_VIDEOS_PATH = "videos"
 # Картинка и длинный потоковый ответ могут занимать до двух минут.
 _IMAGE_READ_TIMEOUT = 180.0
 _STREAM_READ_TIMEOUT = 180.0
 _TRANSCRIBE_READ_TIMEOUT = 120.0
 _SPEECH_READ_TIMEOUT = 120.0
+_VIDEO_READ_TIMEOUT = 300.0
+_VIDEO_POLL_INTERVAL = 5.0
+_VIDEO_POLL_MAX_SECONDS = 600.0
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -255,6 +271,8 @@ class AssistAIConfig(BaseModel):
     default_tts_model: str = "openai/gpt-4o-mini-tts"
     default_tts_voice: str = "alloy"
     default_tts_format: str = "opus"
+    default_image_edit_model: str = "openai/gpt-image-2.5-flare"
+    default_video_model: str = "bytedance/seedance-2.0"
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
 
@@ -281,6 +299,12 @@ class AssistAIConfig(BaseModel):
             default_tts_model=os.getenv("PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"),
             default_tts_voice=os.getenv("PROXYAPI_TTS_VOICE", "alloy"),
             default_tts_format=os.getenv("PROXYAPI_TTS_FORMAT", "opus"),
+            default_image_edit_model=os.getenv(
+                "PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.5-flare"
+            ),
+            default_video_model=os.getenv(
+                "PROXYAPI_VIDEO_MODEL", "bytedance/seedance-2.0"
+            ),
         )
 
 
@@ -1315,6 +1339,15 @@ class SpeechResult:
     mime_type: str
 
 
+@dataclass(frozen=True)
+class VideoResult:
+    """Готовый ролик: байты файла, имя и MIME."""
+
+    data: bytes
+    filename: str
+    mime_type: str = "video/mp4"
+
+
 def _audio_mime(filename: str) -> str:
     """MIME по расширению аудиофайла для multipart STT."""
     lowered = filename.rsplit(".", 1)[-1].casefold() if "." in filename else ""
@@ -1383,6 +1416,10 @@ class AssistAIClient:
                 "EXCHANGERATE_API_KEY не задан, инструмент курса валют отключён"
             )
         self.register_tool(GenerateImageTool(self))
+        # Late import: media_tools зависит от AssistAIClient.
+        from media_tools import register_media_tools
+
+        register_media_tools(self)
 
     def register_tool(self, tool: BaseTool) -> None:
         """Добавляет инструмент в реестр. Повторное имя заменяет предыдущий инструмент."""
@@ -1471,6 +1508,7 @@ class AssistAIClient:
                 len(messages),
             )
             data = await self._post_json(_CHAT_PATH, payload)
+            await self._record_chat_usage(data, messages)
             message, finish_reason = self._extract_choice(data)
             raw_tool_calls = message.get("tool_calls") or []
             tool_calls = [
@@ -1657,6 +1695,7 @@ class AssistAIClient:
                 continue
 
             messages.append({"role": "assistant", "content": content_text})
+            await self._record_chat_estimate(messages, content_text)
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,
@@ -1701,9 +1740,19 @@ class AssistAIClient:
             raise ValueError("prompt не может быть пустым.")
         if not isinstance(size, str) or not size.strip():
             raise ValueError("size не может быть пустым.")
+        if not security.validate_prompt_length(prompt):
+            raise ValueError("Prompt слишком длинный")
+        sanitized_prompt = security.sanitize_prompt(prompt)
+        image_cost = cost_tracker.estimate_image_cost(1)
+        try:
+            await cost_tracker.check_budget(estimated=image_cost)
+        except BudgetExceededError as exc:
+            raise AssistAIError(exc.message) from exc
 
         selected_model = model or self.config.default_image_model
-        payload = _image_generation_body(selected_model, prompt, size.strip())
+        payload = _image_generation_body(
+            selected_model, sanitized_prompt, size.strip()
+        )
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         size_label = (
@@ -1713,10 +1762,10 @@ class AssistAIClient:
             or size.strip()
         )
         logger.info(
-            "generate_image: модель=%s, size=%s, символов в prompt=%s",
-            selected_model,
-            size_label,
-            len(prompt),
+            "generate_image",
+            model=selected_model,
+            size=size_label,
+            prompt_chars=len(sanitized_prompt),
         )
         data = await self._post_json(_IMAGES_PATH, payload, timeout=timeout)
 
@@ -1739,7 +1788,194 @@ class AssistAIClient:
             raise AssistAIError("ProxyAPI не вернул изображение.")
 
         logger.info("generate_image: получено изображений: %s", len(images))
+        await cost_tracker.record(
+            kind="image",
+            amount_usd=cost_tracker.estimate_image_cost(len(images)),
+        )
         return images
+
+    async def edit_image(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        filename: str = "image.png",
+        mime_type: str = "image/png",
+        model: str | None = None,
+    ) -> list[str]:
+        """Редактирует изображение через ``/images/edits`` (multipart)."""
+        if not image_bytes:
+            raise ValueError("image_bytes не может быть пустым.")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt не может быть пустым.")
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+
+        selected_model = model or self.config.default_image_edit_model
+        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
+        form = {
+            "model": selected_model,
+            "prompt": security.sanitize_prompt(prompt.strip()),
+        }
+        files = {"image": (filename, image_bytes, mime_type or "application/octet-stream")}
+        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        logger.info(
+            "edit_image",
+            model=selected_model,
+            bytes=len(image_bytes),
+            prompt_chars=len(prompt),
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers={
+                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "User-Agent": "AssistAIClient/1.0",
+                },
+            ) as client:
+                response = await client.post(url, data=form, files=files)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            raise AssistAIError(
+                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+        if not isinstance(data, dict):
+            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+
+        images: list[str] = []
+        raw_items = data.get("data")
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                url_value = item.get("url")
+                if isinstance(url_value, str) and url_value:
+                    images.append(url_value)
+                    continue
+                encoded = item.get("b64_json")
+                if isinstance(encoded, str) and encoded:
+                    images.append(encoded)
+        if not images:
+            raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
+        await cost_tracker.record(
+            kind="image",
+            amount_usd=cost_tracker.estimate_image_cost(len(images)),
+        )
+        return images
+
+    async def generate_video(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        duration: int | None = None,
+        resolution: str | None = None,
+    ) -> VideoResult:
+        """Создаёт видео-задачу, ждёт completion и скачивает mp4."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt не может быть пустым.")
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+
+        selected_model = model or self.config.default_video_model
+        payload: dict[str, Any] = {
+            "model": selected_model,
+            "prompt": security.sanitize_prompt(prompt.strip()),
+        }
+        if isinstance(duration, int) and duration > 0:
+            payload["duration"] = duration
+        if isinstance(resolution, str) and resolution.strip():
+            payload["resolution"] = resolution.strip()
+
+        create_timeout = httpx.Timeout(
+            max(self.config.timeout, _VIDEO_READ_TIMEOUT),
+            connect=self.config.timeout,
+        )
+        logger.info("generate_video_create", model=selected_model, payload=payload)
+        created = await self._post_json(
+            _VIDEOS_PATH, payload, timeout=create_timeout
+        )
+        job_id = created.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            raise AssistAIError("ProxyAPI не вернул id видео-задачи.")
+        polling_url = created.get("polling_url")
+        status_url = (
+            polling_url
+            if isinstance(polling_url, str) and polling_url.startswith("http")
+            else f"{self.config.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
+        )
+
+        deadline = time.monotonic() + _VIDEO_POLL_MAX_SECONDS
+        status_payload: dict[str, Any] = created
+        while time.monotonic() < deadline:
+            status = str(status_payload.get("status") or "").casefold()
+            if status in {"completed", "succeeded", "success"}:
+                break
+            if status in {"failed", "error", "cancelled"}:
+                raise AssistAIError(
+                    f"Генерация видео завершилась ошибкой: {status_payload}"
+                )
+            await asyncio.sleep(_VIDEO_POLL_INTERVAL)
+            try:
+                response = await self._http.get(
+                    status_url, timeout=httpx.Timeout(30.0, connect=self.config.timeout)
+                )
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPError as exc:
+                raise AssistAIError(f"Не удалось опросить статус видео: {exc}") from exc
+            if not isinstance(body, dict):
+                raise AssistAIError("Некорректный статус видео-задачи.")
+            status_payload = body
+        else:
+            raise AssistAIError("Таймаут ожидания генерации видео.")
+
+        content_url = (
+            f"{self.config.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}/content"
+        )
+        unsigned = status_payload.get("unsigned_urls")
+        if isinstance(unsigned, list) and unsigned:
+            first = unsigned[0]
+            if isinstance(first, str) and first.startswith("http"):
+                content_url = first
+        try:
+            response = await self._http.get(
+                content_url,
+                timeout=httpx.Timeout(
+                    max(self.config.timeout, _VIDEO_READ_TIMEOUT),
+                    connect=self.config.timeout,
+                ),
+                headers={"Authorization": f"Bearer {self.config.proxyapi_key}"},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AssistAIError(f"Не удалось скачать видео: {exc}") from exc
+        data = response.content
+        if not data:
+            raise AssistAIError("ProxyAPI вернул пустой видеофайл.")
+        from cost_tracker import VIDEO_USD
+
+        await cost_tracker.record(kind="video", amount_usd=VIDEO_USD)
+        logger.info("generate_video_done", job_id=job_id, bytes=len(data))
+        return VideoResult(data=data, filename="video.mp4", mime_type="video/mp4")
 
     async def transcribe_audio(
         self,
@@ -1921,10 +2157,18 @@ class AssistAIClient:
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
+        try:
+            await llm_breaker.ensure_allows_call()
+        except CircuitBreakerError as exc:
+            raise AssistAIError(
+                "⚠️ LLM сервис временно недоступен. Попробуйте через минуту."
+            ) from exc
+
         url = f"{self.config.base_url.rstrip('/')}/{_CHAT_PATH}"
         read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
-        logger.info("POST %s (stream)", url)
+        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH)
+        t0 = time.perf_counter()
         try:
             async with self._http.stream(
                 "POST", url, json=payload, timeout=timeout
@@ -1943,21 +2187,44 @@ class AssistAIClient:
                                 message = str(error.get("message") or error)
                             else:
                                 message = str(error)
-                            logger.error("ProxyAPI вернул ошибку в потоке: %s", message)
+                            logger.error("proxy_api_stream_error", detail=message)
                             raise AssistAIError(f"ProxyAPI: {message}")
                         yield chunk
-        except AssistAIError:
+            API_CALLS.labels(
+                service="proxy_api", endpoint="chat_stream", status="success"
+            ).inc()
+            await llm_breaker._on_success()
+        except AssistAIError as exc:
+            API_CALLS.labels(
+                service="proxy_api", endpoint="chat_stream", status="error"
+            ).inc()
+            ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
+            await llm_breaker._on_failure(exc)
             raise
         except httpx.TimeoutException as exc:
-            logger.error("Таймаут потока %s", _CHAT_PATH)
+            API_CALLS.labels(
+                service="proxy_api", endpoint="chat_stream", status="error"
+            ).inc()
+            ERRORS.labels(error_type="TimeoutException", module="proxy_api").inc()
+            await llm_breaker._on_failure(exc)
+            logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
             raise AssistAIError(
                 f"Превышено время ожидания ответа ProxyAPI ({_CHAT_PATH})."
             ) from exc
         except httpx.RequestError as exc:
-            logger.error("Сетевая ошибка потока %s: %s", _CHAT_PATH, exc)
+            API_CALLS.labels(
+                service="proxy_api", endpoint="chat_stream", status="error"
+            ).inc()
+            ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
+            await llm_breaker._on_failure(exc)
+            logger.error("proxy_api_stream_network", path=_CHAT_PATH, error=str(exc))
             raise AssistAIError(
                 f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
             ) from exc
+        finally:
+            LATENCY.labels(service="proxy_api", endpoint="chat_stream").observe(
+                time.perf_counter() - t0
+            )
 
     @staticmethod
     async def _raise_for_stream_status(response: httpx.Response, path: str) -> None:
@@ -1981,6 +2248,58 @@ class AssistAIClient:
             status_code=response.status_code,
         )
 
+    async def test_connection(self) -> None:
+        """Лёгкая проверка доступности ProxyAPI для health check.
+
+        Делает OPTIONS/короткий запрос к базе. Ошибка сети или HTTP 5xx
+        считается недоступностью; 401/404 при живом хосте — ок.
+        """
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+        url = self.config.base_url.rstrip("/") + "/"
+        try:
+            response = await self._http.get(url, timeout=httpx.Timeout(5.0))
+        except httpx.HTTPError as exc:
+            raise AssistAIError(f"ProxyAPI недоступен: {exc}") from exc
+        if response.status_code >= 500:
+            raise AssistAIError(
+                f"ProxyAPI недоступен: HTTP {response.status_code}"
+            )
+
+    async def _record_chat_usage(
+        self, data: dict[str, Any], messages: list[dict[str, Any]]
+    ) -> None:
+        """Record spend from provider ``usage`` or a chars heuristic."""
+        usage = data.get("usage") if isinstance(data, dict) else None
+        prompt_tokens = None
+        completion_tokens = None
+        if isinstance(usage, dict):
+            raw_in = usage.get("prompt_tokens")
+            raw_out = usage.get("completion_tokens")
+            if isinstance(raw_in, int):
+                prompt_tokens = raw_in
+            if isinstance(raw_out, int):
+                completion_tokens = raw_out
+        input_chars = sum(len(_as_text(m.get("content"))) for m in messages)
+        amount = cost_tracker.estimate_chat_cost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            input_chars=0 if prompt_tokens is not None else input_chars,
+            output_chars=0,
+        )
+        await cost_tracker.record(kind="chat", amount_usd=amount)
+
+    async def _record_chat_estimate(
+        self, messages: list[dict[str, Any]], output_text: str
+    ) -> None:
+        """Estimate stream_chat spend when usage chunks are unavailable."""
+        input_chars = sum(len(_as_text(m.get("content"))) for m in messages[:-1])
+        amount = cost_tracker.estimate_chat_cost(
+            input_chars=input_chars,
+            output_chars=len(output_text),
+        )
+        await cost_tracker.record(kind="chat", amount_usd=amount)
+
     async def _post_json(
         self,
         path: str,
@@ -1989,33 +2308,57 @@ class AssistAIClient:
         timeout: httpx.Timeout | None = None,
     ) -> dict[str, Any]:
         """POST JSON на ProxyAPI. Сетевые и HTTP-ошибки становятся ``AssistAIError``."""
+        try:
+            return await safe_api_call(
+                llm_breaker,
+                self._post_json_raw,
+                path,
+                payload,
+                timeout=timeout,
+                user_message=(
+                    "⚠️ LLM сервис временно недоступен. Попробуйте через минуту."
+                ),
+            )
+        except APIUnavailableError as exc:
+            logger.error("llm_unavailable", path=path, error=exc.message)
+            raise AssistAIError(exc.message) from exc
+
+    @track_api_call(service="proxy_api", endpoint="post_json")
+    async def _post_json_raw(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
+        """Фактический HTTP POST без circuit breaker (для метрик и breaker)."""
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
         url = f"{self.config.base_url.rstrip('/')}/{path.lstrip('/')}"
-        logger.info("POST %s", url)
+        logger.info("proxy_api_post", url=url, path=path)
         try:
             response = await self._http.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
             logger.error(
-                "ProxyAPI HTTP %s для %s: %s",
-                exc.response.status_code,
-                path,
-                detail,
+                "proxy_api_http_error",
+                status_code=exc.response.status_code,
+                path=path,
+                detail=detail,
             )
             raise AssistAIError(
                 f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
                 status_code=exc.response.status_code,
             ) from exc
         except httpx.TimeoutException as exc:
-            logger.error("Таймаут запроса к %s", path)
+            logger.error("proxy_api_timeout", path=path)
             raise AssistAIError(
                 f"Превышено время ожидания ответа ProxyAPI ({path})."
             ) from exc
         except httpx.RequestError as exc:
-            logger.error("Сетевая ошибка при запросе к %s: %s", path, exc)
+            logger.error("proxy_api_network_error", path=path, error=str(exc))
             raise AssistAIError(
                 f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
             ) from exc
@@ -2023,7 +2366,7 @@ class AssistAIClient:
         try:
             data = response.json()
         except ValueError as exc:
-            logger.error("ProxyAPI вернул не-JSON для %s", path)
+            logger.error("proxy_api_non_json", path=path)
             raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
 
         if not isinstance(data, dict):
@@ -2035,7 +2378,7 @@ class AssistAIClient:
                 message = str(error.get("message") or error)
             else:
                 message = str(error)
-            logger.error("ProxyAPI вернул ошибку в теле ответа %s: %s", path, message)
+            logger.error("proxy_api_body_error", path=path, detail=message)
             raise AssistAIError(f"ProxyAPI: {message}")
         return data
 

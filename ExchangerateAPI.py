@@ -8,6 +8,12 @@ import ssl
 from dataclasses import dataclass
 
 import httpx
+import structlog
+
+from circuit_breaker import APIUnavailableError, currency_breaker, safe_api_call
+from metrics import track_api_call
+
+logger = structlog.get_logger("ExchangerateAPI")
 
 # Единственный разрешённый адрес. Другие API и пути не используются.
 CONVERT_URL = "http://api.exchangerate.host/convert"
@@ -55,6 +61,10 @@ class InvalidCurrencyError(ExchangeAPIError):
 
 class ExchangeServiceError(ExchangeAPIError):
     """Сеть, таймаут или временный отказ сервиса курсов."""
+
+
+# Client-side currency mistakes must not open the circuit.
+currency_breaker.expected_exception = (ExchangeServiceError,)
 
 
 @dataclass(frozen=True)
@@ -173,6 +183,28 @@ async def get_exchange_rate(
     if amount <= 0:
         raise ValueError("Сумма должна быть положительным числом.")
 
+    try:
+        return await safe_api_call(
+            currency_breaker,
+            _get_exchange_rate_raw,
+            source,
+            target,
+            float(amount),
+            key,
+            user_message=MSG_SERVICE_UNAVAILABLE,
+        )
+    except APIUnavailableError as exc:
+        raise ExchangeServiceError(exc.message) from exc
+
+
+@track_api_call(service="currency", endpoint="convert")
+async def _get_exchange_rate_raw(
+    source: str,
+    target: str,
+    amount: float,
+    key: str,
+) -> Conversion:
+    """Фактический HTTP-запрос к exchangerate.host."""
     params: dict[str, str | float] = {
         "access_key": key,
         "from": source,
@@ -188,6 +220,7 @@ async def get_exchange_rate(
         ) as client:
             response = await client.get(CONVERT_URL, params=params)
     except httpx.HTTPError as exc:
+        logger.error("currency_network_error", error=str(exc))
         raise ExchangeServiceError(MSG_SERVICE_UNAVAILABLE) from exc
 
     try:

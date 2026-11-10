@@ -6,3 +6,10 @@ tenacity
 aiogram>=3.31,<4
 redis[hiredis]>=5.0.0,<6
 PyMuPDF>=1.24,<2
+structlog>=24.1
+prometheus_client>=0.20
+aiohttp>=3.9
+sentry-sdk[aiohttp]>=2.0
+arq>=0.26
+imageio-ffmpeg>=0.5
+boto3>=1.34
