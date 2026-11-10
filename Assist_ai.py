@@ -255,8 +255,9 @@ class AssistAIConfig(BaseModel):
     и ``EXCHANGERATE_API_KEY``. Пустой ключ погоды или курса валют
     не мешает запустить клиент: соответствующий инструмент просто не регистрируется.
 
-    Голос: ``PROXYAPI_TRANSCRIBE_MODEL``, ``PROXYAPI_TTS_MODEL``,
-    ``PROXYAPI_TTS_VOICE``, ``PROXYAPI_TTS_FORMAT``.
+    TTS: ``TTS_PROVIDER`` = ``speechkit`` | ``proxyapi``. Для SpeechKit —
+    ``YC_SPEECHKIT_API_KEY``, ``YC_FOLDER_ID``, ``SPEECHKIT_VOICE`` / ``ROLE`` / ``SPEED``.
+    Для ProxyAPI: ``PROXYAPI_TTS_MODEL``, ``PROXYAPI_TTS_VOICE``, ``PROXYAPI_TTS_FORMAT``.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -267,12 +268,20 @@ class AssistAIConfig(BaseModel):
     base_url: str = "https://api.proxyapi.ru/v1"
     default_text_model: str = "qwen/qwen3.8-flash"
     default_image_model: str = "openai/gpt-image-1-mini"
-    default_transcribe_model: str = "openai/whisper-1"
+    default_transcribe_model: str = "openai/whisper-large-v3"
     default_tts_model: str = "openai/gpt-4o-mini-tts"
     default_tts_voice: str = "alloy"
     default_tts_format: str = "opus"
     default_image_edit_model: str = "openai/gpt-image-2.5-flare"
     default_video_model: str = "bytedance/seedance-2.0"
+    tts_provider: Literal["speechkit", "proxyapi"] = "proxyapi"
+    speechkit_api_key: str = Field(default="", repr=False)
+    speechkit_folder_id: str = ""
+    speechkit_role: str = "friendly"
+    speechkit_speed: float = Field(default=1.0, gt=0)
+    speechkit_url: str = (
+        "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
+    )
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
 
@@ -284,27 +293,73 @@ class AssistAIConfig(BaseModel):
             raise ValueError("base_url должен начинаться с http:// или https://")
         return normalized
 
+    @field_validator("tts_provider", mode="before")
+    @classmethod
+    def _normalize_tts_provider(cls, value: Any) -> str:
+        cleaned = str(value or "proxyapi").strip().casefold()
+        if cleaned not in {"speechkit", "proxyapi"}:
+            raise ValueError("tts_provider должен быть speechkit или proxyapi")
+        return cleaned
+
     @classmethod
     def from_env(cls) -> AssistAIConfig:
         """Собирает конфигурацию из переменных окружения и файла ``.env``."""
         load_dotenv(Path(__file__).resolve().parent / ".env")
         load_dotenv()
+        provider_raw = os.getenv("TTS_PROVIDER", "proxyapi").strip().casefold()
+        provider: Literal["speechkit", "proxyapi"] = (
+            "speechkit" if provider_raw == "speechkit" else "proxyapi"
+        )
+        speechkit_key = os.getenv("YC_SPEECHKIT_API_KEY", "").strip()
+        speechkit_voice = (
+            os.getenv("SPEECHKIT_VOICE", "marina").strip() or "marina"
+        )
+        speechkit_role = os.getenv("SPEECHKIT_ROLE", "friendly").strip()
+        try:
+            speechkit_speed = float(
+                os.getenv("SPEECHKIT_SPEED", "1.0").strip() or "1.0"
+            )
+        except ValueError:
+            speechkit_speed = 1.0
+        speechkit_url = (
+            os.getenv(
+                "SPEECHKIT_URL",
+                "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis",
+            ).strip()
+            or "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
+        )
+        if provider == "speechkit":
+            default_tts_voice = speechkit_voice
+            default_tts_format = "opus"
+            default_tts_model = "yandex/speechkit"
+        else:
+            default_tts_voice = os.getenv("PROXYAPI_TTS_VOICE", "alloy")
+            default_tts_format = os.getenv("PROXYAPI_TTS_FORMAT", "opus")
+            default_tts_model = os.getenv(
+                "PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"
+            )
         return cls(
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", ""),
             exchangerate_api_key=os.getenv("EXCHANGERATE_API_KEY", ""),
             default_transcribe_model=os.getenv(
-                "PROXYAPI_TRANSCRIBE_MODEL", "openai/whisper-1"
+                "PROXYAPI_TRANSCRIBE_MODEL", "openai/whisper-large-v3"
             ),
-            default_tts_model=os.getenv("PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"),
-            default_tts_voice=os.getenv("PROXYAPI_TTS_VOICE", "alloy"),
-            default_tts_format=os.getenv("PROXYAPI_TTS_FORMAT", "opus"),
+            default_tts_model=default_tts_model,
+            default_tts_voice=default_tts_voice,
+            default_tts_format=default_tts_format,
             default_image_edit_model=os.getenv(
                 "PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.5-flare"
             ),
             default_video_model=os.getenv(
                 "PROXYAPI_VIDEO_MODEL", "bytedance/seedance-2.0"
             ),
+            tts_provider=provider,
+            speechkit_api_key=speechkit_key,
+            speechkit_folder_id=os.getenv("YC_FOLDER_ID", "").strip(),
+            speechkit_role=speechkit_role,
+            speechkit_speed=speechkit_speed,
+            speechkit_url=speechkit_url,
         )
 
 
@@ -2075,11 +2130,11 @@ class AssistAIClient:
         voice: str | None = None,
         response_format: str | None = None,
     ) -> SpeechResult:
-        """Синтезирует речь через ProxyAPI ``/audio/speech``.
+        """Синтезирует речь: SpeechKit или ProxyAPI ``/audio/speech``.
 
         Args:
             text: текст ответа ассистента.
-            model: TTS-модель.
+            model: TTS-модель (только ProxyAPI).
             voice: голос.
             response_format: формат аудио. По умолчанию opus.
 
@@ -2094,6 +2149,9 @@ class AssistAIClient:
             raise ValueError("text не может быть пустым.")
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
+
+        if self.config.tts_provider == "speechkit":
+            return await self._synthesize_speech_speechkit(text, voice=voice)
 
         selected_model = model or self.config.default_tts_model
         selected_voice = voice or self.config.default_tts_voice
@@ -2145,6 +2203,44 @@ class AssistAIClient:
             raise AssistAIError("ProxyAPI вернул пустой аудиоответ.")
         filename, mime_type = _speech_file(selected_format)
         logger.info("synthesize_speech: байт=%s", len(audio))
+        return SpeechResult(audio=audio, filename=filename, mime_type=mime_type)
+
+    async def _synthesize_speech_speechkit(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> SpeechResult:
+        """Озвучка через Yandex SpeechKit TTS v3 (OGG Opus)."""
+        from speechkit_tts import SpeechKitConfig, SpeechKitError, synthesize
+
+        if not self.config.speechkit_api_key:
+            raise AssistAIError(
+                "TTS_PROVIDER=speechkit, но YC_SPEECHKIT_API_KEY не задан."
+            )
+        sk_config = SpeechKitConfig(
+            api_key=self.config.speechkit_api_key,
+            folder_id=self.config.speechkit_folder_id,
+            voice=self.config.default_tts_voice,
+            role=self.config.speechkit_role,
+            speed=self.config.speechkit_speed,
+            url=self.config.speechkit_url,
+        )
+        read_timeout = max(self.config.timeout, _SPEECH_READ_TIMEOUT)
+        try:
+            audio = await synthesize(
+                text,
+                config=sk_config,
+                voice=voice,
+                http=self._http,
+                timeout=read_timeout,
+            )
+        except SpeechKitError as exc:
+            raise AssistAIError(
+                exc.message, status_code=exc.status_code
+            ) from exc
+        filename, mime_type = _speech_file("opus")
+        logger.info("synthesize_speech speechkit: байт=%s", len(audio))
         return SpeechResult(audio=audio, filename=filename, mime_type=mime_type)
 
     async def _iter_chat_chunks(

@@ -54,11 +54,15 @@ copy .env.example .env
 
 | Переменная | Для чего |
 |------------|----------|
-| `PROXYAPI_API_KEY` | Текст, tools, картинки, STT/TTS через ProxyAPI |
-| `PROXYAPI_TRANSCRIBE_MODEL` | Модель распознавания речи (по умолчанию `openai/whisper-1`) |
-| `PROXYAPI_TTS_MODEL` | Модель озвучки |
-| `PROXYAPI_TTS_VOICE` | Голос TTS по умолчанию (`alloy` и др.) |
-| `PROXYAPI_TTS_FORMAT` | Формат аудио (`opus` и др.) |
+| `PROXYAPI_API_KEY` | Текст, tools, картинки, STT через ProxyAPI |
+| `PROXYAPI_TRANSCRIBE_MODEL` | Модель распознавания речи (по умолчанию `openai/whisper-large-v3`) |
+| `TTS_PROVIDER` | Озвучка: `speechkit` (Yandex SpeechKit) или `proxyapi` |
+| `YC_SPEECHKIT_API_KEY` | API-ключ сервисного аккаунта для SpeechKit (роль `ai.speechkit-tts.user`) |
+| `YC_FOLDER_ID` | Каталог Yandex Cloud (`x-folder-id`) |
+| `SPEECHKIT_VOICE` / `SPEECHKIT_ROLE` / `SPEECHKIT_SPEED` | Голос, амплуа и скорость SpeechKit |
+| `PROXYAPI_TTS_MODEL` | Модель озвучки ProxyAPI (если `TTS_PROVIDER=proxyapi`) |
+| `PROXYAPI_TTS_VOICE` | Голос ProxyAPI (`alloy` и др.) |
+| `PROXYAPI_TTS_FORMAT` | Формат аудио ProxyAPI (`opus` и др.) |
 | `OPENWEATHER_API_KEY` | Инструменты погоды |
 | `EXCHANGERATE_API_KEY` | Конвертация валют |
 | `TELEGRAM_BOT_TOKEN` | Токен от @BotFather |
@@ -81,6 +85,10 @@ copy .env.example .env
 Без ключа погоды или курса соответствующий инструмент не регистрируется.
 Без `PROXYAPI_API_KEY` клиент LLM не стартует. Без `TELEGRAM_BOT_TOKEN` не
 стартует бот. Если Redis недоступен, профили, темы и FSM остаются в памяти процесса.
+
+Озвучка персоны по умолчанию в `.env.example` — **Yandex SpeechKit** (`TTS_PROVIDER=speechkit`):
+API-ключ сервисного аккаунта с ролью `ai.speechkit-tts.user`, плюс `YC_FOLDER_ID`.
+Формат — OGG Opus. STT по-прежнему через ProxyAPI whisper.
 
 ## Production observability
 

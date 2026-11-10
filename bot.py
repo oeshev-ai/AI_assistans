@@ -92,13 +92,21 @@ from models_config import AVAILABLE_IMAGE_MODELS, AVAILABLE_TEXT_MODELS
 from rate_limiter import rate_limiter
 from s3_storage import S3Storage, S3StorageError, get_storage
 from security import security
+from speechkit_tts import (
+    SPEECHKIT_VOICES,
+    resolve_speechkit_voice,
+)
 from topic_history import (
     TopicConfig,
     TopicHistoryStorage,
     TopicStorageError,
     create_topic_storage,
 )
-from upload_server import is_upload_feature_ready, public_upload_url, setup_upload_routes
+from upload_server import (
+    is_upload_feature_ready,
+    public_upload_url,
+    setup_upload_routes,
+)
 from upload_sessions import (
     UploadMediaKind,
     UploadRequestContext,
@@ -145,7 +153,9 @@ MAX_MEDIA_SIZE_MB = 20  # лимит Telegram Bot API getFile
 SHOW_RECOGNIZED_TEXT = True
 VOICE_RECOGNIZED_PREVIEW_LIMIT = 500
 TTS_MAX_CHARS = 3500
-TTS_VOICES: tuple[str, ...] = ("alloy", "verse", "nova", "shimmer")
+PROXYAPI_TTS_VOICES: tuple[str, ...] = ("alloy", "verse", "nova", "shimmer")
+# Совместимость со старым именем; актуальный список — ``_tts_voices_for``.
+TTS_VOICES: tuple[str, ...] = PROXYAPI_TTS_VOICES
 STT_LANGUAGES: tuple[tuple[str, str | None], ...] = (
     ("авто", None),
     ("ru", "ru"),
@@ -1070,6 +1080,23 @@ def _clip_tts_text(text: str) -> str:
     return cut.rstrip()
 
 
+def _tts_voices_for(assistant: AssistAIClient) -> tuple[str, ...]:
+    """Список голосов для UI в зависимости от TTS-провайдера."""
+    if assistant.config.tts_provider == "speechkit":
+        return SPEECHKIT_VOICES
+    return PROXYAPI_TTS_VOICES
+
+
+def _resolve_profile_tts_voice(
+    profile: AssistantProfile, assistant: AssistAIClient
+) -> str:
+    """Голос профиля с миграцией legacy ProxyAPI → SpeechKit default."""
+    raw = profile.tts_voice or assistant.config.default_tts_voice
+    if assistant.config.tts_provider == "speechkit":
+        return resolve_speechkit_voice(raw, assistant.config.default_tts_voice)
+    return raw
+
+
 async def _send_voice_reply(
     message: Message,
     assistant: AssistAIClient,
@@ -1081,8 +1108,10 @@ async def _send_voice_reply(
     if not tts_text:
         return
     model = profile.tts_model or assistant.config.default_tts_model
-    voice = profile.tts_voice or assistant.config.default_tts_voice
+    voice = _resolve_profile_tts_voice(profile, assistant)
     fmt = profile.tts_format or assistant.config.default_tts_format
+    if assistant.config.tts_provider == "speechkit":
+        fmt = "opus"
     user_id = message.from_user.id if message.from_user else message.chat.id
     set_billing_user(user_id)
     try:
@@ -2989,19 +3018,35 @@ def _voice_settings_lines(
     profile: AssistantProfile, assistant: AssistAIClient
 ) -> list[str]:
     """Текст блока голосовых настроек персоны."""
-    tts_model = profile.tts_model or assistant.config.default_tts_model
-    tts_voice = profile.tts_voice or assistant.config.default_tts_voice
-    tts_format = profile.tts_format or assistant.config.default_tts_format
+    tts_voice = _resolve_profile_tts_voice(profile, assistant)
     stt_language = profile.stt_language or "авто"
     mode_label = _VOICE_MODE_LABELS.get(profile.voice_mode, profile.voice_mode)
-    return [
+    lines = [
         "🎙 Голос:",
         f"Режим: {mode_label}",
-        f"TTS модель: {tts_model}",
-        f"Голос: {tts_voice}",
-        f"Формат: {tts_format}",
-        f"STT язык: {stt_language}",
     ]
+    if assistant.config.tts_provider == "speechkit":
+        role = assistant.config.speechkit_role or "—"
+        lines.extend(
+            [
+                "TTS: Yandex SpeechKit",
+                f"Голос: {tts_voice}",
+                f"Амплуа: {role}",
+                "Формат: opus",
+            ]
+        )
+    else:
+        tts_model = profile.tts_model or assistant.config.default_tts_model
+        tts_format = profile.tts_format or assistant.config.default_tts_format
+        lines.extend(
+            [
+                f"TTS модель: {tts_model}",
+                f"Голос: {tts_voice}",
+                f"Формат: {tts_format}",
+            ]
+        )
+    lines.append(f"STT язык: {stt_language}")
+    return lines
 
 
 def _voice_view(
@@ -3025,9 +3070,12 @@ def _voice_view(
             )
         )
     rows.append(mode_row)
+    voices = _tts_voices_for(assistant)
+    current_voice = _resolve_profile_tts_voice(profile, assistant)
+    # По 4 голоса в ряд — SpeechKit список длиннее ProxyAPI.
+    voice_rows: list[list[InlineKeyboardButton]] = []
     voice_row: list[InlineKeyboardButton] = []
-    current_voice = profile.tts_voice or assistant.config.default_tts_voice
-    for index, name in enumerate(TTS_VOICES):
+    for index, name in enumerate(voices):
         mark = "✅ " if current_voice == name else ""
         voice_row.append(
             InlineKeyboardButton(
@@ -3035,7 +3083,12 @@ def _voice_view(
                 callback_data=f"voice_name:{index}",
             )
         )
-    rows.append(voice_row)
+        if len(voice_row) >= 4:
+            voice_rows.append(voice_row)
+            voice_row = []
+    if voice_row:
+        voice_rows.append(voice_row)
+    rows.extend(voice_rows)
     lang_row: list[InlineKeyboardButton] = []
     for label, value in STT_LANGUAGES:
         mark = "✅ " if profile.stt_language == value else ""
@@ -4562,8 +4615,9 @@ async def on_voice_name(
         await query.answer()
         return
     raw = (query.data or "").removeprefix("voice_name:")
+    voices = _tts_voices_for(assistant)
     try:
-        voice = TTS_VOICES[int(raw)]
+        voice = voices[int(raw)]
     except (ValueError, IndexError):
         await query.answer("Неизвестный голос", show_alert=True)
         return

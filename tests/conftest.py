@@ -22,6 +22,7 @@ async def assist_client() -> AsyncIterator[AssistAIClient]:
             exchangerate_api_key="test-fx-key",
             base_url="https://api.proxyapi.ru/v1",
             default_text_model="openai/gpt-4o",
+            tts_provider="proxyapi",
             timeout=5.0,
             max_tool_iterations=5,
         )

@@ -35,6 +35,7 @@ class UploadObjectStorage(Protocol):
 
     async def head_object(self, object_key: str) -> dict[str, Any]: ...
 
+
 DEFAULT_ALLOWED_MIME = (
     "audio/mpeg",
     "audio/mp3",
