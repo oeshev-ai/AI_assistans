@@ -98,8 +98,9 @@ from topic_history import (
     TopicStorageError,
     create_topic_storage,
 )
-from upload_server import is_upload_feature_ready, setup_upload_routes
+from upload_server import is_upload_feature_ready, public_upload_url, setup_upload_routes
 from upload_sessions import (
+    UploadMediaKind,
     UploadRequestContext,
     UploadSession,
     UploadSessionStore,
@@ -132,8 +133,8 @@ WELCOME = (
     "погода и валюты.\n\n"
     "Голосовое сообщение распознаётся как ваш текст и уходит в диалог.\n"
     "Длинное аудио/видео для расшифровки пришлите файлом — текст вернётся .txt.\n"
-    "Файл больше ~20 МБ: напишите персоне «нужна ссылка на загрузку» — она выдаст "
-    "одноразовую ссылку в облако, после загрузки расшифровка стартует сама.\n\n"
+    "Файл больше ~20 МБ: бот сам пришлёт ссылку на загрузку в облако "
+    "(или напишите «нужна ссылка на загрузку»).\n\n"
     "Внизу кнопки: ассистенты, темы, картинка, настройки.\n"
     "/help — справка, /cancel — отмена мастера"
 )
@@ -785,11 +786,11 @@ async def _send_generated_image(message: Message, image: str, index: int) -> Non
     await message.answer_photo(photo=BufferedInputFile(raw, filename=filename))
 
 
-def filter_sensitive_data(
-    event: dict[str, Any], hint: dict[str, Any]
-) -> dict[str, Any]:
+def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
     """Strip secrets from Sentry payloads before upload."""
     _ = hint
+    if not isinstance(event, dict):
+        return event
     request = event.get("request")
     if isinstance(request, dict):
         data = request.get("data")
@@ -816,7 +817,7 @@ def init_sentry() -> None:
         ],
         traces_sample_rate=0.1,
         send_default_pii=False,
-        before_send=filter_sensitive_data,
+        before_send=filter_sensitive_data,  # type: ignore[arg-type]
     )
     logger.info(
         "sentry_initialized",
@@ -1472,6 +1473,141 @@ async def handle_voice(
     )
 
 
+async def _delete_chat_messages(
+    bot: Bot, chat_id: int, message_ids: list[int] | None
+) -> None:
+    """Best-effort удаление служебных сообщений (ссылка на загрузку и т.п.)."""
+    if not message_ids:
+        return
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramBadRequest:
+            continue
+        except Exception:
+            logger.debug(
+                "upload_prompt_delete_failed", chat_id=chat_id, message_id=message_id
+            )
+
+
+async def _offer_cloud_upload_for_oversized(
+    message: Message,
+    assistant: AssistAIClient,
+    state: FSMContext,
+    *,
+    media_kind: UploadMediaKind,
+) -> None:
+    """После отказа Telegram getFile — пояснение + ссылка и кнопка «Отмена»."""
+    notice = await message.answer(
+        f"Файл слишком большой для Telegram (лимит ~{MAX_MEDIA_SIZE_MB} МБ).\n"
+        "Его нельзя скачать через обычное вложение."
+    )
+    chrome_ids = [notice.message_id]
+
+    if not is_upload_feature_ready():
+        tip = await message.answer(
+            "Облачная загрузка сейчас не настроена.\n"
+            f"Сожмите файл до {MAX_MEDIA_SIZE_MB} МБ или напишите администратору."
+        )
+        chrome_ids.append(tip.message_id)
+        await _append_chrome(state, chrome_ids)
+        return
+
+    store = getattr(assistant, "upload_session_store", None)
+    if not isinstance(store, UploadSessionStore):
+        tip = await message.answer(
+            "Сервис загрузки временно недоступен. Попробуйте позже."
+        )
+        chrome_ids.append(tip.message_id)
+        await _append_chrome(state, chrome_ids)
+        return
+
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    session = await store.create(
+        chat_id=message.chat.id,
+        user_id=user_id,
+        purpose="transcribe",
+        media_kind=media_kind,
+    )
+    url = public_upload_url(session.upload_id, session.token)
+    if not url:
+        tip = await message.answer(
+            "Не удалось сформировать ссылку. Напишите администратору."
+        )
+        chrome_ids.append(tip.message_id)
+        await store.delete(session.upload_id)
+        await _append_chrome(state, chrome_ids)
+        return
+
+    link_msg = await message.answer(
+        "Загрузите файл по ссылке (действует около часа):\n"
+        f"{url}\n\n"
+        "Откройте ссылку → выберите файл → дождитесь «Готово». "
+        "Расшифровка придёт в этот чат.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data=f"upload:cancel:{session.upload_id}",
+                    )
+                ]
+            ]
+        ),
+        disable_web_page_preview=True,
+    )
+    chrome_ids.append(link_msg.message_id)
+    session.prompt_message_ids = list(chrome_ids)
+    await store.update(session)
+    await _append_chrome(state, chrome_ids)
+
+
+async def on_upload_cancel(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    state: FSMContext,
+) -> None:
+    """Отмена облачной загрузки: удаляет сообщения со ссылкой и сессию."""
+    await query.answer()
+    data = query.data or ""
+    upload_id = data.removeprefix("upload:cancel:")
+    if not upload_id or query.message is None:
+        return
+    chat_id = query.message.chat.id
+    store = getattr(assistant, "upload_session_store", None)
+    bot = query.bot
+    if not isinstance(store, UploadSessionStore) or bot is None:
+        return
+    session = await store.get(upload_id)
+    if session is None or session.chat_id != chat_id:
+        if isinstance(query.message, Message):
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        await bot.send_message(chat_id, "Ссылка уже недействительна или устарела.")
+        return
+    if session.status not in {"pending"}:
+        await bot.send_message(
+            chat_id, "Загрузка уже началась или завершена — отменить нельзя."
+        )
+        return
+
+    await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
+    await store.delete(upload_id)
+    # Убрать id из chrome FSM, если ещё там.
+    stored = await state.get_data()
+    chrome = stored.get(_CHROME)
+    if isinstance(chrome, list) and session.prompt_message_ids:
+        leftover = [
+            item
+            for item in chrome
+            if isinstance(item, int) and item not in set(session.prompt_message_ids)
+        ]
+        await state.update_data({_CHROME: leftover})
+    await bot.send_message(chat_id, "Загрузка отменена.")
+
+
 def _infer_upload_media_kind(*, mime_type: str, filename: str, preferred: str) -> str:
     if preferred in {"audio", "video"}:
         return preferred
@@ -1524,16 +1660,29 @@ async def _process_s3_upload_session(
             filename=filename,
             is_video=kind == "video",
         )
+        stt_language: str | None = "ru"
+        try:
+            profile = await _active_profile(chat_id, assistant_storage)
+            if profile.stt_language:
+                stt_language = profile.stt_language
+        except Exception:
+            logger.debug("upload_stt_language_fallback_ru", chat_id=chat_id)
+
         parts: list[str] = []
         for audio_bytes, chunk_name in chunks:
             text = await job_queue.transcribe_audio(
                 assistant,
                 audio_bytes,
                 filename=chunk_name,
+                language=stt_language,
             )
             if text:
                 parts.append(text)
         transcript = "\n\n".join(parts).strip()
+        await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
+        session.prompt_message_ids = None
+        await store.update(session)
+
         if not transcript:
             await bot.send_message(chat_id, "Речь не распознана.")
             session.status = "done"
@@ -1681,8 +1830,8 @@ async def handle_audio(
         )
         return
     if audio.file_size and audio.file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
-        await message.answer(
-            f"Файл слишком большой. Лимит Telegram Bot API — {MAX_MEDIA_SIZE_MB} МБ."
+        await _offer_cloud_upload_for_oversized(
+            message, assistant, state, media_kind="audio"
         )
         return
     bot = message.bot
@@ -1737,8 +1886,8 @@ async def handle_video_file(
         return
     size = getattr(video, "file_size", None)
     if size and size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
-        await message.answer(
-            f"Файл слишком большой. Лимит Telegram Bot API — {MAX_MEDIA_SIZE_MB} МБ."
+        await _offer_cloud_upload_for_oversized(
+            message, assistant, state, media_kind="video"
         )
         return
     bot = message.bot
@@ -2031,9 +2180,11 @@ async def handle_document(
                 document.file_size is not None
                 and document.file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024
             ):
-                await message.answer(
-                    f"Файл слишком большой. Лимит Telegram Bot API — "
-                    f"{MAX_MEDIA_SIZE_MB} МБ."
+                await _offer_cloud_upload_for_oversized(
+                    message,
+                    assistant,
+                    state,
+                    media_kind="audio" if media_kind == "audio" else "video",
                 )
                 return
             try:
@@ -4544,6 +4695,9 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     )
     dispatcher.callback_query.register(
         on_topic_delete_yes, F.data.startswith("topic_del_yes:")
+    )
+    dispatcher.callback_query.register(
+        on_upload_cancel, F.data.startswith("upload:cancel:")
     )
     dispatcher.message.register(cmd_unknown, F.text.startswith("/"))
     dispatcher.message.register(sg_new_assistant_name, NewAssistantSG.name)

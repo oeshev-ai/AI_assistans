@@ -64,8 +64,8 @@ async def test_same_origin_file_upload_flow() -> None:
     setup_upload_routes(
         app,
         store=store,
-        storage=storage,
-        on_complete=on_complete,  # type: ignore[arg-type]
+        storage=storage,  # Protocol duck-typing
+        on_complete=on_complete,
     )
 
     server = TestServer(app)

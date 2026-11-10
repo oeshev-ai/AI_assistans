@@ -45,6 +45,8 @@ class UploadSession:
     mime_type: str | None = None
     file_size: int | None = None
     error: str | None = None
+    # Сообщения в чате со ссылкой/пояснением — удаляем после успеха или Отмены.
+    prompt_message_ids: list[int] | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -52,6 +54,9 @@ class UploadSession:
     @classmethod
     def from_json(cls, raw: str) -> UploadSession:
         data = json.loads(raw)
+        ids = data.get("prompt_message_ids")
+        if ids is not None and not isinstance(ids, list):
+            data["prompt_message_ids"] = None
         return cls(**data)
 
 
@@ -115,17 +120,17 @@ class UploadSessionStore:
         return session
 
     async def get(self, upload_id: str) -> UploadSession | None:
+        session: UploadSession | None
         if self._redis is not None:
             raw = await self._redis.get(f"{_REDIS_PREFIX}{upload_id}")
             if not raw:
                 return None
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            session = UploadSession.from_json(raw)
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            session = UploadSession.from_json(text)
         else:
             session = self._memory.get(upload_id)
-            if session is None:
-                return None
+        if session is None:
+            return None
         if session.expires_at < time.time():
             await self.delete(upload_id)
             return None

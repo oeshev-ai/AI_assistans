@@ -7,16 +7,33 @@ import os
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, Protocol
 
 import structlog
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 
-from s3_storage import S3Storage, S3StorageError
+from s3_storage import S3StorageError
 from upload_sessions import UploadSession, UploadSessionStore, object_key_for
 
 logger = structlog.get_logger("upload_server")
 
 UploadCompleteHandler = Callable[[UploadSession], Awaitable[None]]
+
+
+class UploadObjectStorage(Protocol):
+    """Минимальный контракт хранилища (S3Storage или тест-двойник)."""
+
+    config: Any
+
+    async def create_presigned_put(
+        self, *, object_key: str, content_type: str
+    ) -> str: ...
+
+    async def upload_file(
+        self, *, object_key: str, file_path: str, content_type: str
+    ) -> None: ...
+
+    async def head_object(self, object_key: str) -> dict[str, Any]: ...
 
 DEFAULT_ALLOWED_MIME = (
     "audio/mpeg",
@@ -194,8 +211,7 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
           }};
           xhr.ontimeout = () => reject(new Error('Таймаут загрузки. Проверьте proxy_read_timeout в nginx.'));
           xhr.onerror = () => reject(new Error(
-            'Обрыв соединения с сервером. Чаще всего: в nginx нет client_max_body_size 512m, ' +
-            'или бот не слушает 8082. Проверьте: curl -s https://assist.mrischool.ru/health'
+            'Обрыв соединения с сервером.'
           ));
           xhr.send(form);
         }});
@@ -217,7 +233,7 @@ def setup_upload_routes(
     app: web.Application,
     *,
     store: UploadSessionStore,
-    storage: S3Storage,
+    storage: UploadObjectStorage,
     on_complete: UploadCompleteHandler,
 ) -> None:
     """Регистрирует страницу и API загрузки на существующем aiohttp app."""
@@ -322,12 +338,14 @@ def setup_upload_routes(
         if session.status not in {"pending", "uploaded"}:
             return web.json_response({"error": "Сессия уже обработана"}, status=409)
 
-            try:
-                body = await request.json()
-            except Exception:
-                return web.json_response({"error": "Некорректный JSON"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
 
-            object_key = str(body.get("objectKey") or session.object_key or "").strip()
+        object_key = str(body.get("objectKey") or session.object_key or "").strip()
         expected_prefix = f"uploads/{session.upload_id}/"
         if not object_key.startswith(expected_prefix):
             return web.json_response(
@@ -390,7 +408,7 @@ def setup_upload_routes(
 
         reader = await request.multipart()
         field = await reader.next()
-        if field is None or field.name != "file":
+        if not isinstance(field, BodyPartReader) or field.name != "file":
             return web.json_response({"error": "Ожидалось поле file"}, status=400)
 
         file_name = Path(field.filename or "media.bin").name

@@ -57,30 +57,68 @@ async def extract_audio_from_video(
         src = Path(tmp) / f"input{suffix}"
         dst = Path(tmp) / "audio.mp3"
         src.write_bytes(video_bytes)
+        # 16 kHz mono — оптимально для Whisper; явный map первой аудиодорожки.
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-y",
             "-i",
             str(src),
+            "-map",
+            "0:a:0?",
             "-vn",
-            "-acodec",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
             "libmp3lame",
-            "-q:a",
-            "4",
+            "-b:a",
+            "64k",
             str(dst),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _stdout, stderr = await proc.communicate()
-        if proc.returncode != 0 or not dst.exists():
+        if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+            # Fallback без map — некоторые контейнеры криво маркируют дорожки.
             detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
-            logger.error("ffmpeg_extract_failed", detail=detail)
-            raise MediaProcessingError(
-                "Не удалось извлечь аудио из видео. Проверьте формат файла."
+            logger.warning("ffmpeg_extract_map_failed", detail=detail)
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg,
+                "-y",
+                "-i",
+                str(src),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(dst),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            _stdout, stderr = await proc.communicate()
+            if proc.returncode != 0 or not dst.exists():
+                detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
+                logger.error("ffmpeg_extract_failed", detail=detail)
+                raise MediaProcessingError(
+                    "Не удалось извлечь аудио из видео. Проверьте формат файла."
+                )
         audio = dst.read_bytes()
         if not audio:
             raise MediaProcessingError("В видео нет звуковой дорожки.")
+        # ~64 kbit/s → меньше ~8 КБ на секунду; очень маленький файл при
+        # большом видео часто значит «почти нет речи» или битая дорожка.
+        if len(video_bytes) > 5 * 1024 * 1024 and len(audio) < 32 * 1024:
+            logger.warning(
+                "audio_extracted_suspiciously_small",
+                video_bytes=len(video_bytes),
+                audio_bytes=len(audio),
+            )
         logger.info(
             "audio_extracted",
             video_bytes=len(video_bytes),
