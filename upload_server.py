@@ -174,19 +174,26 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
         const presign = await presignRes.json();
         if (!presignRes.ok) throw new Error(presign.error || 'Не удалось получить ссылку');
 
+        // Content-Type обязан совпасть с тем, что вшито в подпись URL.
+        const putType = presign.contentType || mime;
         setStatus('Загружаю в облако…');
         await new Promise((resolve, reject) => {{
           const xhr = new XMLHttpRequest();
           xhr.open('PUT', presign.signedUrl);
-          xhr.setRequestHeader('Content-Type', mime);
+          xhr.setRequestHeader('Content-Type', putType);
           xhr.upload.onprogress = (e) => {{
             if (e.lengthComputable) fill.style.width = Math.round(e.loaded / e.total * 100) + '%';
           }};
           xhr.onload = () => {{
             if (xhr.status >= 200 && xhr.status < 300) resolve();
-            else reject(new Error('Ошибка загрузки в бакет (' + xhr.status + ')'));
+            else {{
+              const hint = (xhr.responseText || '').slice(0, 180);
+              reject(new Error('Ошибка загрузки в бакет (' + xhr.status + ')' + (hint ? ': ' + hint : '')));
+            }}
           }};
-          xhr.onerror = () => reject(new Error('Сеть: не удалось загрузить файл'));
+          xhr.onerror = () => reject(new Error(
+            'Сеть/CORS: PUT в бакет заблокирован. Проверьте CORS (Origin, PUT, MaxAgeSeconds) и что URL вида bucket.storage.yandexcloud.net'
+          ));
           xhr.send(file);
         }});
 
@@ -197,7 +204,7 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
           body: JSON.stringify({{
             objectKey: presign.objectKey,
             fileName: file.name,
-            fileType: mime,
+            fileType: putType,
             fileSize: file.size
           }})
         }});

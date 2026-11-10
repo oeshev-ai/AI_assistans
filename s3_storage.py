@@ -62,13 +62,18 @@ def _build_client(config: S3Config) -> Any:
             "Пакет boto3 не установлен. Добавьте boto3 в requirements."
         ) from exc
 
+    # virtual-hosted: https://{bucket}.storage.yandexcloud.net/... — так же, как
+    # у рабочего MRISchoolClub / AWS SDK; path-style чаще ломает CORS в браузере.
     return boto3.client(
         "s3",
         endpoint_url=config.endpoint,
         region_name=config.region,
         aws_access_key_id=config.access_key_id,
         aws_secret_access_key=config.secret_access_key,
-        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
+        config=BotoConfig(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
+        ),
     )
 
 
