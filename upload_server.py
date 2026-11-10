@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import structlog
 from aiohttp import web
@@ -165,51 +167,28 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
       setStatus('Получаю ссылку для загрузки…');
 
       try {{
-        const mime = file.type || 'application/octet-stream';
-        const presignRes = await fetch('/api/uploads/' + UPLOAD_ID + '/presign?t=' + encodeURIComponent(TOKEN), {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json', 'X-Upload-Token': TOKEN }},
-          body: JSON.stringify({{ fileName: file.name, fileType: mime, fileSize: file.size }})
-        }});
-        const presign = await presignRes.json();
-        if (!presignRes.ok) throw new Error(presign.error || 'Не удалось получить ссылку');
+        // Файл идёт на наш домен (same-origin), сервер сам кладёт в S3 —
+        // так не нужен браузерный CORS к storage.yandexcloud.net (Telegram WebView).
+        setStatus('Загружаю файл…');
+        const form = new FormData();
+        form.append('file', file, file.name);
 
-        // Content-Type обязан совпасть с тем, что вшито в подпись URL.
-        const putType = presign.contentType || mime;
-        setStatus('Загружаю в облако…');
         await new Promise((resolve, reject) => {{
           const xhr = new XMLHttpRequest();
-          xhr.open('PUT', presign.signedUrl);
-          xhr.setRequestHeader('Content-Type', putType);
+          xhr.open('POST', '/api/uploads/' + UPLOAD_ID + '/file?t=' + encodeURIComponent(TOKEN));
+          xhr.setRequestHeader('X-Upload-Token', TOKEN);
           xhr.upload.onprogress = (e) => {{
             if (e.lengthComputable) fill.style.width = Math.round(e.loaded / e.total * 100) + '%';
           }};
           xhr.onload = () => {{
-            if (xhr.status >= 200 && xhr.status < 300) resolve();
-            else {{
-              const hint = (xhr.responseText || '').slice(0, 180);
-              reject(new Error('Ошибка загрузки в бакет (' + xhr.status + ')' + (hint ? ': ' + hint : '')));
-            }}
+            let payload = null;
+            try {{ payload = JSON.parse(xhr.responseText || '{{}}'); }} catch (_e) {{}}
+            if (xhr.status >= 200 && xhr.status < 300) resolve(payload);
+            else reject(new Error((payload && payload.error) || ('Ошибка загрузки (' + xhr.status + ')')));
           }};
-          xhr.onerror = () => reject(new Error(
-            'Сеть/CORS: PUT в бакет заблокирован. Проверьте CORS (Origin, PUT, MaxAgeSeconds) и что URL вида bucket.storage.yandexcloud.net'
-          ));
-          xhr.send(file);
+          xhr.onerror = () => reject(new Error('Сеть: не удалось связаться с сервером загрузки'));
+          xhr.send(form);
         }});
-
-        setStatus('Подтверждаю загрузку…');
-        const completeRes = await fetch('/api/uploads/' + UPLOAD_ID + '/complete?t=' + encodeURIComponent(TOKEN), {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json', 'X-Upload-Token': TOKEN }},
-          body: JSON.stringify({{
-            objectKey: presign.objectKey,
-            fileName: file.name,
-            fileType: putType,
-            fileSize: file.size
-          }})
-        }});
-        const complete = await completeRes.json();
-        if (!completeRes.ok) throw new Error(complete.error || 'Ошибка подтверждения');
 
         fill.style.width = '100%';
         setStatus('Готово. Можно вернуться в Telegram — бот начал обработку.', 'ok');
@@ -377,9 +356,108 @@ def setup_upload_routes(
         asyncio.create_task(_run())
         return web.json_response({"ok": True, "status": "processing"})
 
+    async def upload_file(request: web.Request) -> web.Response:
+        """Same-origin multipart → S3 (обход CORS / Telegram WebView)."""
+        upload_id = request.match_info["upload_id"]
+        token = _extract_token(request)
+        session = await store.get_authorized(upload_id, token)
+        if session is None:
+            return web.json_response({"error": "Сессия не найдена"}, status=404)
+        if session.status != "pending":
+            return web.json_response({"error": "Сессия уже использована"}, status=409)
+
+        reader = await request.multipart()
+        field = await reader.next()
+        if field is None or field.name != "file":
+            return web.json_response({"error": "Ожидалось поле file"}, status=400)
+
+        file_name = Path(field.filename or "media.bin").name
+        lower_name = file_name.lower()
+        if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+            return web.json_response({"error": "Недопустимое расширение файла"}, status=400)
+
+        header_ctype = (field.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        effective_type = header_ctype or _guess_mime(file_name)
+        if effective_type == "application/octet-stream":
+            effective_type = _guess_mime(file_name)
+        if (
+            effective_type not in allowed_mimes
+            and effective_type != "application/octet-stream"
+        ):
+            return web.json_response(
+                {"error": f"MIME не разрешён: {effective_type}"}, status=400
+            )
+
+        tmp_path: str | None = None
+        size = 0
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as tmp:
+                tmp_path = tmp.name
+                while True:
+                    chunk = await field.read_chunk(size=1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        return web.json_response(
+                            {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
+                            status=400,
+                        )
+                    tmp.write(chunk)
+
+            if size <= 0:
+                return web.json_response({"error": "Пустой файл"}, status=400)
+
+            key = object_key_for(session, file_name)
+            await storage.upload_file(
+                object_key=key,
+                file_path=tmp_path,
+                content_type=effective_type,
+            )
+
+            session.object_key = key
+            session.filename = file_name
+            session.mime_type = effective_type
+            session.file_size = size
+            session.status = "processing"
+            await store.update(session)
+
+            async def _run() -> None:
+                try:
+                    await on_complete(session)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "upload_file_handler_failed", upload_id=session.upload_id
+                    )
+                    session.status = "failed"
+                    session.error = "processing_failed"
+                    await store.update(session)
+
+            asyncio.create_task(_run())
+            return web.json_response(
+                {
+                    "ok": True,
+                    "status": "processing",
+                    "objectKey": key,
+                    "fileSize": size,
+                }
+            )
+        except S3StorageError as exc:
+            return web.json_response({"error": exc.message}, status=500)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("upload_file_failed", upload_id=upload_id)
+            return web.json_response({"error": f"Ошибка загрузки: {exc}"}, status=500)
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
     app.router.add_get("/upload/{upload_id}", page)
     app.router.add_post("/api/uploads/{upload_id}/presign", presign)
     app.router.add_post("/api/uploads/{upload_id}/complete", complete)
+    app.router.add_post("/api/uploads/{upload_id}/file", upload_file)
     logger.info("upload_routes_registered")
 
 

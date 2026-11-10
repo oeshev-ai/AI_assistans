@@ -66,7 +66,11 @@ async def start_health_server(
     setup_app: AppSetup | None = None,
 ) -> web.AppRunner:
     """Start an aiohttp app exposing ``GET /health`` on ``0.0.0.0:port``."""
-    app = web.Application()
+    import os
+
+    # Запас под multipart + большие медиа (прокси-upload через наш домен).
+    max_mb = max(1, int(os.getenv("UPLOAD_MAX_MB", "512") or "512"))
+    app = web.Application(client_max_size=(max_mb + 8) * 1024 * 1024)
     app["upload_enabled"] = False
 
     async def _handler(request: web.Request) -> web.Response:

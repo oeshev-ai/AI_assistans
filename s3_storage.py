@@ -105,6 +105,25 @@ class S3Storage:
             logger.exception("s3_presign_failed", key=object_key)
             raise S3StorageError(f"Не удалось создать ссылку загрузки: {exc}") from exc
 
+    async def upload_file(
+        self, *, object_key: str, file_path: str, content_type: str
+    ) -> None:
+        """Загружает локальный файл в бакет (серверный PUT, без CORS браузера)."""
+
+        def _upload() -> None:
+            self._client.upload_file(
+                file_path,
+                self.config.bucket,
+                object_key,
+                ExtraArgs={"ContentType": content_type},
+            )
+
+        try:
+            await asyncio.to_thread(_upload)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("s3_upload_file_failed", key=object_key)
+            raise S3StorageError(f"Не удалось загрузить объект: {exc}") from exc
+
     async def head_object(self, object_key: str) -> dict[str, Any]:
         def _head() -> dict[str, Any]:
             return self._client.head_object(

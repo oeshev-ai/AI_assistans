@@ -143,6 +143,9 @@ neurophoto (`8081`) и не торчать в интернет без nginx. О�
 На VPS с `mrischool.ru`: DNS `assist` → IP сервера, nginx
 `assist.mrischool.ru` → `http://127.0.0.1:8082`, в `.env`
 `UPLOAD_PUBLIC_BASE_URL=https://assist.mrischool.ru`.
+В nginx для этого `server` обязательно `client_max_body_size 512m;` —
+файл теперь грузится на наш домен, а сервер сам кладёт его в Object Storage
+(без браузерного CORS к Yandex; так надёжнее в Telegram WebView).
 
 После изменений кода: `docker compose up -d --build`.
 

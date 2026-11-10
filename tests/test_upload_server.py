@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
+
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from upload_server import setup_upload_routes
@@ -24,7 +26,13 @@ class FakeStorage:
         self.objects: dict[str, bytes] = {}
 
     async def create_presigned_put(self, *, object_key: str, content_type: str) -> str:
-        return f"https://storage.example/{object_key}?sig=1&ct={content_type}"
+        return f"https://bucket.storage.example/{object_key}?sig=1&ct={content_type}"
+
+    async def upload_file(
+        self, *, object_key: str, file_path: str, content_type: str
+    ) -> None:
+        with open(file_path, "rb") as handle:
+            self.objects[object_key] = handle.read()
 
     async def head_object(self, object_key: str) -> dict[str, Any]:
         data = self.objects.get(object_key)
@@ -42,7 +50,7 @@ class FakeStorage:
 
 
 @pytest.mark.asyncio
-async def test_presign_and_complete_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_same_origin_file_upload_flow() -> None:
     store = UploadSessionStore(redis=None)
     storage = FakeStorage()
     completed: list[str] = []
@@ -51,11 +59,10 @@ async def test_presign_and_complete_flow(monkeypatch: pytest.MonkeyPatch) -> Non
         completed.append(session.upload_id)
 
     session = await store.create(chat_id=42, user_id=7, purpose="transcribe")
-    app = web.Application()
+    app = web.Application(client_max_size=10 * 1024 * 1024)
     setup_upload_routes(
         app, store=store, storage=storage, on_complete=on_complete  # type: ignore[arg-type]
     )
-    app["upload_enabled"] = True
 
     server = TestServer(app)
     client = TestClient(server)
@@ -63,55 +70,33 @@ async def test_presign_and_complete_flow(monkeypatch: pytest.MonkeyPatch) -> Non
     try:
         page = await client.get(f"/upload/{session.upload_id}?t={session.token}")
         assert page.status == 200
-        assert "Большой файл" in await page.text()
+        text = await page.text()
+        assert "/api/uploads/" in text
+        assert "FormData" in text
 
-        bad = await client.post(
-            f"/api/uploads/{session.upload_id}/presign?t=bad",
-            json={"fileName": "a.mp3", "fileType": "audio/mpeg", "fileSize": 10},
+        form = FormData()
+        form.add_field(
+            "file",
+            b"ID3fake-mp3-bytes",
+            filename="lecture.mp3",
+            content_type="audio/mpeg",
         )
-        assert bad.status == 404
-
-        presign = await client.post(
-            f"/api/uploads/{session.upload_id}/presign?t={session.token}",
-            json={
-                "fileName": "lecture.mp3",
-                "fileType": "audio/mpeg",
-                "fileSize": 1024,
-            },
+        resp = await client.post(
+            f"/api/uploads/{session.upload_id}/file?t={session.token}",
+            data=form,
         )
-        assert presign.status == 200
-        payload = await presign.json()
-        assert "signedUrl" in payload
-        assert payload["objectKey"].startswith(f"uploads/{session.upload_id}/")
-
-        storage.objects[payload["objectKey"]] = b"x" * 100
-        complete = await client.post(
-            f"/api/uploads/{session.upload_id}/complete?t={session.token}",
-            json={
-                "objectKey": payload["objectKey"],
-                "fileName": "lecture.mp3",
-                "fileType": "audio/mpeg",
-                "fileSize": 100,
-            },
-        )
-        assert complete.status == 200
-        body = await complete.json()
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
         assert body["ok"] is True
+        assert body["objectKey"] in storage.objects
 
-        # background task
         for _ in range(50):
             if completed:
                 break
-            await asyncio_sleep()
+            await asyncio.sleep(0.01)
         assert completed == [session.upload_id]
     finally:
         await client.close()
-
-
-async def asyncio_sleep() -> None:
-    import asyncio
-
-    await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
