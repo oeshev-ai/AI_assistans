@@ -26,6 +26,7 @@ def test_old_profile_gets_voice_defaults() -> None:
     assert profile.voice_mode == "auto"
     assert profile.tts_model is None
     assert profile.tts_voice is None
+    assert profile.tts_role is None
     assert profile.tts_format is None
     assert profile.stt_language is None
     assert profile.vision_model is None

@@ -13,14 +13,22 @@ import structlog
 
 logger = structlog.get_logger("speechkit_tts")
 
-DEFAULT_SPEECHKIT_URL = (
-    "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
-)
+DEFAULT_SPEECHKIT_URL = "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
 DEFAULT_VOICE = "marina"
 DEFAULT_ROLE = "friendly"
 DEFAULT_SPEED = 1.0
+SPEECHKIT_MODEL_ID = "yandex/speechkit"
 
-PROXYAPI_LEGACY_VOICES = frozenset({"alloy", "verse", "nova", "shimmer", "echo", "fable", "onyx"})
+PROXYAPI_LEGACY_VOICES = frozenset(
+    {"alloy", "verse", "nova", "shimmer", "echo", "fable", "onyx"}
+)
+
+
+def is_speechkit_tts_model(model: str | None) -> bool:
+    """True для идентификатора Yandex SpeechKit в профиле/конфиге."""
+    cleaned = (model or "").strip().casefold()
+    return cleaned == SPEECHKIT_MODEL_ID or cleaned.startswith("yandex/")
+
 
 SPEECHKIT_VOICES: tuple[str, ...] = (
     "marina",
@@ -36,6 +44,22 @@ SPEECHKIT_VOICES: tuple[str, ...] = (
     "jane",
     "filipp",
 )
+
+# Амплуа по документации SpeechKit. Пустой tuple — голос без ролей (role не слать).
+SPEECHKIT_VOICE_ROLES: dict[str, tuple[str, ...]] = {
+    "marina": ("neutral", "whisper", "friendly"),
+    "alexander": ("neutral", "good"),
+    "alena": ("neutral", "good"),
+    "dasha": ("neutral", "good", "friendly"),
+    "julia": ("neutral", "strict"),
+    "lera": ("neutral", "friendly"),
+    "masha": ("good", "strict", "friendly"),
+    "kirill": ("neutral", "strict", "good"),
+    "anton": ("neutral", "good"),
+    "zahar": ("neutral", "good"),
+    "jane": ("neutral", "good", "evil"),
+    "filipp": (),
+}
 
 
 class SpeechKitError(Exception):
@@ -92,6 +116,26 @@ def resolve_speechkit_voice(voice: str | None, default: str = DEFAULT_VOICE) -> 
     if not cleaned or cleaned.casefold() in PROXYAPI_LEGACY_VOICES:
         return default
     return cleaned
+
+
+def speechkit_roles_for(voice: str | None) -> tuple[str, ...]:
+    """Допустимые амплуа для голоса; пусто — ролей нет."""
+    cleaned = (voice or "").strip().casefold()
+    if cleaned in SPEECHKIT_VOICE_ROLES:
+        return SPEECHKIT_VOICE_ROLES[cleaned]
+    # Неизвестный голос — не навязываем role.
+    return ()
+
+
+def resolve_speechkit_role(voice: str | None, role: str | None) -> str:
+    """Возвращает role только если голос его поддерживает; иначе пустая строка."""
+    allowed = speechkit_roles_for(voice)
+    if not allowed:
+        return ""
+    cleaned = (role or "").strip().casefold()
+    if cleaned in allowed:
+        return cleaned
+    return ""
 
 
 def _extract_audio_chunks(payload: Any, out: list[bytes]) -> None:
@@ -194,7 +238,8 @@ async def synthesize(
         raise SpeechKitError("YC_SPEECHKIT_API_KEY не задан.")
 
     selected_voice = resolve_speechkit_voice(voice, config.voice)
-    selected_role = (role if role is not None else config.role).strip()
+    requested_role = role if role is not None else config.role
+    selected_role = resolve_speechkit_role(selected_voice, requested_role)
     selected_speed = config.speed if speed is None else speed
     payload = _build_request_body(
         text.strip(),

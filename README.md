@@ -181,9 +181,10 @@ tools/Vision).
 - Файлы > ~20 МБ: персона выдаёт одноразовую ссылку → загрузка в Yandex Object Storage → авто-STT (нужны `YC_*` и `UPLOAD_PUBLIC_BASE_URL`)
 - Vision: фото и PDF через multimodal chat
 - Голосовые сообщения: авто-STT как текст диалога; TTS ответа по `voice_mode`
+- В настройках персоны можно выбрать TTS-модель (`yandex/speechkit`, ProxyAPI `openai/gpt-4o-mini-tts` / `elevenlabs/eleven-multilingual-v2`)
 - Погода и валюты через Function Calling
 
-Нижнее меню: **Ассистенты**, **Темы**, **Картинка**, **Настройки**.
+Нижнее меню: **Ассистенты** и **Темы** (два ряда). Настройки — команда `/settings` в меню бота (☰).
 Модели и голос правятся только в настройках.
 
 **Команды:** `/help` (справка), `/cancel` (отмена мастера). `/start` — то же, что `/help`.

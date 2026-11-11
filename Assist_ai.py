@@ -279,9 +279,7 @@ class AssistAIConfig(BaseModel):
     speechkit_folder_id: str = ""
     speechkit_role: str = "friendly"
     speechkit_speed: float = Field(default=1.0, gt=0)
-    speechkit_url: str = (
-        "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
-    )
+    speechkit_url: str = "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
 
@@ -311,9 +309,7 @@ class AssistAIConfig(BaseModel):
             "speechkit" if provider_raw == "speechkit" else "proxyapi"
         )
         speechkit_key = os.getenv("YC_SPEECHKIT_API_KEY", "").strip()
-        speechkit_voice = (
-            os.getenv("SPEECHKIT_VOICE", "marina").strip() or "marina"
-        )
+        speechkit_voice = os.getenv("SPEECHKIT_VOICE", "marina").strip() or "marina"
         speechkit_role = os.getenv("SPEECHKIT_ROLE", "friendly").strip()
         try:
             speechkit_speed = float(
@@ -331,7 +327,9 @@ class AssistAIConfig(BaseModel):
         if provider == "speechkit":
             default_tts_voice = speechkit_voice
             default_tts_format = "opus"
-            default_tts_model = "yandex/speechkit"
+            from speechkit_tts import SPEECHKIT_MODEL_ID
+
+            default_tts_model = SPEECHKIT_MODEL_ID
         else:
             default_tts_voice = os.getenv("PROXYAPI_TTS_VOICE", "alloy")
             default_tts_format = os.getenv("PROXYAPI_TTS_FORMAT", "opus")
@@ -2129,6 +2127,7 @@ class AssistAIClient:
         model: str | None = None,
         voice: str | None = None,
         response_format: str | None = None,
+        role: str | None = None,
     ) -> SpeechResult:
         """Синтезирует речь: SpeechKit или ProxyAPI ``/audio/speech``.
 
@@ -2137,6 +2136,7 @@ class AssistAIClient:
             model: TTS-модель (только ProxyAPI).
             voice: голос.
             response_format: формат аудио. По умолчанию opus.
+            role: амплуа SpeechKit (игнорируется, если голос его не поддерживает).
 
         Returns:
             SpeechResult с байтами аудио, filename и mime_type.
@@ -2150,12 +2150,19 @@ class AssistAIClient:
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
-        if self.config.tts_provider == "speechkit":
-            return await self._synthesize_speech_speechkit(text, voice=voice)
-
         selected_model = model or self.config.default_tts_model
+        from models_config import ELEVENLABS_TTS_VOICES, is_elevenlabs_tts_model
+        from speechkit_tts import is_speechkit_tts_model
+
+        if is_speechkit_tts_model(selected_model):
+            return await self._synthesize_speech_speechkit(text, voice=voice, role=role)
+
         selected_voice = voice or self.config.default_tts_voice
         selected_format = response_format or self.config.default_tts_format
+        if is_elevenlabs_tts_model(selected_model):
+            selected_format = "mp3"
+            if selected_voice not in ELEVENLABS_TTS_VOICES:
+                selected_voice = ELEVENLABS_TTS_VOICES[0]
         payload = {
             "model": selected_model,
             "input": text,
@@ -2210,13 +2217,14 @@ class AssistAIClient:
         text: str,
         *,
         voice: str | None = None,
+        role: str | None = None,
     ) -> SpeechResult:
         """Озвучка через Yandex SpeechKit TTS v3 (OGG Opus)."""
         from speechkit_tts import SpeechKitConfig, SpeechKitError, synthesize
 
         if not self.config.speechkit_api_key:
             raise AssistAIError(
-                "TTS_PROVIDER=speechkit, но YC_SPEECHKIT_API_KEY не задан."
+                "Выбрана модель Yandex SpeechKit, но YC_SPEECHKIT_API_KEY не задан."
             )
         sk_config = SpeechKitConfig(
             api_key=self.config.speechkit_api_key,
@@ -2232,13 +2240,12 @@ class AssistAIClient:
                 text,
                 config=sk_config,
                 voice=voice,
+                role=role,
                 http=self._http,
                 timeout=read_timeout,
             )
         except SpeechKitError as exc:
-            raise AssistAIError(
-                exc.message, status_code=exc.status_code
-            ) from exc
+            raise AssistAIError(exc.message, status_code=exc.status_code) from exc
         filename, mime_type = _speech_file("opus")
         logger.info("synthesize_speech speechkit: байт=%s", len(audio))
         return SpeechResult(audio=audio, filename=filename, mime_type=mime_type)

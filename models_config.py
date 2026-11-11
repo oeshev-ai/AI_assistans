@@ -35,3 +35,38 @@ AVAILABLE_IMAGE_MODELS: tuple[str, ...] = (
     "bytedance-seed/seedream-5-0-flash",
     "recraft/recraft-v4.1",
 )
+
+# Озвучка: SpeechKit + модели ProxyAPI /audio/speech.
+SPEECHKIT_TTS_MODEL = "yandex/speechkit"
+AVAILABLE_TTS_MODELS: tuple[str, ...] = (
+    SPEECHKIT_TTS_MODEL,
+    "openai/gpt-4o-mini-tts",
+    "elevenlabs/eleven-multilingual-v2",
+)
+
+# Голоса ProxyAPI OpenAI TTS (alloy и др.).
+OPENAI_TTS_VOICES: tuple[str, ...] = ("alloy", "verse", "nova", "shimmer")
+
+# Голоса ProxyAPI ElevenLabs multilingual v2 (см. карточку модели).
+ELEVENLABS_TTS_VOICES: tuple[str, ...] = (
+    "george",
+    "sarah",
+    "adam",
+    "alice",
+    "bella",
+    "brian",
+    "charlie",
+    "daniel",
+    "jessica",
+    "laura",
+    "liam",
+    "lily",
+    "matilda",
+    "river",
+    "will",
+)
+
+
+def is_elevenlabs_tts_model(model: str | None) -> bool:
+    """True для моделей ElevenLabs через ProxyAPI."""
+    return (model or "").strip().casefold().startswith("elevenlabs/")

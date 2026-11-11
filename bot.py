@@ -88,13 +88,23 @@ from media_tools import (
 )
 from media_utils import MediaProcessingError, prepare_audio_for_stt
 from metrics import note_active_user, observe_message, start_metrics_server
-from models_config import AVAILABLE_IMAGE_MODELS, AVAILABLE_TEXT_MODELS
+from models_config import (
+    AVAILABLE_IMAGE_MODELS,
+    AVAILABLE_TEXT_MODELS,
+    AVAILABLE_TTS_MODELS,
+    ELEVENLABS_TTS_VOICES,
+    OPENAI_TTS_VOICES,
+    is_elevenlabs_tts_model,
+)
 from rate_limiter import rate_limiter
 from s3_storage import S3Storage, S3StorageError, get_storage
 from security import security
 from speechkit_tts import (
     SPEECHKIT_VOICES,
+    is_speechkit_tts_model,
+    resolve_speechkit_role,
     resolve_speechkit_voice,
+    speechkit_roles_for,
 )
 from topic_history import (
     TopicConfig,
@@ -143,8 +153,8 @@ WELCOME = (
     "Длинное аудио/видео для расшифровки пришлите файлом — текст вернётся .txt.\n"
     "Файл больше ~20 МБ: бот сам пришлёт ссылку на загрузку в облако "
     "(или напишите «нужна ссылка на загрузку»).\n\n"
-    "Внизу кнопки: ассистенты, темы, картинка, настройки.\n"
-    "/help — справка, /cancel — отмена мастера"
+    "Внизу кнопки: ассистенты и темы.\n"
+    "Меню (☰): /settings — настройки, /help — справка, /cancel — отмена мастера"
 )
 InputKind = Literal["text", "voice"]
 MAX_VOICE_DURATION_SECONDS = 600
@@ -153,24 +163,11 @@ MAX_MEDIA_SIZE_MB = 20  # лимит Telegram Bot API getFile
 SHOW_RECOGNIZED_TEXT = True
 VOICE_RECOGNIZED_PREVIEW_LIMIT = 500
 TTS_MAX_CHARS = 3500
-PROXYAPI_TTS_VOICES: tuple[str, ...] = ("alloy", "verse", "nova", "shimmer")
 # Совместимость со старым именем; актуальный список — ``_tts_voices_for``.
-TTS_VOICES: tuple[str, ...] = PROXYAPI_TTS_VOICES
-STT_LANGUAGES: tuple[tuple[str, str | None], ...] = (
-    ("авто", None),
-    ("ru", "ru"),
-    ("en", "en"),
-)
-
+PROXYAPI_TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
+TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
 _MENU_ASSISTANTS = "Ассистенты"
 _MENU_TOPICS = "Темы"
-_MENU_SETTINGS = "Настройки"
-MAIN_MENU_TEXT = {
-    "assistants": "🤖 Ассистенты",
-    "topics": "💬 Темы",
-    "image": "🖼 Картинка",
-    "settings": "⚙️ Настройки",
-}
 _OPENAI_IMAGE_SIZES: tuple[str, ...] = ("1024x1024", "1024x1792", "1792x1024")
 _TIER_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K")
 _ASPECT_IMAGE_SIZES: tuple[str, ...] = ("1:1", "16:9", "9:16")
@@ -285,14 +282,11 @@ def _menu_button(title: str, name: str) -> str:
 
 
 def _reply_menu(assistant_name: str, topic_name: str) -> ReplyKeyboardMarkup:
-    """Три кнопки: персоны, темы активной персоны и её настройки."""
+    """Две кнопки в два ряда: персоны и темы. Настройки — в меню команд."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text=_menu_button(_MENU_ASSISTANTS, assistant_name)),
-                KeyboardButton(text=_menu_button(_MENU_TOPICS, topic_name)),
-            ],
-            [KeyboardButton(text=_MENU_SETTINGS)],
+            [KeyboardButton(text=_menu_button(_MENU_ASSISTANTS, assistant_name))],
+            [KeyboardButton(text=_menu_button(_MENU_TOPICS, topic_name))],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -964,7 +958,9 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     try:
         await bot.set_my_commands(
             [
+                BotCommand(command="settings", description="Настройки персоны"),
                 BotCommand(command="help", description="Что умеет бот"),
+                BotCommand(command="cancel", description="Отмена мастера"),
             ]
         )
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -1080,21 +1076,57 @@ def _clip_tts_text(text: str) -> str:
     return cut.rstrip()
 
 
-def _tts_voices_for(assistant: AssistAIClient) -> tuple[str, ...]:
-    """Список голосов для UI в зависимости от TTS-провайдера."""
-    if assistant.config.tts_provider == "speechkit":
+def _tts_model_of(profile: AssistantProfile, assistant: AssistAIClient) -> str:
+    """Эффективная TTS-модель персоны (пустой выбор = дефолт конфига)."""
+    return profile.tts_model or assistant.config.default_tts_model
+
+
+def _tts_voices_for(
+    assistant: AssistAIClient, *, model_id: str | None = None
+) -> tuple[str, ...]:
+    """Список голосов для UI в зависимости от TTS-модели."""
+    effective = model_id or assistant.config.default_tts_model
+    if is_speechkit_tts_model(effective):
         return SPEECHKIT_VOICES
-    return PROXYAPI_TTS_VOICES
+    if is_elevenlabs_tts_model(effective):
+        return ELEVENLABS_TTS_VOICES
+    return OPENAI_TTS_VOICES
 
 
 def _resolve_profile_tts_voice(
     profile: AssistantProfile, assistant: AssistAIClient
 ) -> str:
-    """Голос профиля с миграцией legacy ProxyAPI → SpeechKit default."""
+    """Голос профиля с миграцией при смене семейства TTS-модели."""
+    model_id = _tts_model_of(profile, assistant)
     raw = profile.tts_voice or assistant.config.default_tts_voice
-    if assistant.config.tts_provider == "speechkit":
-        return resolve_speechkit_voice(raw, assistant.config.default_tts_voice)
-    return raw
+    if is_speechkit_tts_model(model_id):
+        default = (
+            assistant.config.default_tts_voice
+            if is_speechkit_tts_model(assistant.config.default_tts_model)
+            else "marina"
+        )
+        return resolve_speechkit_voice(raw, default)
+    voices = _tts_voices_for(assistant, model_id=model_id)
+    if raw in voices:
+        return raw
+    if assistant.config.default_tts_voice in voices:
+        return assistant.config.default_tts_voice
+    return voices[0]
+
+
+def _compatible_tts_voice(
+    profile: AssistantProfile,
+    assistant: AssistAIClient,
+    *,
+    new_model: str | None,
+) -> str | None:
+    """Голос после смены TTS-модели; сбрасывает несовместимый."""
+    effective = new_model or assistant.config.default_tts_model
+    voices = _tts_voices_for(assistant, model_id=effective)
+    current = profile.tts_voice
+    if current in voices:
+        return current
+    return None
 
 
 async def _send_voice_reply(
@@ -1107,11 +1139,17 @@ async def _send_voice_reply(
     tts_text = _clip_tts_text(text)
     if not tts_text:
         return
-    model = profile.tts_model or assistant.config.default_tts_model
+    model = _tts_model_of(profile, assistant)
     voice = _resolve_profile_tts_voice(profile, assistant)
     fmt = profile.tts_format or assistant.config.default_tts_format
-    if assistant.config.tts_provider == "speechkit":
+    role: str | None = None
+    if is_speechkit_tts_model(model):
         fmt = "opus"
+        requested_role = profile.tts_role or assistant.config.speechkit_role
+        role = resolve_speechkit_role(voice, requested_role) or None
+    elif is_elevenlabs_tts_model(model):
+        # ProxyAPI ElevenLabs отдаёт MP3; opus/alloy-голоса OpenAI не принимаются.
+        fmt = "mp3"
     user_id = message.from_user.id if message.from_user else message.chat.id
     set_billing_user(user_id)
     try:
@@ -1124,6 +1162,7 @@ async def _send_voice_reply(
             model=model,
             voice=voice,
             response_format=fmt,
+            role=role,
         )
         await cost_tracker.record(
             kind="tts",
@@ -1142,6 +1181,13 @@ async def _send_voice_reply(
         await message.answer("⚠️ Не удалось озвучить ответ.")
         return
     audio = BufferedInputFile(speech.audio, filename=speech.filename)
+    # MP3 (ElevenLabs) — как audio; OGG — как voice-bubble.
+    if speech.mime_type == "audio/mpeg" or speech.filename.casefold().endswith(".mp3"):
+        try:
+            await message.answer_audio(audio=audio)
+        except TelegramBadRequest as exc:
+            logger.warning("Не удалось отправить озвучку (audio): %s", exc)
+        return
     try:
         await message.answer_voice(voice=audio)
     except TelegramBadRequest as exc:
@@ -1431,12 +1477,12 @@ async def handle_voice(
             user_id, cost_tracker.estimate_stt_cost(float(voice.duration))
         )
         audio_bytes, filename = await _download_voice(message)
-        profile = await _active_profile(chat_id, assistant_storage)
+        await _active_profile(chat_id, assistant_storage)
         transcribed = await job_queue.transcribe_audio(
             assistant,
             audio_bytes,
             filename=filename,
-            language=profile.stt_language,
+            language=None,
         )
         await cost_tracker.record(
             kind="stt",
@@ -1689,21 +1735,13 @@ async def _process_s3_upload_session(
             filename=filename,
             is_video=kind == "video",
         )
-        stt_language: str | None = "ru"
-        try:
-            profile = await _active_profile(chat_id, assistant_storage)
-            if profile.stt_language:
-                stt_language = profile.stt_language
-        except Exception:
-            logger.debug("upload_stt_language_fallback_ru", chat_id=chat_id)
-
         parts: list[str] = []
         for audio_bytes, chunk_name in chunks:
             text = await job_queue.transcribe_audio(
                 assistant,
                 audio_bytes,
                 filename=chunk_name,
-                language=stt_language,
+                language=None,
             )
             if text:
                 parts.append(text)
@@ -2444,6 +2482,28 @@ async def _apply_model_choice(
             if image_model_family(old_model) != image_model_family(new_model):
                 fields["image_size"] = _default_image_size(new_model)
             updated = profile.model_copy(update=fields)
+        elif kind == "tts":
+            effective = selected or assistant.config.default_tts_model
+            new_voice = _compatible_tts_voice(profile, assistant, new_model=selected)
+            fields: dict[str, Any] = {
+                "tts_model": selected,
+                "tts_voice": new_voice,
+            }
+            if is_speechkit_tts_model(effective):
+                fields["tts_format"] = "opus"
+                voice_for_role = new_voice or (
+                    assistant.config.default_tts_voice
+                    if is_speechkit_tts_model(assistant.config.default_tts_model)
+                    else "marina"
+                )
+                fields["tts_role"] = (
+                    resolve_speechkit_role(voice_for_role, profile.tts_role) or None
+                )
+            else:
+                fields["tts_role"] = None
+                if is_elevenlabs_tts_model(effective):
+                    fields["tts_format"] = "mp3"
+            updated = profile.model_copy(update=fields)
         else:
             updated = profile.model_copy(update={"text_model": selected})
         await assistant_storage.save_assistant(chat_id, updated)
@@ -2451,8 +2511,8 @@ async def _apply_model_choice(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer("Модель обновлена")
-    if kind == "image":
-        text, markup = _model_picker_parts(updated, assistant, "image")
+    if kind in {"image", "tts"}:
+        text, markup = _model_picker_parts(updated, assistant, kind)
         await _edit_inline(message, text, markup)
         return
     await _return_to_settings(message, state, updated, assistant)
@@ -2529,16 +2589,8 @@ def _release_outgoing(token: Token[bool] | None) -> Token[bool] | None:
 
 
 def _is_menu_button(text: str) -> bool:
-    """Нижние кнопки и их старые подписи. Это не вопрос к персоне."""
-    if text.startswith((f"{_MENU_ASSISTANTS} (", f"{_MENU_TOPICS} (")):
-        return True
-    return text in {
-        _MENU_SETTINGS,
-        MAIN_MENU_TEXT["assistants"],
-        MAIN_MENU_TEXT["topics"],
-        MAIN_MENU_TEXT["settings"],
-        MAIN_MENU_TEXT["image"],
-    }
+    """Нижние кнопки «Ассистенты» / «Темы». Это не вопрос к персоне."""
+    return text.startswith((f"{_MENU_ASSISTANTS} (", f"{_MENU_TOPICS} ("))
 
 
 async def _append_chrome(state: FSMContext, ids: list[int]) -> None:
@@ -3004,6 +3056,91 @@ def _model_picker_parts(
             "Выберите модель или размер:"
         )
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    if kind == "tts":
+        current = _chosen_model_line(
+            profile.tts_model, assistant.config.default_tts_model
+        )
+        tts_model = _tts_model_of(profile, assistant)
+        tts_voice = _resolve_profile_tts_voice(profile, assistant)
+        mode_label = _VOICE_MODE_LABELS.get(profile.voice_mode, profile.voice_mode)
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, model in enumerate(AVAILABLE_TTS_MODELS):
+            mark = "✅ " if tts_model == model else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=_clip_label(mark, model),
+                        callback_data=f"set_tts:{index}",
+                    )
+                ]
+            )
+        rows.append(
+            [InlineKeyboardButton(text="По умолчанию", callback_data="set_tts:default")]
+        )
+        mode_row: list[InlineKeyboardButton] = []
+        for mode in ("off", "auto", "always"):
+            mark = "✅ " if profile.voice_mode == mode else ""
+            mode_row.append(
+                InlineKeyboardButton(
+                    text=f"{mark}{_VOICE_MODE_LABELS[mode]}",
+                    callback_data=f"voice_mode:{mode}",
+                )
+            )
+        rows.append(mode_row)
+        voices = _tts_voices_for(assistant, model_id=tts_model)
+        voice_row: list[InlineKeyboardButton] = []
+        for index, name in enumerate(voices):
+            mark = "✅ " if tts_voice == name else ""
+            voice_row.append(
+                InlineKeyboardButton(
+                    text=f"{mark}{name}",
+                    callback_data=f"voice_name:{index}",
+                )
+            )
+            if len(voice_row) >= 4:
+                rows.append(voice_row)
+                voice_row = []
+        if voice_row:
+            rows.append(voice_row)
+        extra = ""
+        if is_speechkit_tts_model(tts_model):
+            roles = speechkit_roles_for(tts_voice)
+            requested = profile.tts_role or assistant.config.speechkit_role
+            effective_role = resolve_speechkit_role(tts_voice, requested)
+            if roles:
+                role_row: list[InlineKeyboardButton] = []
+                for name in roles:
+                    mark = "✅ " if effective_role == name else ""
+                    role_row.append(
+                        InlineKeyboardButton(
+                            text=f"{mark}{name}",
+                            callback_data=f"voice_role:{name}",
+                        )
+                    )
+                    if len(role_row) >= 4:
+                        rows.append(role_row)
+                        role_row = []
+                if role_row:
+                    rows.append(role_row)
+                role_label = effective_role or "дефолт голоса"
+            else:
+                role_label = "не поддерживается"
+            extra = f"Амплуа: {role_label}\nФормат: opus\n"
+        elif is_elevenlabs_tts_model(tts_model):
+            extra = "Формат: mp3\n"
+        else:
+            fmt = profile.tts_format or assistant.config.default_tts_format
+            extra = f"Формат: {fmt}\n"
+        rows.append([InlineKeyboardButton(text="Готово", callback_data="picker:done")])
+        text = (
+            f"Голосовой ответ — «{profile.name}»\n"
+            f"Модель: {current}\n"
+            f"Режим: {mode_label}\n"
+            f"Голос: {tts_voice}\n"
+            f"{extra}\n"
+            "Выберите модель, режим, голос или амплуа:"
+        )
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
     current = _chosen_model_line(
         profile.text_model, assistant.config.default_text_model
     )
@@ -3012,95 +3149,6 @@ def _model_picker_parts(
         f"Текстовая модель ассистента «{profile.name}»:\n{current}\n\nВыберите модель:"
     )
     return text, keyboard
-
-
-def _voice_settings_lines(
-    profile: AssistantProfile, assistant: AssistAIClient
-) -> list[str]:
-    """Текст блока голосовых настроек персоны."""
-    tts_voice = _resolve_profile_tts_voice(profile, assistant)
-    stt_language = profile.stt_language or "авто"
-    mode_label = _VOICE_MODE_LABELS.get(profile.voice_mode, profile.voice_mode)
-    lines = [
-        "🎙 Голос:",
-        f"Режим: {mode_label}",
-    ]
-    if assistant.config.tts_provider == "speechkit":
-        role = assistant.config.speechkit_role or "—"
-        lines.extend(
-            [
-                "TTS: Yandex SpeechKit",
-                f"Голос: {tts_voice}",
-                f"Амплуа: {role}",
-                "Формат: opus",
-            ]
-        )
-    else:
-        tts_model = profile.tts_model or assistant.config.default_tts_model
-        tts_format = profile.tts_format or assistant.config.default_tts_format
-        lines.extend(
-            [
-                f"TTS модель: {tts_model}",
-                f"Голос: {tts_voice}",
-                f"Формат: {tts_format}",
-            ]
-        )
-    lines.append(f"STT язык: {stt_language}")
-    return lines
-
-
-def _voice_view(
-    profile: AssistantProfile, assistant: AssistAIClient
-) -> tuple[str, InlineKeyboardMarkup]:
-    """Экран голосового ответа: режим, голос TTS, язык STT."""
-    lines = [
-        f"Голосовой ответ — «{profile.name}»",
-        "",
-        *_voice_settings_lines(profile, assistant),
-    ]
-    text = "\n".join(lines)
-    rows: list[list[InlineKeyboardButton]] = []
-    mode_row: list[InlineKeyboardButton] = []
-    for mode in ("off", "auto", "always"):
-        mark = "✅ " if profile.voice_mode == mode else ""
-        mode_row.append(
-            InlineKeyboardButton(
-                text=f"{mark}{_VOICE_MODE_LABELS[mode]}",
-                callback_data=f"voice_mode:{mode}",
-            )
-        )
-    rows.append(mode_row)
-    voices = _tts_voices_for(assistant)
-    current_voice = _resolve_profile_tts_voice(profile, assistant)
-    # По 4 голоса в ряд — SpeechKit список длиннее ProxyAPI.
-    voice_rows: list[list[InlineKeyboardButton]] = []
-    voice_row: list[InlineKeyboardButton] = []
-    for index, name in enumerate(voices):
-        mark = "✅ " if current_voice == name else ""
-        voice_row.append(
-            InlineKeyboardButton(
-                text=f"{mark}{name}",
-                callback_data=f"voice_name:{index}",
-            )
-        )
-        if len(voice_row) >= 4:
-            voice_rows.append(voice_row)
-            voice_row = []
-    if voice_row:
-        voice_rows.append(voice_row)
-    rows.extend(voice_rows)
-    lang_row: list[InlineKeyboardButton] = []
-    for label, value in STT_LANGUAGES:
-        mark = "✅ " if profile.stt_language == value else ""
-        lang_row.append(
-            InlineKeyboardButton(
-                text=f"{mark}STT {label}",
-                callback_data=f"stt_lang:{label}",
-            )
-        )
-    rows.append(lang_row)
-    rows.append([InlineKeyboardButton(text="Готово", callback_data="settings:open")])
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _settings_view(
@@ -3120,6 +3168,10 @@ def _settings_view(
             f"{_chosen_model_line(profile.image_model, assistant.config.default_image_model)}"
         ),
         f"Размер картинки: {shown_size}",
+        (
+            "TTS модель: "
+            f"{_chosen_model_line(profile.tts_model, assistant.config.default_tts_model)}"
+        ),
         f"Голосовой ответ: {mode_label}",
     ]
     text = "\n".join(lines)
@@ -3380,31 +3432,9 @@ async def on_menu_settings(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Кнопка «Настройки» показывает модели активной персоны."""
+    """``/settings`` — настройки активной персоны."""
     await _drop_flow(state)
     await _open_settings(message, assistant, assistant_storage, state)
-
-
-async def on_menu_image(
-    message: Message,
-    assistant: AssistAIClient,
-    assistant_storage: AssistantStorage,
-    state: FSMContext,
-) -> None:
-    """Кнопка «Картинка» открывает выбор модели и размера."""
-    await _drop_flow(state)
-    try:
-        profile = await _active_profile(message.chat.id, assistant_storage)
-    except AssistantStorageError:
-        await _reply_profile_error(message)
-        return
-    selected = profile.image_model
-    model_id = selected or assistant.config.default_image_model
-    size = _default_image_size(model_id)
-    await state.set_state(ImageSG.config)
-    await state.update_data(image_model=selected, image_size=size)
-    text, markup = _image_view(selected, size, assistant)
-    await _upsert_screen(message, state, _SCREEN_IMAGE, text, markup)
 
 
 async def on_asst_list(
@@ -4462,6 +4492,24 @@ async def on_set_image_menu(
     await _open_model_menu(query, assistant, assistant_storage, state, kind="image")
 
 
+async def on_set_tts_model(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Записывает TTS-модель в активный профиль (экран голосового ответа)."""
+    await _apply_model_choice(
+        query,
+        assistant,
+        assistant_storage,
+        state,
+        catalog=AVAILABLE_TTS_MODELS,
+        prefix="set_tts:",
+        kind="tts",
+    )
+
+
 async def on_settings_open(
     query: CallbackQuery,
     assistant: AssistAIClient,
@@ -4541,7 +4589,7 @@ async def on_picker_done(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Закрывает выбор модели картинок и возвращает к настройкам."""
+    """Закрывает выбор модели (картинки / TTS) и возвращает к настройкам."""
     message = _query_message(query)
     if message is None:
         await query.answer()
@@ -4561,20 +4609,8 @@ async def on_voice_menu(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Открывает экран голосового ответа поверх сообщения настроек."""
-    message = _query_message(query)
-    if message is None:
-        await query.answer()
-        return
-    try:
-        profile = await _active_profile(message.chat.id, assistant_storage)
-    except AssistantStorageError as exc:
-        await query.answer(exc.message, show_alert=True)
-        return
-    await query.answer()
-    text, markup = _voice_view(profile, assistant)
-    await _edit_inline(message, text, markup)
-    await state.update_data({_SCREEN_SETTINGS: message.message_id})
+    """Открывает выбор TTS-модели и голоса отдельным сообщением."""
+    await _open_model_menu(query, assistant, assistant_storage, state, kind="tts")
 
 
 async def on_voice_mode(
@@ -4600,7 +4636,7 @@ async def on_voice_mode(
         return
     label = _VOICE_MODE_LABELS[mode]
     await query.answer(f"Режим: {label}")
-    text, markup = _voice_view(updated, assistant)
+    text, markup = _model_picker_parts(updated, assistant, "tts")
     await _edit_or_answer(query, text, markup)
 
 
@@ -4615,49 +4651,51 @@ async def on_voice_name(
         await query.answer()
         return
     raw = (query.data or "").removeprefix("voice_name:")
-    voices = _tts_voices_for(assistant)
     try:
+        profile = await _active_profile(message.chat.id, assistant_storage)
+        voices = _tts_voices_for(assistant, model_id=_tts_model_of(profile, assistant))
         voice = voices[int(raw)]
+        fields: dict[str, Any] = {"tts_voice": voice}
+        if is_speechkit_tts_model(_tts_model_of(profile, assistant)):
+            # Сбрасываем амплуа, если новый голос его не поддерживает.
+            fields["tts_role"] = resolve_speechkit_role(voice, profile.tts_role) or None
+        updated = profile.model_copy(update=fields)
+        await assistant_storage.save_assistant(message.chat.id, updated)
     except (ValueError, IndexError):
         await query.answer("Неизвестный голос", show_alert=True)
         return
-    try:
-        profile = await _active_profile(message.chat.id, assistant_storage)
-        updated = profile.model_copy(update={"tts_voice": voice})
-        await assistant_storage.save_assistant(message.chat.id, updated)
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer(f"Голос: {voice}")
-    text, markup = _voice_view(updated, assistant)
+    text, markup = _model_picker_parts(updated, assistant, "tts")
     await _edit_or_answer(query, text, markup)
 
 
-async def on_stt_language(
+async def on_voice_role(
     query: CallbackQuery,
     assistant: AssistAIClient,
     assistant_storage: AssistantStorage,
 ) -> None:
-    """Задаёт язык распознавания речи для активной персоны."""
+    """Выбирает амплуа SpeechKit для текущего голоса."""
     message = _query_message(query)
     if message is None:
         await query.answer()
         return
-    label = (query.data or "").removeprefix("stt_lang:")
-    mapping = {item[0]: item[1] for item in STT_LANGUAGES}
-    if label not in mapping:
-        await query.answer("Неизвестный язык", show_alert=True)
-        return
-    language = mapping[label]
+    role = (query.data or "").removeprefix("voice_role:").strip().casefold()
     try:
         profile = await _active_profile(message.chat.id, assistant_storage)
-        updated = profile.model_copy(update={"stt_language": language})
+        voice = _resolve_profile_tts_voice(profile, assistant)
+        if role not in speechkit_roles_for(voice):
+            await query.answer("Это амплуа недоступно для голоса", show_alert=True)
+            return
+        updated = profile.model_copy(update={"tts_role": role})
         await assistant_storage.save_assistant(message.chat.id, updated)
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
-    await query.answer(f"STT: {label}")
-    text, markup = _voice_view(updated, assistant)
+    await query.answer(f"Амплуа: {role}")
+    text, markup = _model_picker_parts(updated, assistant, "tts")
     await _edit_or_answer(query, text, markup)
 
 
@@ -4708,10 +4746,11 @@ class _CommandLeavesWizard(BaseMiddleware):
 
 
 def _register_handlers(dispatcher: Dispatcher) -> None:
-    """Служебные команды — только /start, /help и /cancel.
+    """Служебные команды: /start, /help, /cancel, /settings.
 
-    Остальное — кнопки нижнего меню и inline. ``aiogram.filters.Text`` удалён
-    в aiogram 3.31; любой некомандный текст ловит ``F.text``.
+    Внизу — кнопки ассистентов и тем; остальное — inline.
+    ``aiogram.filters.Text`` удалён в aiogram 3.31; любой некомандный текст
+    ловит ``F.text``.
     """
     dispatcher.message.middleware(_CleanChat())
     dispatcher.callback_query.middleware(_CleanChat())
@@ -4719,19 +4758,14 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(cmd_start, CommandStart())
     dispatcher.message.register(cmd_start, Command("help"))
     dispatcher.message.register(cmd_cancel, Command("cancel"))
+    dispatcher.message.register(on_menu_settings, Command("settings"))
     dispatcher.message.register(
         on_menu_assistants,
-        F.text.startswith(f"{_MENU_ASSISTANTS} (")
-        | (F.text == MAIN_MENU_TEXT["assistants"]),
+        F.text.startswith(f"{_MENU_ASSISTANTS} ("),
     )
     dispatcher.message.register(
         on_menu_topics,
-        F.text.startswith(f"{_MENU_TOPICS} (") | (F.text == MAIN_MENU_TEXT["topics"]),
-    )
-    dispatcher.message.register(on_menu_image, F.text == MAIN_MENU_TEXT["image"])
-    dispatcher.message.register(
-        on_menu_settings,
-        (F.text == _MENU_SETTINGS) | (F.text == MAIN_MENU_TEXT["settings"]),
+        F.text.startswith(f"{_MENU_TOPICS} ("),
     )
     dispatcher.callback_query.register(
         on_assistants_page, F.data.startswith("asst_page:")
@@ -4816,13 +4850,14 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     )
     dispatcher.callback_query.register(on_voice_mode, F.data.startswith("voice_mode:"))
     dispatcher.callback_query.register(on_voice_name, F.data.startswith("voice_name:"))
-    dispatcher.callback_query.register(on_stt_language, F.data.startswith("stt_lang:"))
+    dispatcher.callback_query.register(on_voice_role, F.data.startswith("voice_role:"))
     dispatcher.callback_query.register(
         on_set_text_model, F.data.startswith("set_text:")
     )
     dispatcher.callback_query.register(
         on_set_image_model, F.data.startswith("set_image:")
     )
+    dispatcher.callback_query.register(on_set_tts_model, F.data.startswith("set_tts:"))
     dispatcher.message.register(handle_voice, F.voice)
     dispatcher.message.register(handle_audio, F.audio)
     dispatcher.message.register(handle_video_file, F.video | F.video_note)

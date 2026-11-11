@@ -103,6 +103,7 @@ async def synthesize_speech(
     model: str | None = None,
     voice: str | None = None,
     response_format: str | None = None,
+    role: str | None = None,
     timeout: float = 120.0,
 ) -> Any:
     """Run TTS via arq or inline. Returns ``SpeechResult``-like object."""
@@ -114,6 +115,7 @@ async def synthesize_speech(
             model,
             voice,
             response_format,
+            role,
         )
         if job is None:
             return await assistant.synthesize_speech(
@@ -121,6 +123,7 @@ async def synthesize_speech(
                 model=model,
                 voice=voice,
                 response_format=response_format,
+                role=role,
             )
         logger.info(
             "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
@@ -138,6 +141,7 @@ async def synthesize_speech(
         model=model,
         voice=voice,
         response_format=response_format,
+        role=role,
     )
 
 

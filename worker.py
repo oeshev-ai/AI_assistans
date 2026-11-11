@@ -93,14 +93,16 @@ async def synthesize_speech_task(
     model: str | None,
     voice: str | None,
     response_format: str | None,
+    role: str | None = None,
 ) -> dict[str, str]:
     assistant: AssistAIClient = ctx["assistant"]
-    logger.info("job_synthesize_speech", chars=len(text), voice=voice)
+    logger.info("job_synthesize_speech", chars=len(text), voice=voice, role=role)
     speech = await assistant.synthesize_speech(
         text,
         model=model,
         voice=voice,
         response_format=response_format,
+        role=role,
     )
     return {
         "audio_b64": base64.b64encode(speech.audio).decode("ascii"),

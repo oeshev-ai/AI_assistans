@@ -88,6 +88,7 @@ class AssistantProfile(BaseModel):
     voice_mode: Literal["off", "auto", "always"] = "auto"
     tts_model: str | None = None
     tts_voice: str | None = None
+    tts_role: str | None = None
     tts_format: str | None = None
     stt_language: str | None = None
 

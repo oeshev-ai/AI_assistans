@@ -13,8 +13,11 @@ from Assist_ai import AssistAIClient, AssistAIConfig, AssistAIError, SpeechResul
 from speechkit_tts import (
     SpeechKitConfig,
     SpeechKitError,
+    is_speechkit_tts_model,
     parse_speechkit_audio,
+    resolve_speechkit_role,
     resolve_speechkit_voice,
+    speechkit_roles_for,
     synthesize,
 )
 
@@ -25,6 +28,23 @@ def test_resolve_speechkit_voice_legacy() -> None:
     assert resolve_speechkit_voice("alloy") == "marina"
     assert resolve_speechkit_voice("alexander") == "alexander"
     assert resolve_speechkit_voice(None, default="dasha") == "dasha"
+
+
+def test_is_speechkit_tts_model() -> None:
+    assert is_speechkit_tts_model("yandex/speechkit")
+    assert is_speechkit_tts_model("Yandex/SpeechKit")
+    assert not is_speechkit_tts_model("openai/gpt-4o-mini-tts")
+    assert not is_speechkit_tts_model(None)
+
+
+def test_speechkit_roles_per_voice() -> None:
+    assert speechkit_roles_for("filipp") == ()
+    assert "friendly" in speechkit_roles_for("marina")
+    assert "friendly" not in speechkit_roles_for("alexander")
+    assert resolve_speechkit_role("filipp", "friendly") == ""
+    assert resolve_speechkit_role("alexander", "friendly") == ""
+    assert resolve_speechkit_role("alexander", "good") == "good"
+    assert resolve_speechkit_role("marina", "FRIENDLY") == "friendly"
 
 
 def test_parse_speechkit_audio_ndjson() -> None:
@@ -103,6 +123,7 @@ async def test_assist_client_speechkit_route(respx_mock: MockRouter) -> None:
             tts_provider="speechkit",
             speechkit_api_key="sk-key",
             speechkit_folder_id="b1folder",
+            default_tts_model="yandex/speechkit",
             default_tts_voice="marina",
             speechkit_role="friendly",
             timeout=5.0,
@@ -124,11 +145,44 @@ async def test_assist_client_speechkit_missing_key() -> None:
             proxyapi_key="test-proxy-key",
             tts_provider="speechkit",
             speechkit_api_key="",
+            default_tts_model="yandex/speechkit",
             timeout=5.0,
         )
     )
     try:
         with pytest.raises(AssistAIError, match="YC_SPEECHKIT_API_KEY"):
             await client.synthesize_speech("Привет")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_assist_client_routes_by_model_not_provider(
+    respx_mock: MockRouter,
+) -> None:
+    """Даже при TTS_PROVIDER=proxyapi модель yandex/speechkit идёт в SpeechKit."""
+    chunk = base64.b64encode(b"sk-ogg").decode()
+    respx_mock.post(SPEECHKIT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps({"result": {"audioChunk": {"data": chunk}}}).encode(),
+        )
+    )
+    client = AssistAIClient(
+        AssistAIConfig(
+            proxyapi_key="test-proxy-key",
+            tts_provider="proxyapi",
+            speechkit_api_key="sk-key",
+            speechkit_folder_id="folder",
+            default_tts_model="openai/gpt-4o-mini-tts",
+            default_tts_voice="alloy",
+            timeout=5.0,
+        )
+    )
+    try:
+        speech = await client.synthesize_speech(
+            "Привет", model="yandex/speechkit", voice="marina"
+        )
+        assert speech.audio == b"sk-ogg"
     finally:
         await client.close()
