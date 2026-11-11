@@ -59,7 +59,7 @@ async def test_synthesize_speech_inline() -> None:
 
     class FakeAssistant:
         async def synthesize_speech(
-            self, text, model=None, voice=None, response_format=None
+            self, text, model=None, voice=None, response_format=None, role=None
         ):
             return speech
 

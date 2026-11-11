@@ -70,7 +70,7 @@ async def test_topics_do_not_share_history(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    general = await storage.create_topic(1, AID, "General")
+    general = await storage.create_topic(1, AID, "Общая")
     work = await storage.create_topic(1, AID, "Работа")
     await storage.set_active_topic(1, AID, work)
     await storage.append_message(
@@ -94,7 +94,7 @@ async def test_clear_topic_keeps_the_other(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    general = await storage.create_topic(2, AID, "General")
+    general = await storage.create_topic(2, AID, "Общая")
     work = await storage.create_topic(2, AID, "Работа")
     await storage.append_message(2, AID, general, {"role": "user", "content": "a"}, 20)
     await storage.append_message(2, AID, work, {"role": "user", "content": "b"}, 20)
@@ -114,7 +114,7 @@ async def test_system_prompt_preserved_inside_topic(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    topic_id = await storage.create_topic(3, AID, "General")
+    topic_id = await storage.create_topic(3, AID, "Общая")
     await storage.append_message(
         3, AID, topic_id, {"role": "system", "content": "sys"}, 20
     )
@@ -136,11 +136,11 @@ async def test_ensure_active_creates_general_once(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    first = await storage.ensure_active(4, AID, "General")
-    second = await storage.ensure_active(4, AID, "General")
+    first = await storage.ensure_active(4, AID, "Общая")
+    second = await storage.ensure_active(4, AID, "Общая")
     topics = await storage.list_topics(4, AID)
     assert first == second
-    assert topics == [{"id": first, "name": "General"}]
+    assert topics == [{"id": first, "name": "Общая"}]
     assert await storage.get_active_topic(4, AID) == first
 
 
@@ -151,7 +151,7 @@ async def test_switch_unknown_topic(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    await storage.create_topic(5, AID, "General")
+    await storage.create_topic(5, AID, "Общая")
     with pytest.raises(TopicStorageError):
         await storage.set_active_topic(5, AID, "missing")
 
@@ -163,7 +163,7 @@ async def test_delete_topic_moves_active_and_drops_history(
     redis_storage: RedisTopicStorage,
 ) -> None:
     storage = _pick(storage_name, memory_storage, redis_storage)
-    general = await storage.create_topic(7, AID, "General")
+    general = await storage.create_topic(7, AID, "Общая")
     work = await storage.create_topic(7, AID, "Работа")
     await storage.set_active_topic(7, AID, work)
     await storage.append_message(7, AID, work, {"role": "user", "content": "x"}, 20)
@@ -171,7 +171,7 @@ async def test_delete_topic_moves_active_and_drops_history(
     await storage.delete_topic(7, AID, work)
 
     assert await storage.get_active_topic(7, AID) == general
-    assert await storage.list_topics(7, AID) == [{"id": general, "name": "General"}]
+    assert await storage.list_topics(7, AID) == [{"id": general, "name": "Общая"}]
     assert await storage.get_history(7, AID, work) == []
     if isinstance(storage, RedisTopicStorage):
         assert (
@@ -212,7 +212,7 @@ async def test_rename_topic_and_unknown(
 
 
 async def test_topic_ttl_is_set(redis_storage: RedisTopicStorage) -> None:
-    topic_id = await redis_storage.create_topic(6, AID, "General")
+    topic_id = await redis_storage.create_topic(6, AID, "Общая")
     await redis_storage.set_active_topic(6, AID, topic_id)
     await redis_storage.append_message(
         6, AID, topic_id, {"role": "user", "content": "привет"}, 20

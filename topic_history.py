@@ -25,7 +25,7 @@ from history_storage import trim_messages
 logger = structlog.get_logger("TopicHistory")
 
 _APPEND_ATTEMPTS = 64
-_DEFAULT_TOPIC_NAME = "General"
+_DEFAULT_TOPIC_NAME = "Общая"
 
 
 async def _redis_list(value: Awaitable[list[Any]] | list[Any]) -> list[Any]:
@@ -929,7 +929,7 @@ async def _demo() -> None:
     """Показывает, что две темы одной персоны не смешивают историю."""
     storage = InMemoryTopicStorage(max_length=20)
     assistant_id = "standard"
-    first = await storage.create_topic(1, assistant_id, "General")
+    first = await storage.create_topic(1, assistant_id, "Общая")
     second = await storage.create_topic(1, assistant_id, "Работа")
     await storage.set_active_topic(1, assistant_id, first)
     await storage.append_message(

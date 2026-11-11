@@ -13,7 +13,7 @@ from collections.abc import Awaitable
 from typing import Literal, TypeVar
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -80,6 +80,7 @@ class AssistantProfile(BaseModel):
         default_factory=lambda: uuid.uuid4().hex[:8], min_length=1, max_length=32
     )
     name: str = Field(min_length=1, max_length=50)
+    icon: str = Field(default="🤖", max_length=8)
     system_prompt: str = Field(min_length=10)
     text_model: str | None = None
     image_model: str | None = None
@@ -92,12 +93,19 @@ class AssistantProfile(BaseModel):
     tts_format: str | None = None
     stt_language: str | None = None
 
+    @field_validator("icon")
+    @classmethod
+    def _normalize_icon(cls, value: str) -> str:
+        cleaned = value.strip() if isinstance(value, str) else ""
+        return cleaned or "🤖"
+
 
 def default_assistant_profile() -> AssistantProfile:
     """Базовый ассистент «Стандартный». Его id фиксирован, чтобы на него можно было вернуться."""
     return AssistantProfile(
         id=DEFAULT_ASSISTANT_ID,
         name=DEFAULT_ASSISTANT_NAME,
+        icon="🤖",
         system_prompt=DEFAULT_PERSONA_PROMPT,
     )
 

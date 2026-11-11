@@ -24,6 +24,7 @@ def test_old_profile_gets_voice_defaults() -> None:
     )
 
     assert profile.voice_mode == "auto"
+    assert profile.icon == "🤖"
     assert profile.tts_model is None
     assert profile.tts_voice is None
     assert profile.tts_role is None
