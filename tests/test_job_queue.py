@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import job_queue
+import app.infra.job_queue as job_queue
 
 
 @pytest.mark.asyncio

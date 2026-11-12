@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from security import MAX_MESSAGE_LENGTH, MAX_PROMPT_LENGTH, security
+from app.infra.security import MAX_MESSAGE_LENGTH, MAX_PROMPT_LENGTH, security
 
 
 def test_sanitize_filters_injection_patterns() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from metrics import (
+from app.infra.metrics import (
     ACTIVE_USERS,
     API_CALLS,
     note_active_user,

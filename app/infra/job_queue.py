@@ -129,7 +129,7 @@ async def synthesize_speech(
             "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
         )
         payload = await job.result(timeout=timeout)
-        from Assist_ai import SpeechResult
+        from app.llm.assist_ai import SpeechResult
 
         return SpeechResult(
             audio=base64.b64decode(payload["audio_b64"]),

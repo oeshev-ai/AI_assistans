@@ -9,7 +9,7 @@ from typing import Any, Literal, Self
 
 import structlog
 
-from Assist_ai import (
+from app.llm.assist_ai import (
     AssistAIClient,
     AssistAIError,
     BaseTool,
@@ -17,7 +17,7 @@ from Assist_ai import (
     _error_json,
     _exception_text,
 )
-from media_utils import MediaProcessingError, prepare_audio_for_stt
+from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
 logger = structlog.get_logger("media_tools")
 
@@ -422,8 +422,8 @@ class RequestLargeMediaUploadTool(BaseTool):
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        from upload_server import is_upload_feature_ready, public_upload_url
-        from upload_sessions import get_upload_request_context
+        from app.media.upload_server import is_upload_feature_ready, public_upload_url
+        from app.storage.upload_sessions import get_upload_request_context
 
         if not is_upload_feature_ready():
             return _error_json(

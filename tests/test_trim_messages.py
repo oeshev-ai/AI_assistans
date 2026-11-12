@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from history_storage import trim_messages
+from app.storage.history_storage import trim_messages
 
 
 def test_trim_does_not_start_with_orphan_tool() -> None:

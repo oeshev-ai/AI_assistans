@@ -6,7 +6,7 @@ import httpx
 import pytest
 from respx import MockRouter
 
-from Assist_ai import AssistAIClient, AssistAIError, SpeechResult
+from app.llm.assist_ai import AssistAIClient, AssistAIError, SpeechResult
 
 TRANSCRIBE_URL = "https://api.proxyapi.ru/v1/audio/transcriptions"
 SPEECH_URL = "https://api.proxyapi.ru/v1/audio/speech"

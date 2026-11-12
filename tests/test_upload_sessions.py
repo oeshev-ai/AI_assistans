@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from upload_sessions import (
+from app.storage.upload_sessions import (
     UploadRequestContext,
     UploadSessionStore,
     get_upload_request_context,

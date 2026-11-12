@@ -9,7 +9,7 @@ import pytest
 import pytest_asyncio
 from fakeredis import FakeAsyncRedis
 
-from history_storage import (
+from app.storage.history_storage import (
     ChatHistoryStorage,
     InMemoryChatHistoryStorage,
     RedisChatHistoryStorage,

@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from history_storage import RedisConfig
+from app.storage.history_storage import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
 

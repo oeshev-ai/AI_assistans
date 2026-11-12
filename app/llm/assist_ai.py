@@ -33,19 +33,20 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 # Ключи лежат рядом с модулем. Загружаем их до импорта клиентов,
 # чтобы те увидели то же окружение, даже если процесс запущен не из каталога проекта.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 
-from circuit_breaker import (
+from app.infra.circuit_breaker import (
     APIUnavailableError,
     CircuitBreakerError,
     llm_breaker,
     safe_api_call,
 )
-from cost_tracker import BudgetExceededError, cost_tracker
-from ExchangerateAPI import Conversion, ExchangeAPIError, get_exchange_rate
-from metrics import API_CALLS, ERRORS, LATENCY, track_api_call
-from OpenWeatherAPI import (
+from app.infra.cost_tracker import BudgetExceededError, cost_tracker
+from app.infra.metrics import API_CALLS, ERRORS, LATENCY, track_api_call
+from app.infra.security import security
+from app.llm.exchangerate import Conversion, ExchangeAPIError, get_exchange_rate
+from app.llm.openweather import (
     AirPollutionData,
     CurrentWeather,
     DailyForecast,
@@ -53,7 +54,6 @@ from OpenWeatherAPI import (
     OpenWeatherClient,
     OWMConfig,
 )
-from security import security
 
 # URL с access_key не должен попадать в лог при уровне INFO.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -156,6 +156,57 @@ def _reasoning_piece(delta: dict[str, Any]) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+# GPT-6: tools на chat/completions только с reasoning_effort=none.
+_GPT6_TOOLS_REASONING_NONE: frozenset[str] = frozenset(
+    {
+        "gpt-6-luna",
+        "gpt-6-luna-decisions",
+        "gpt-6-sol",
+        "gpt-6-terra",
+        "gpt-6.1-terra",
+    }
+)
+# GPT-6: tools на chat/completions не поддерживаются (нужен /v1/responses).
+# Каталог бота такие модели больше не предлагает; сет оставлен под будущие id.
+_GPT6_CHAT_OMIT_TOOLS: frozenset[str] = frozenset()
+
+
+def _normalize_openai_model_id(model_id: str) -> str:
+    name = model_id.strip().casefold()
+    if name.startswith("openai/"):
+        return name[len("openai/") :]
+    return name
+
+
+def _gpt6_chat_tools_need_reasoning_none(model_id: str) -> bool:
+    """True для GPT-6, где tools на chat/completions требуют ``reasoning_effort=none``."""
+    return _normalize_openai_model_id(model_id) in _GPT6_TOOLS_REASONING_NONE
+
+
+def _gpt6_chat_omit_tools(model_id: str) -> bool:
+    """True если tools на chat/completions для модели нельзя отправлять."""
+    return _normalize_openai_model_id(model_id) in _GPT6_CHAT_OMIT_TOOLS
+
+
+def _attach_chat_tools(
+    payload: dict[str, Any], tools: list[dict[str, Any]], model_id: str
+) -> None:
+    """Добавляет tools в chat/completions с учётом ограничений GPT-6."""
+    if not tools:
+        return
+    if _gpt6_chat_omit_tools(model_id):
+        logger.warning(
+            "chat_tools_omitted",
+            model=model_id,
+            reason="model requires /v1/responses for function tools",
+        )
+        return
+    payload["tools"] = tools
+    payload["tool_choice"] = "auto"
+    if _gpt6_chat_tools_need_reasoning_none(model_id):
+        payload["reasoning_effort"] = "none"
 
 
 def _assistant_stream_tool_message(
@@ -302,7 +353,7 @@ class AssistAIConfig(BaseModel):
     @classmethod
     def from_env(cls) -> AssistAIConfig:
         """Собирает конфигурацию из переменных окружения и файла ``.env``."""
-        load_dotenv(Path(__file__).resolve().parent / ".env")
+        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         load_dotenv()
         provider_raw = os.getenv("TTS_PROVIDER", "proxyapi").strip().casefold()
         provider: Literal["speechkit", "proxyapi"] = (
@@ -327,7 +378,7 @@ class AssistAIConfig(BaseModel):
         if provider == "speechkit":
             default_tts_voice = speechkit_voice
             default_tts_format = "opus"
-            from speechkit_tts import SPEECHKIT_MODEL_ID
+            from app.llm.speechkit_tts import SPEECHKIT_MODEL_ID
 
             default_tts_model = SPEECHKIT_MODEL_ID
         else:
@@ -1470,7 +1521,7 @@ class AssistAIClient:
             )
         self.register_tool(GenerateImageTool(self))
         # Late import: media_tools зависит от AssistAIClient.
-        from media_tools import register_media_tools
+        from app.media.media_tools import register_media_tools
 
         register_media_tools(self)
 
@@ -1549,9 +1600,7 @@ class AssistAIClient:
                 "model": selected_model,
                 "messages": messages,
             }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+            _attach_chat_tools(payload, tools, selected_model)
 
             logger.info(
                 "chat_completion: модель=%s, итерация=%s/%s, сообщений=%s",
@@ -1654,9 +1703,7 @@ class AssistAIClient:
                 "messages": messages,
                 "stream": True,
             }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+            _attach_chat_tools(payload, tools, selected_model)
 
             logger.info(
                 "stream_chat: модель=%s, итерация=%s/%s, сообщений=%s",
@@ -2022,7 +2069,7 @@ class AssistAIClient:
         data = response.content
         if not data:
             raise AssistAIError("ProxyAPI вернул пустой видеофайл.")
-        from cost_tracker import VIDEO_USD
+        from app.infra.cost_tracker import VIDEO_USD
 
         await cost_tracker.record(kind="video", amount_usd=VIDEO_USD)
         logger.info("generate_video_done", job_id=job_id, bytes=len(data))
@@ -2151,8 +2198,8 @@ class AssistAIClient:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_tts_model
-        from models_config import ELEVENLABS_TTS_VOICES, is_elevenlabs_tts_model
-        from speechkit_tts import is_speechkit_tts_model
+        from app.llm.models_config import ELEVENLABS_TTS_VOICES, is_elevenlabs_tts_model
+        from app.llm.speechkit_tts import is_speechkit_tts_model
 
         if is_speechkit_tts_model(selected_model):
             return await self._synthesize_speech_speechkit(text, voice=voice, role=role)
@@ -2220,7 +2267,7 @@ class AssistAIClient:
         role: str | None = None,
     ) -> SpeechResult:
         """Озвучка через Yandex SpeechKit TTS v3 (OGG Opus)."""
-        from speechkit_tts import SpeechKitConfig, SpeechKitError, synthesize
+        from app.llm.speechkit_tts import SpeechKitConfig, SpeechKitError, synthesize
 
         if not self.config.speechkit_api_key:
             raise AssistAIError(

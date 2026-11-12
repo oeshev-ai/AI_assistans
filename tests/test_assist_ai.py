@@ -9,11 +9,14 @@ import httpx
 import pytest
 from respx import MockRouter
 
-from Assist_ai import (
+from app.llm.assist_ai import (
     AssistAIClient,
     AssistAIError,
     BaseTool,
     ImageModelScope,
+    _attach_chat_tools,
+    _gpt6_chat_omit_tools,
+    _gpt6_chat_tools_need_reasoning_none,
     _ToolCallBuilder,
 )
 from bot import _extract_generated_images
@@ -96,6 +99,94 @@ def _stream_delta(
             }
         ]
     }
+
+
+def test_gpt6_tools_require_reasoning_none() -> None:
+    """luna/sol/terra → reasoning_effort=none при tools; omit-список пуст."""
+    assert _gpt6_chat_tools_need_reasoning_none("openai/gpt-6-luna")
+    assert _gpt6_chat_tools_need_reasoning_none("gpt-6-sol")
+    assert _gpt6_chat_tools_need_reasoning_none("openai/gpt-6.1-terra")
+    assert not _gpt6_chat_omit_tools("openai/gpt-6-sol")
+    assert not _gpt6_chat_omit_tools("openai/gpt-6.1-terra")
+    assert not _gpt6_chat_omit_tools("openai/gpt-6-luna")
+    assert not _gpt6_chat_tools_need_reasoning_none("openai/gpt-4o")
+
+    tools = [{"type": "function", "function": {"name": "ping"}}]
+    gpt6: dict[str, Any] = {"model": "openai/gpt-6-luna"}
+    _attach_chat_tools(gpt6, tools, "openai/gpt-6-luna")
+    assert gpt6["tools"] == tools
+    assert gpt6["tool_choice"] == "auto"
+    assert gpt6["reasoning_effort"] == "none"
+
+    sol: dict[str, Any] = {"model": "openai/gpt-6-sol"}
+    _attach_chat_tools(sol, tools, "openai/gpt-6-sol")
+    assert sol["tools"] == tools
+    assert sol["reasoning_effort"] == "none"
+
+    terra: dict[str, Any] = {"model": "openai/gpt-6.1-terra"}
+    _attach_chat_tools(terra, tools, "openai/gpt-6.1-terra")
+    assert terra["tools"] == tools
+    assert terra["reasoning_effort"] == "none"
+
+    other: dict[str, Any] = {"model": "openai/gpt-4o"}
+    _attach_chat_tools(other, tools, "openai/gpt-4o")
+    assert other["tools"] == tools
+    assert "reasoning_effort" not in other
+
+    empty: dict[str, Any] = {"model": "openai/gpt-6-luna"}
+    _attach_chat_tools(empty, [], "openai/gpt-6-luna")
+    assert "tools" not in empty
+    assert "reasoning_effort" not in empty
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_gpt6_sol_sends_tools_with_none(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """gpt-6-sol на chat/completions шлёт tools с reasoning_effort=none."""
+    route = respx_mock.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=_sse([_stream_delta({"content": "ок"}, "stop")]),
+        )
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "привет"}]
+    deltas = [
+        delta
+        async for delta in assist_client.stream_chat(messages, model="openai/gpt-6-sol")
+    ]
+    assert "".join(d.text for d in deltas if d.kind == "content") == "ок"
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == "openai/gpt-6-sol"
+    assert body.get("tools")
+    assert body["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_gpt6_luna_sends_reasoning_none(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Живой payload для gpt-6-luna с tools содержит reasoning_effort=none."""
+    route = respx_mock.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=_sse([_stream_delta({"content": "4"}, "stop")]),
+        )
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "2+2?"}]
+    deltas = [
+        delta
+        async for delta in assist_client.stream_chat(
+            messages, model="openai/gpt-6-luna"
+        )
+    ]
+    assert "".join(d.text for d in deltas if d.kind == "content") == "4"
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == "openai/gpt-6-luna"
+    assert body.get("tools")
+    assert body["reasoning_effort"] == "none"
 
 
 def test_tool_arguments_parsing_robustness() -> None:

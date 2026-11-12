@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from assistant_storage import (
+from app.storage.assistant_storage import (
     DEFAULT_PERSONA_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
     AssistantProfile,

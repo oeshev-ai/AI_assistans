@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cost_tracker import BudgetExceededError, CostTracker
+from app.infra.cost_tracker import BudgetExceededError, CostTracker
 
 
 @pytest.mark.asyncio

@@ -24,8 +24,12 @@ from tenacity import (
     wait_exponential,
 )
 
-from circuit_breaker import APIUnavailableError, safe_api_call, weather_breaker
-from metrics import track_api_call
+from app.infra.circuit_breaker import (
+    APIUnavailableError,
+    safe_api_call,
+    weather_breaker,
+)
+from app.infra.metrics import track_api_call
 
 load_dotenv()
 

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
-from history_storage import trim_messages
+from app.storage.history_storage import trim_messages
 
 logger = structlog.get_logger("TopicHistory")
 

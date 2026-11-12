@@ -19,7 +19,6 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: production
-      # Не пересекаться с neurophoto webhook на хосте :8081
       METRICS_PORT: ${METRICS_PORT:-8083}
       HEALTH_PORT: ${HEALTH_PORT:-8082}
     ports:

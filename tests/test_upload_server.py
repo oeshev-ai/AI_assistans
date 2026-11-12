@@ -10,8 +10,8 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from upload_server import setup_upload_routes
-from upload_sessions import UploadSessionStore
+from app.media.upload_server import setup_upload_routes
+from app.storage.upload_sessions import UploadSessionStore
 
 
 @dataclass
@@ -38,7 +38,7 @@ class FakeStorage:
     async def head_object(self, object_key: str) -> dict[str, Any]:
         data = self.objects.get(object_key)
         if data is None:
-            from s3_storage import S3StorageError
+            from app.storage.s3_storage import S3StorageError
 
             raise S3StorageError("missing")
         return {"ContentLength": len(data), "ContentType": "audio/mpeg"}
@@ -105,8 +105,8 @@ async def test_same_origin_file_upload_flow() -> None:
 
 @pytest.mark.asyncio
 async def test_request_large_media_upload_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    from media_tools import RequestLargeMediaUploadTool
-    from upload_sessions import (
+    from app.media.media_tools import RequestLargeMediaUploadTool
+    from app.storage.upload_sessions import (
         UploadRequestContext,
         UploadSessionStore,
         reset_upload_request_context,

@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from fakeredis import FakeAsyncRedis
 
-from topic_history import (
+from app.storage.topic_history import (
     InMemoryTopicStorage,
     RedisTopicStorage,
     TopicConfig,

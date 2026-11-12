@@ -8,7 +8,7 @@ import pytest
 import pytest_asyncio
 from fakeredis import FakeAsyncRedis
 
-from assistant_storage import (
+from app.storage.assistant_storage import (
     DEFAULT_ASSISTANT_ID,
     DEFAULT_ASSISTANT_NAME,
     AssistantProfile,
@@ -17,7 +17,7 @@ from assistant_storage import (
     InMemoryAssistantStorage,
     RedisAssistantStorage,
 )
-from history_storage import RedisConfig
+from app.storage.history_storage import RedisConfig
 
 pytestmark = pytest.mark.asyncio
 

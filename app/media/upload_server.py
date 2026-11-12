@@ -12,8 +12,12 @@ from typing import Any, Protocol
 import structlog
 from aiohttp import BodyPartReader, web
 
-from s3_storage import S3StorageError
-from upload_sessions import UploadSession, UploadSessionStore, object_key_for
+from app.storage.s3_storage import S3StorageError
+from app.storage.upload_sessions import (
+    UploadSession,
+    UploadSessionStore,
+    object_key_for,
+)
 
 logger = structlog.get_logger("upload_server")
 
@@ -541,6 +545,6 @@ def public_upload_url(upload_id: str, token: str) -> str | None:
 
 
 def is_upload_feature_ready() -> bool:
-    from s3_storage import is_s3_configured
+    from app.storage.s3_storage import is_s3_configured
 
     return is_s3_configured() and bool(os.getenv("UPLOAD_PUBLIC_BASE_URL", "").strip())

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from media_utils import MediaProcessingError, prepare_audio_for_stt, split_audio_for_stt
+from app.media.media_utils import (
+    MediaProcessingError,
+    prepare_audio_for_stt,
+    split_audio_for_stt,
+)
 
 
 @pytest.mark.asyncio
@@ -20,7 +24,7 @@ async def test_prepare_video_calls_extract(monkeypatch: pytest.MonkeyPatch) -> N
         assert video_bytes == b"video"
         return b"audio-bytes", "audio.mp3"
 
-    monkeypatch.setattr("media_utils.extract_audio_from_video", fake_extract)
+    monkeypatch.setattr("app.media.media_utils.extract_audio_from_video", fake_extract)
     parts = await prepare_audio_for_stt(b"video", filename="clip.mp4", is_video=True)
     assert parts == [(b"audio-bytes", "audio.mp3")]
 

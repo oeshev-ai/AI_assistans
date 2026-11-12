@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 
 import pytest_asyncio
 
-from Assist_ai import AssistAIClient, AssistAIConfig
+from app.llm.assist_ai import AssistAIClient, AssistAIConfig
 
 
 @pytest_asyncio.fixture

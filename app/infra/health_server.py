@@ -9,7 +9,7 @@ from typing import Any
 import structlog
 from aiohttp import web
 
-from metrics import refresh_redis_gauge
+from app.infra.metrics import refresh_redis_gauge
 
 logger = structlog.get_logger("health")
 

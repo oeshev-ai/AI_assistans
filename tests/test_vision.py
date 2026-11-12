@@ -6,7 +6,7 @@ import base64
 
 import pytest
 
-from vision import (
+from app.llm.vision import (
     VisionError,
     build_image_content,
     build_multimodal_content,

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from assistant_presets import (
+from app.llm.models_config import (
+    AVAILABLE_IMAGE_MODELS,
+    AVAILABLE_TEXT_MODELS,
+    AVAILABLE_TTS_MODELS,
+)
+from app.storage.assistant_presets import (
     ASSISTANT_PRESETS,
     get_preset,
     preset_profile,
     validate_catalog,
 )
-from assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
-from models_config import (
-    AVAILABLE_IMAGE_MODELS,
-    AVAILABLE_TEXT_MODELS,
-    AVAILABLE_TTS_MODELS,
-)
-from persona_icons import DEFAULT_ICON, normalize_icon, persona_label
+from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
+from app.storage.persona_icons import DEFAULT_ICON, normalize_icon, persona_label
 
 
 def test_validate_catalog_passes() -> None:

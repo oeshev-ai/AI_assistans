@@ -31,4 +31,4 @@ USER app
 
 EXPOSE 8082 8083
 
-CMD ["python", "bot.py"]
+CMD ["python", "-m", "app.bot"]

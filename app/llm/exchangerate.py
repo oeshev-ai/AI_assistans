@@ -10,8 +10,12 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
-from circuit_breaker import APIUnavailableError, currency_breaker, safe_api_call
-from metrics import track_api_call
+from app.infra.circuit_breaker import (
+    APIUnavailableError,
+    currency_breaker,
+    safe_api_call,
+)
+from app.infra.metrics import track_api_call
 
 logger = structlog.get_logger("ExchangerateAPI")
 

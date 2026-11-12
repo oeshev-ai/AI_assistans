@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from rate_limiter import (
+from app.infra.rate_limiter import (
     IMAGE_LIMIT,
     TEXT_LIMIT,
     RateLimiter,

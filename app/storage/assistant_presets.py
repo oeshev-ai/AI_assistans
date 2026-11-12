@@ -7,9 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from Assist_ai import image_model_family
-from assistant_storage import AssistantProfile
-from models_config import (
+from app.llm.assist_ai import image_model_family
+from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     AVAILABLE_TTS_MODELS,
@@ -17,7 +16,8 @@ from models_config import (
     OPENAI_TTS_VOICES,
     is_elevenlabs_tts_model,
 )
-from persona_icons import PERSONA_ICONS, normalize_icon
+from app.storage.assistant_storage import AssistantProfile
+from app.storage.persona_icons import PERSONA_ICONS, normalize_icon
 
 
 class AssistantPreset(BaseModel):
@@ -84,7 +84,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "«в современном динамично развивающемся мире». Адаптируй тон под "
             "аудиторию и площадку, предлагай 2–3 варианта заголовка."
         ),
-        text_model="openai/gpt-6-astra",
+        text_model="openai/gpt-6.1-terra",
         image_model="black-forest-labs/flux-3-image",
         image_size="2K",
         voice_mode="off",
@@ -100,7 +100,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "3) конкретные рекомендации к действию. Тон деловой, без эмоций. "
             "Если данных для анализа не хватает — прямо укажи пробел и что нужно уточнить."
         ),
-        text_model="openai/gpt-6.1-sol",
+        text_model="openai/gpt-6-sol",
         image_model="recraft/recraft-v4.1",
         image_size="16:9",
         voice_mode="off",

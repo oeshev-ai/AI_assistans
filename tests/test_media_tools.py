@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from media_tools import (
+from app.media.media_tools import (
     MediaTurnScope,
     TranscribeMediaTool,
     UserMedia,
@@ -21,7 +21,7 @@ async def test_transcribe_media_sends_transcript_file(
     async def fake_prepare(data, *, filename, is_video):
         return [(b"chunk", "chunk.mp3")]
 
-    monkeypatch.setattr("media_tools.prepare_audio_for_stt", fake_prepare)
+    monkeypatch.setattr("app.media.media_tools.prepare_audio_for_stt", fake_prepare)
 
     class FakeClient:
         async def transcribe_audio(self, audio_bytes, filename="x", language=None):
@@ -51,6 +51,6 @@ async def test_transcribe_media_sends_transcript_file(
             assert doc.data is not None
             assert b"hello world" in doc.data
     finally:
-        from media_tools import reset_user_media
+        from app.media.media_tools import reset_user_media
 
         reset_user_media(token)

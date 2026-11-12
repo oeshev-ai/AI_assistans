@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
+from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
 from bot import _should_send_voice_reply
 
 
