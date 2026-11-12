@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from app.bot import models as M
-from app.bot.constants import *
+from app.bot.constants import (
+    PAGE_SIZE,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 
 def _topics_text(topics: list[dict[str, str]], active: str, page: int = 0) -> str:

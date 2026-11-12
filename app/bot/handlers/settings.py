@@ -5,7 +5,27 @@ from __future__ import annotations
 import app.bot.screens as screens
 from app.bot import models as M
 from app.bot import runtime as R
-from app.bot.constants import *
+from app.bot.constants import (
+    _SCREEN_PICKER,
+    _SCREEN_PRESETS,
+    _SCREEN_SETTINGS,
+    _VOICE_MODE_LABELS,
+    AVAILABLE_IMAGE_MODELS,
+    AVAILABLE_TEXT_MODELS,
+    AVAILABLE_TTS_MODELS,
+    Any,
+    AssistAIClient,
+    AssistantStorage,
+    AssistantStorageError,
+    CallbackQuery,
+    FSMContext,
+    Message,
+    TelegramBadRequest,
+    is_speechkit_tts_model,
+    logger,
+    resolve_speechkit_role,
+    speechkit_roles_for,
+)
 
 
 async def on_set_text_model(

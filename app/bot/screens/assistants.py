@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from app.bot import models as M
-from app.bot.constants import *
+from app.bot.constants import (
+    PAGE_SIZE,
+    AssistantProfile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    persona_label,
+)
 
 
 def _assistants_text(

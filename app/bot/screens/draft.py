@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from app.bot import models as M
-from app.bot.constants import *
+from app.bot.constants import (
+    AVAILABLE_IMAGE_MODELS,
+    AVAILABLE_TEXT_MODELS,
+    PERSONA_ICONS,
+    Any,
+    AssistAIClient,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    normalize_icon,
+)
 
 
 def _draft_models_text(data: dict[str, Any], assistant: AssistAIClient) -> str:

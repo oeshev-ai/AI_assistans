@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from app.bot import models as M
-from app.bot.constants import *
+from app.bot.constants import (
+    _VOICE_MODE_LABELS,
+    ASSISTANT_PRESETS,
+    PAGE_SIZE,
+    TELEGRAM_TEXT_LIMIT,
+    AssistAIClient,
+    AssistantPreset,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 
 def _presets_text(page: int = 0) -> str:

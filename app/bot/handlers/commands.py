@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 from app.bot import runtime as R
-from app.bot.constants import *
+from app.bot.constants import (
+    WELCOME,
+    Any,
+    AssistAIClient,
+    AssistantStorage,
+    Awaitable,
+    BaseMiddleware,
+    Callable,
+    FSMContext,
+    Message,
+    TelegramObject,
+    TopicHistoryStorage,
+)
 from app.bot.states import (
     EditAssistantSG,
     NewAssistantSG,

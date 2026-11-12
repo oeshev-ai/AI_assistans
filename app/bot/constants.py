@@ -220,6 +220,12 @@ _VOICE_MODE_LABELS: dict[str, str] = {
     "auto": "авто",
     "always": "всегда",
 }
+MSG_UNAVAILABLE = "⚠️ Сервис временно недоступен. Попробуйте позже."
+MSG_TIMEOUT = "⚠️ Превышено время ожидания."
+MSG_INTERNAL = "❌ Произошла внутренняя ошибка."
+MSG_IMAGE_FAILED = "Не удалось сгенерировать изображение."
+MSG_HISTORY = "⚠️ Временные проблемы с историей диалога. Попробуйте позже."
+MSG_PROFILE = "⚠️ Не удалось прочитать профиль ассистента. Попробуйте позже."
 
 
 from app.bot.states import (
@@ -230,5 +236,5 @@ from app.bot.states import (
     RenameTopicSG,
 )
 
-# ``import *`` otherwise skips names starting with ``_``.
+# Include private screen/menu keys so consumers can import them explicitly.
 __all__ = [name for name in globals() if not name.startswith("__")]

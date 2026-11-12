@@ -5,7 +5,17 @@ from __future__ import annotations
 import app.bot.screens as screens
 from app.bot import models as M
 from app.bot import runtime as R
-from app.bot.constants import *
+from app.bot.constants import (
+    _SCREEN_TOPICS,
+    AssistantStorage,
+    AssistantStorageError,
+    CallbackQuery,
+    FSMContext,
+    Message,
+    TopicHistoryStorage,
+    TopicStorageError,
+    logger,
+)
 from app.bot.states import (
     NewTopicSG,
     RenameTopicSG,

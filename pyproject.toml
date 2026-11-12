@@ -37,26 +37,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
-# Bot package still re-exports via ``import *`` from constants until fully explicit.
+# Shared re-export hub for bot modules (imports look unused locally).
 "app/bot/constants.py" = ["F401"]
-"app/bot/models.py" = ["F403", "F405"]
-"app/bot/runtime.py" = ["F403", "F405"]
-"app/bot/main.py" = ["F403", "F405"]
-"app/bot/screens/*.py" = ["F403", "F405"]
-"app/bot/handlers/*.py" = ["F403", "F405"]
 
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = [
-  "app.bot.constants",
-  "app.bot.models",
-  "app.bot.runtime",
-  "app.bot.main",
-  "app.bot.screens.*",
-  "app.bot.handlers.*",
-]
-# Star-import re-exports from constants; runtime OK via __all__.
-disable_error_code = ["name-defined"]

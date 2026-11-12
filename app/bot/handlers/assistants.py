@@ -5,7 +5,31 @@ from __future__ import annotations
 import app.bot.screens as screens
 from app.bot import models as M
 from app.bot import runtime as R
-from app.bot.constants import *
+from app.bot.constants import (
+    _SCREEN_ASSISTANTS,
+    _SCREEN_PICKER,
+    _SCREEN_SETTINGS,
+    AVAILABLE_IMAGE_MODELS,
+    AVAILABLE_TEXT_MODELS,
+    DEFAULT_ASSISTANT_ID,
+    DEFAULT_ICON,
+    PERSONA_ICONS,
+    Any,
+    AssistAIClient,
+    AssistantProfile,
+    AssistantStorage,
+    AssistantStorageError,
+    CallbackQuery,
+    FSMContext,
+    Message,
+    TelegramBadRequest,
+    TopicHistoryStorage,
+    TopicStorageError,
+    ValidationError,
+    logger,
+    normalize_icon,
+    persona_label,
+)
 from app.bot.states import (
     EditAssistantSG,
     NewAssistantSG,
