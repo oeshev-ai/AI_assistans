@@ -1,0 +1,73 @@
+"""Сборка альбома и debounce без Telegram и сети."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from app.bot.album import AlbumHub, IncomingPhoto, assemble_album
+
+
+def _photo(message_id: int, caption: str = "", size: int = 10) -> IncomingPhoto:
+    return IncomingPhoto(
+        message_id=message_id,
+        file_id=f"id-{message_id}",
+        size=size,
+        caption=caption,
+    )
+
+
+def test_sorts_by_message_id_and_keeps_first_caption() -> None:
+    built = assemble_album([_photo(5, ""), _photo(2, "вторая"), _photo(9, "позже")])
+    assert [item.message_id for item in built.photos] == [2, 5, 9]
+    assert built.caption == "вторая"
+    assert built.error is None
+
+
+def test_trims_to_five() -> None:
+    photos = [_photo(index) for index in range(6, 0, -1)]
+    built = assemble_album(photos, max_items=5)
+    assert len(built.photos) == 5
+    assert [item.message_id for item in built.photos] == [1, 2, 3, 4, 5]
+    assert built.notice == "Взял первые 5 фото"
+
+
+def test_rejects_oversize_album() -> None:
+    built = assemble_album(
+        [_photo(1, size=11), _photo(2, size=11)],
+        max_total_bytes=20,
+    )
+    assert built.error is not None
+    assert built.photos == []
+
+
+@pytest.mark.asyncio
+async def test_text_during_debounce_becomes_instruction() -> None:
+    hub = AlbumHub(debounce=5)
+    ready: list[tuple[str, list[int]]] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append((built.caption, [item.message_id for item in built.photos]))
+
+    await hub.add(1, "group", _photo(2, "из альбома"), "svc", on_ready)
+    await hub.add(1, "group", _photo(1), "svc", on_ready)
+    flushed = await hub.flush_text(1, "замени фон", on_ready)
+    assert flushed is True
+    assert ready == [("замени фон", [1, 2])]
+    await asyncio.sleep(0.05)
+    assert len(ready) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_photo_cancels_open_buffer() -> None:
+    hub = AlbumHub(debounce=5)
+    ready: list[str] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append(built.photos[0].file_id)
+
+    await hub.add(1, "group", _photo(1), "svc", on_ready)
+    await hub.add(1, None, _photo(8), "svc", on_ready)
+    assert ready == ["id-8"]
+    assert hub.cancel_chat(1) is False

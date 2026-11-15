@@ -10,6 +10,7 @@ Requires ``REDIS_URL`` and ``PROXYAPI_API_KEY``.
 from __future__ import annotations
 
 import base64
+import json
 import os
 from pathlib import Path
 from typing import Any, ClassVar
@@ -87,6 +88,43 @@ async def generate_image_task(
     return await assistant.generate_image(prompt=prompt, model=model, size=size)
 
 
+async def edit_image_task(
+    ctx: dict[str, Any],
+    redis_key: str,
+    prompt: str,
+    model: str | None,
+    labels: list[str] | None = None,
+) -> list[str]:
+    assistant: AssistAIClient = ctx["assistant"]
+    redis = ctx["redis"]
+    raw = await redis.get(redis_key)
+    try:
+        await redis.delete(redis_key)
+    except Exception:
+        pass
+    if not raw:
+        raise ValueError("edit payload missing or expired in Redis")
+    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+    payload = json.loads(text)
+    files: list[tuple[bytes, str, str]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            encoded = item.get("b64")
+            if not isinstance(encoded, str):
+                continue
+            files.append(
+                (
+                    base64.b64decode(encoded),
+                    str(item.get("filename") or "image.png"),
+                    str(item.get("mime") or "image/png"),
+                )
+            )
+    logger.info("job_edit_image", model=model, count=len(files))
+    return await assistant.edit_images(files, prompt, model=model, labels=labels)
+
+
 async def synthesize_speech_task(
     ctx: dict[str, Any],
     text: str,
@@ -142,6 +180,7 @@ class WorkerSettings:
 
     functions: ClassVar[list] = [
         generate_image_task,
+        edit_image_task,
         synthesize_speech_task,
         transcribe_audio_task,
     ]

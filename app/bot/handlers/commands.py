@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.bot import runtime as R
+from app.bot.album import get_album_hub
 from app.bot.constants import (
     WELCOME,
     Any,
@@ -22,6 +23,7 @@ from app.bot.states import (
     NewTopicSG,
     RenameTopicSG,
 )
+from app.storage.pending_media import PendingMediaStorage
 
 
 async def cmd_start(
@@ -47,13 +49,26 @@ async def cmd_cancel(
     assistant: AssistAIClient,
     assistant_storage: AssistantStorage,
     topic_storage: TopicHistoryStorage,
+    pending_media: PendingMediaStorage,
 ) -> None:
     """Сбрасывает текущий пошаговый ввод. Без шага отвечает, что отменять нечего."""
+    had_album = get_album_hub().cancel_chat(message.chat.id)
+    had_pending = False
+    try:
+        profile = await R._active_profile(message.chat.id, assistant_storage)
+        had_pending = await pending_media.get(message.chat.id, profile.id) is not None
+        await pending_media.clear(message.chat.id, profile.id)
+    except Exception:
+        had_pending = False
     menu = await R._menu_for(message.chat.id, assistant_storage, topic_storage)
     current = await state.get_state()
-    if current is None:
+    if current is None and not had_album and not had_pending:
         await R._apply_reply_menu(message, menu, state)
         await message.answer("Нечего отменять.")
+        return
+    if current is None:
+        await R._apply_reply_menu(message, menu, state)
+        await message.answer("Отменено.")
         return
     return_to_settings = current in {
         EditAssistantSG.name.state,

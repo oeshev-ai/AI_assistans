@@ -60,6 +60,16 @@ from app.bot.handlers.media import (
     handle_video_file,
     on_upload_cancel,
 )
+from app.bot.handlers.photo import (
+    on_photo_analyze,
+    on_photo_ask,
+    on_photo_base_next,
+    on_photo_base_set,
+    on_photo_cancel,
+    on_photo_edit,
+    sg_photo_edit_instruction,
+    sg_photo_question,
+)
 from app.bot.handlers.presets import (
     on_preset_apply,
     on_preset_edit,
@@ -101,6 +111,7 @@ from app.bot.handlers.topics import (
     sg_new_topic_name,
     sg_rename_topic_name,
 )
+from app.bot.states import PhotoSG
 
 
 def _register_handlers(dispatcher: Dispatcher) -> None:
@@ -248,6 +259,16 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(handle_voice, F.voice)
     dispatcher.message.register(handle_audio, F.audio)
     dispatcher.message.register(handle_video_file, F.video | F.video_note)
+    dispatcher.callback_query.register(on_photo_edit, F.data == "photo:edit")
+    dispatcher.callback_query.register(on_photo_analyze, F.data == "photo:analyze")
+    dispatcher.callback_query.register(on_photo_ask, F.data == "photo:ask")
+    dispatcher.callback_query.register(on_photo_cancel, F.data == "photo:cancel")
+    dispatcher.callback_query.register(on_photo_base_next, F.data == "photo:base_next")
+    dispatcher.callback_query.register(
+        on_photo_base_set, F.data.startswith("photo:base_set:")
+    )
+    dispatcher.message.register(sg_photo_edit_instruction, PhotoSG.edit_instruction)
+    dispatcher.message.register(sg_photo_question, PhotoSG.question)
     dispatcher.message.register(handle_photo, F.photo)
     dispatcher.message.register(handle_document, F.document)
     dispatcher.message.register(handle_text, F.text & ~F.text.startswith("/"))

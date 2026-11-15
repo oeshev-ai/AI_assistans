@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -191,7 +192,10 @@ def _gpt6_chat_omit_tools(model_id: str) -> bool:
 
 
 def _attach_chat_tools(
-    payload: dict[str, Any], tools: list[dict[str, Any]], model_id: str
+    payload: dict[str, Any],
+    tools: list[dict[str, Any]],
+    model_id: str,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> None:
     """Добавляет tools в chat/completions с учётом ограничений GPT-6."""
     if not tools:
@@ -204,7 +208,7 @@ def _attach_chat_tools(
         )
         return
     payload["tools"] = tools
-    payload["tool_choice"] = "auto"
+    payload["tool_choice"] = "auto" if tool_choice is None else tool_choice
     if _gpt6_chat_tools_need_reasoning_none(model_id):
         payload["reasoning_effort"] = "none"
 
@@ -1317,6 +1321,83 @@ def image_model_family(model: str) -> ImageModelFamily:
     return "openai"
 
 
+def supports_multi_image(model: str) -> bool:
+    """Несколько входных фото принимает только семейство OpenAI (gpt-image / edits)."""
+    return image_model_family(model) == "openai"
+
+
+def _composite_fallback_enabled() -> bool:
+    return os.getenv("ALLOW_COMPOSITE_FALLBACK", "0").strip() == "1"
+
+
+def composite_side_by_side(
+    files: list[tuple[bytes, str, str]],
+    labels: list[str] | None = None,
+) -> tuple[bytes, str, str]:
+    """Склеивает фото в один PNG слева направо с подписями."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise AssistAIError(
+            "Склейка нескольких фото недоступна: установите пакет Pillow."
+        ) from exc
+    if len(files) < 2:
+        raise ValueError("Для склейки нужно хотя бы два изображения.")
+    opened: list[Any] = []
+    for data, _name, _mime in files:
+        opened.append(Image.open(io.BytesIO(data)).convert("RGB"))
+    height = 512
+    resized: list[Any] = []
+    for image in opened:
+        width = max(1, int(image.width * height / max(image.height, 1)))
+        resized.append(image.resize((width, height)))
+    gap = 8
+    label_band = 28
+    total = sum(image.width for image in resized) + gap * (len(resized) - 1)
+    canvas = Image.new("RGB", (total, height + label_band), "white")
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for index, image in enumerate(resized):
+        canvas.paste(image, (x, label_band))
+        label = (
+            labels[index]
+            if labels is not None and index < len(labels)
+            else str(index + 1)
+        )
+        draw.text((x + 4, 4), label, fill="black")
+        x += image.width + gap
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG")
+    return buffer.getvalue(), "composite.png", "image/png"
+
+
+def prepare_edit_files(
+    files: list[tuple[bytes, str, str]],
+    model: str,
+    labels: list[str] | None = None,
+) -> list[tuple[bytes, str, str]]:
+    """Оставляет файлы как есть, склеивает или отказывает. Референс не отбрасывается."""
+    if len(files) <= 1 or supports_multi_image(model):
+        return files
+    if _composite_fallback_enabled():
+        logger.info(
+            "edit_image_composite",
+            model=model,
+            count=len(files),
+        )
+        return [composite_side_by_side(files, labels)]
+    logger.info(
+        "multi_image_unsupported",
+        model=model,
+        count=len(files),
+    )
+    raise AssistAIError(
+        "Эта модель не принимает несколько изображений за один запрос. "
+        "Выберите модель семейства OpenAI или включите склейку "
+        "(ALLOW_COMPOSITE_FALLBACK=1)."
+    )
+
+
 def _is_flux_model(model: str) -> bool:
     """FLUX не принимает пиксельный ``size`` вроде ``1024x1024``."""
     return image_model_family(model) == "flux"
@@ -1565,6 +1646,7 @@ class AssistAIClient:
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> str:
         """Ведёт диалог с моделью и сама выполняет запрошенные инструменты.
 
@@ -1600,7 +1682,12 @@ class AssistAIClient:
                 "model": selected_model,
                 "messages": messages,
             }
-            _attach_chat_tools(payload, tools, selected_model)
+            _attach_chat_tools(
+                payload,
+                tools,
+                selected_model,
+                tool_choice if iteration == 1 else None,
+            )
 
             logger.info(
                 "chat_completion: модель=%s, итерация=%s/%s, сообщений=%s",
@@ -1666,6 +1753,7 @@ class AssistAIClient:
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> AsyncIterator[ChatDelta]:
         """Потоковый диалог с теми же инструментами, что и ``chat_completion``.
 
@@ -1703,7 +1791,12 @@ class AssistAIClient:
                 "messages": messages,
                 "stream": True,
             }
-            _attach_chat_tools(payload, tools, selected_model)
+            _attach_chat_tools(
+                payload,
+                tools,
+                selected_model,
+                tool_choice if iteration == 1 else None,
+            )
 
             logger.info(
                 "stream_chat: модель=%s, итерация=%s/%s, сообщений=%s",
@@ -1901,29 +1994,46 @@ class AssistAIClient:
         mime_type: str = "image/png",
         model: str | None = None,
     ) -> list[str]:
-        """Редактирует изображение через ``/images/edits`` (multipart)."""
-        if not image_bytes:
-            raise ValueError("image_bytes не может быть пустым.")
+        """Редактирует одно изображение. Обёртка над ``edit_images``."""
+        return await self.edit_images(
+            [(image_bytes, filename, mime_type)],
+            prompt,
+            model=model,
+        )
+
+    async def edit_images(
+        self,
+        files: list[tuple[bytes, str, str]],
+        prompt: str,
+        *,
+        model: str | None = None,
+        labels: list[str] | None = None,
+    ) -> list[str]:
+        """Редактирует фото через ``/images/edits``. Основа — первый файл."""
+        if not files or any(not item[0] for item in files):
+            raise ValueError("Список изображений не может быть пустым.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt не может быть пустым.")
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
+        prepared = prepare_edit_files(files, selected_model, labels)
         url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
         form = {
             "model": selected_model,
             "prompt": security.sanitize_prompt(prompt.strip()),
         }
-        files = {
-            "image": (filename, image_bytes, mime_type or "application/octet-stream")
-        }
+        multipart: list[tuple[str, tuple[str, bytes, str]]] = [
+            ("image", (name, data, mime or "application/octet-stream"))
+            for data, name, mime in prepared
+        ]
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
-            "edit_image",
+            "edit_image_call",
             model=selected_model,
-            bytes=len(image_bytes),
+            count=len(prepared),
             prompt_chars=len(prompt),
         )
         try:
@@ -1936,7 +2046,7 @@ class AssistAIClient:
                     "User-Agent": "AssistAIClient/1.0",
                 },
             ) as client:
-                response = await client.post(url, data=form, files=files)
+                response = await client.post(url, data=form, files=multipart)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
@@ -1978,6 +2088,11 @@ class AssistAIClient:
         await cost_tracker.record(
             kind="image",
             amount_usd=cost_tracker.estimate_image_cost(len(images)),
+        )
+        logger.info(
+            "edit_image_done",
+            model=selected_model,
+            count=len(images),
         )
         return images
 

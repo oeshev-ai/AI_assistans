@@ -8,6 +8,7 @@ so local development needs no worker.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import uuid
 from typing import Any
@@ -94,6 +95,53 @@ async def generate_image(
         result = await job.result(timeout=timeout)
         return list(result)
     return await assistant.generate_image(prompt=prompt, model=model, size=size)
+
+
+async def edit_images(
+    assistant: Any,
+    files: list[tuple[bytes, str, str]],
+    prompt: str,
+    *,
+    model: str | None = None,
+    labels: list[str] | None = None,
+    timeout: float = 180.0,
+) -> list[str]:
+    """Правит фото через arq (байты в Redis) или сразу в процессе."""
+    if is_queue_enabled() and _pool is not None:
+        key = f"arq:edit:{uuid.uuid4().hex}"
+        payload = [
+            {
+                "b64": base64.b64encode(data).decode("ascii"),
+                "filename": name,
+                "mime": mime,
+            }
+            for data, name, mime in files
+        ]
+        try:
+            await _pool.set(key, json.dumps(payload), ex=600)
+            job = await _pool.enqueue_job(
+                "edit_image_task",
+                key,
+                prompt,
+                model,
+                labels,
+            )
+            if job is None:
+                await _pool.delete(key)
+                logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
+                return await assistant.edit_images(
+                    files, prompt, model=model, labels=labels
+                )
+            logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
+            result = await job.result(timeout=timeout)
+            return list(result)
+        except Exception as exc:
+            logger.warning("arq_edit_failed_inline", error=str(exc))
+            try:
+                await _pool.delete(key)
+            except Exception:
+                pass
+    return await assistant.edit_images(files, prompt, model=model, labels=labels)
 
 
 async def synthesize_speech(

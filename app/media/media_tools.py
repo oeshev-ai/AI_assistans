@@ -88,6 +88,35 @@ def get_user_media() -> list[UserMedia]:
     return list(_REQUEST_USER_MEDIA.get() or [])
 
 
+_BASE_OVERRIDE: ContextVar[int | None] = ContextVar("photo_base_override", default=None)
+_LAST_EDIT_BASE: ContextVar[int | None] = ContextVar("last_edit_base", default=None)
+_IMAGE_LIMIT_CHECKED: ContextVar[bool] = ContextVar(
+    "image_limit_checked", default=False
+)
+
+
+def set_base_override(index: int | None) -> Token[int | None]:
+    return _BASE_OVERRIDE.set(index)
+
+
+def reset_base_override(token: Token[int | None]) -> None:
+    _BASE_OVERRIDE.reset(token)
+
+
+def take_last_edit_base() -> int | None:
+    value = _LAST_EDIT_BASE.get()
+    _LAST_EDIT_BASE.set(None)
+    return value
+
+
+def mark_image_limit_checked() -> Token[bool]:
+    return _IMAGE_LIMIT_CHECKED.set(True)
+
+
+def reset_image_limit_checked(token: Token[bool]) -> None:
+    _IMAGE_LIMIT_CHECKED.reset(token)
+
+
 def _outbound() -> MediaBucket | None:
     return _REQUEST_OUTBOUND.get()
 
@@ -101,7 +130,7 @@ def _last_user_media(*kinds: UserMediaKind) -> UserMedia | None:
 
 
 class EditImageTool(BaseTool):
-    """Редактирование изображения через ``/v1/images/edits``."""
+    """Редактирование одного или нескольких изображений через ``/images/edits``."""
 
     def __init__(self, client: AssistAIClient) -> None:
         self._client = client
@@ -113,10 +142,13 @@ class EditImageTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Изменить уже существующее изображение по текстовому описанию. "
-            "Вызывай, когда пользователь просит отредактировать, перерисовать, "
-            "изменить стиль или детали картинки, которую он прислал. "
-            "Нужно вложение-изображение в текущем сообщении."
+            "Изменить присланные фото. Если фото больше одного, индексы обязательны: "
+            "не угадывай роли по порядку альбома. "
+            "Примеры: «костюм с фото 1 надень на человека с фото 2» — "
+            "base_index=1, reference_indexes=[0]; "
+            "«лицо с фото 1 замени лицом с фото 2» — base_index=1, reference_indexes=[0]; "
+            "«предмет с фото 1 помести на фото 2» — base_index=1, reference_indexes=[0]. "
+            "Фото 1 — это индекс 0."
         )
 
     @property
@@ -124,37 +156,91 @@ class EditImageTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "prompt": {
+                "instruction": {
                     "type": "string",
-                    "description": "Что изменить на изображении.",
+                    "description": "Что изменить. Только просьба пользователя, без служебного текста.",
                 },
-                "model": {
+                "base_index": {
+                    "type": "integer",
+                    "description": "Индекс основы с нуля. Обязателен, если фото больше одного.",
+                },
+                "reference_indexes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Индексы референсов с нуля. Обязательны, если фото больше одного.",
+                },
+                "edit_type": {
                     "type": "string",
-                    "description": "Модель редактирования. Необязательно.",
+                    "enum": [
+                        "face_swap",
+                        "outfit_transfer",
+                        "object_insert",
+                        "background_replace",
+                        "style_transfer",
+                        "generic",
+                    ],
+                    "description": "Тип правки.",
                 },
             },
-            "required": ["prompt"],
+            "required": ["instruction"],
             "additionalProperties": False,
         }
 
     async def execute(self, **kwargs: Any) -> str:
-        prompt = kwargs.get("prompt")
+        instruction = kwargs.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            instruction = kwargs.get("prompt")
         model = kwargs.get("model")
-        if not isinstance(prompt, str) or not prompt.strip():
-            return _error_json("Параметр prompt обязателен.")
-        source = _last_user_media("image")
-        if source is None:
+        if not isinstance(instruction, str) or not instruction.strip():
+            return _error_json("Параметр instruction обязателен.")
+        images = [item for item in get_user_media() if item.kind == "image"]
+        if not images:
             return _error_json(
                 "Нет изображения во вложении. Попросите пользователя прислать картинку."
             )
+        if not _IMAGE_LIMIT_CHECKED.get():
+            from app.infra.cost_tracker import get_billing_user
+            from app.infra.rate_limiter import rate_limiter
+
+            user_id = get_billing_user()
+            if user_id is not None and not await rate_limiter.check_image_limit(
+                user_id
+            ):
+                retry_after = await rate_limiter.get_retry_after(user_id, "image")
+                return _error_json(
+                    f"Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
+                )
+        base, refs, error = _resolve_edit_indexes(images, kwargs)
+        if error is not None:
+            return _error_json(error)
+        assert base is not None
+        ordered = [images[base]]
+        labels = [str(base + 1)]
+        for index in refs:
+            ordered.append(images[index])
+            labels.append(str(index + 1))
+        files = [(item.data, item.filename, item.mime_type) for item in ordered]
         selected = model.strip() if isinstance(model, str) and model.strip() else None
+        edit_type = kwargs.get("edit_type")
+        prompt = instruction.strip()
+        if isinstance(edit_type, str) and edit_type.strip():
+            prompt = f"{edit_type.strip()}: {prompt}"
+        logger.info(
+            "edit_image_call",
+            count=len(files),
+            base_index=base,
+            reference_indexes=refs,
+            model=selected,
+        )
         try:
-            images = await self._client.edit_image(
-                image_bytes=source.data,
-                filename=source.filename,
-                prompt=prompt.strip(),
+            import app.infra.job_queue as job_queue
+
+            result = await job_queue.edit_images(
+                self._client,
+                files,
+                prompt,
                 model=selected,
-                mime_type=source.mime_type,
+                labels=labels,
             )
         except AssistAIError as exc:
             return _error_json(exc.message)
@@ -164,8 +250,9 @@ class EditImageTool(BaseTool):
             logger.exception("edit_image_failed")
             return _error_json(_exception_text(exc))
 
+        _LAST_EDIT_BASE.set(base)
         bucket = _outbound()
-        for index, image in enumerate(images):
+        for index, image in enumerate(result):
             if image.startswith(("http://", "https://")):
                 item = OutboundMedia(
                     kind="image",
@@ -184,17 +271,71 @@ class EditImageTool(BaseTool):
                 )
             if bucket is not None:
                 bucket.add(item)
+        logger.info("edit_image_done", count=len(result), base_index=base)
         return json.dumps(
             {
                 "status": "success",
-                "image_count": len(images),
+                "image_count": len(result),
+                "base_index": base,
                 "note": (
                     "Отредактированное изображение уже отправляется пользователю. "
-                    "Кратко подтверди результат, без base64."
+                    "Кратко подтверди результат, без base64 и без URL."
                 ),
             },
             ensure_ascii=False,
         )
+
+
+def _resolve_edit_indexes(
+    images: list[UserMedia], kwargs: dict[str, Any]
+) -> tuple[int | None, list[int], str | None]:
+    """Индексы из аргументов модели. При нескольких фото без индексов — ошибка."""
+    override = _BASE_OVERRIDE.get()
+    raw_base = kwargs.get("base_index")
+    raw_refs = kwargs.get("reference_indexes")
+    count = len(images)
+    if override is not None:
+        if not 0 <= override < count:
+            return None, [], "Индекс основы вне диапазона фото."
+        refs = _int_list(raw_refs)
+        if refs is None:
+            refs = [index for index in range(count) if index != override]
+        refs = [index for index in refs if index != override]
+        if any(index < 0 or index >= count for index in refs):
+            return None, [], "Индекс референса вне диапазона фото."
+        return override, refs, None
+    if count > 1 and (not isinstance(raw_base, int) or not isinstance(raw_refs, list)):
+        return (
+            None,
+            [],
+            "Для нескольких фото укажи base_index и reference_indexes. Не угадывай роли.",
+        )
+    if count == 1 and not isinstance(raw_base, int):
+        return 0, [], None
+    if not isinstance(raw_base, int):
+        return None, [], "Параметр base_index обязателен."
+    if not 0 <= raw_base < count:
+        return None, [], "Индекс основы вне диапазона фото."
+    refs = _int_list(raw_refs) if raw_refs is not None else []
+    if refs is None:
+        return None, [], "reference_indexes должен быть списком индексов."
+    refs = [index for index in refs if index != raw_base]
+    if any(index < 0 or index >= count for index in refs):
+        return None, [], "Индекс референса вне диапазона фото."
+    return raw_base, refs, None
+
+
+def _int_list(value: Any) -> list[int] | None:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return None
+    result: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            return None
+        result.append(item)
+    return result
 
 
 class GenerateVideoTool(BaseTool):

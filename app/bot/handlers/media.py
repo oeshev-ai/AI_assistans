@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.bot import runtime as R
+from app.bot.album import get_album_hub
 from app.bot.constants import (
     _CHROME,
     MAX_IMAGE_SIZE_MB,
@@ -27,6 +28,8 @@ from app.bot.constants import (
     process_pdf,
     rate_limiter,
 )
+from app.bot.handlers.photo import PhotoTurn, deliver_album, incoming_from_message
+from app.storage.pending_media import PendingMediaStorage
 
 
 async def on_upload_cancel(
@@ -192,8 +195,9 @@ async def handle_photo(
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
     state: FSMContext,
+    pending_media: PendingMediaStorage,
 ) -> None:
-    """Анализирует фото через multimodal stream_chat."""
+    """Кладёт фото в буфер альбома. Разбор намерения — после паузы или сразу."""
     if not message.photo:
         return
     if await state.get_state() is not None:
@@ -206,51 +210,34 @@ async def handle_photo(
         )
         logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
         return
-    bot = message.bot
-    if bot is None:
-        await message.answer("Не удалось загрузить файл")
+    photo = incoming_from_message(message)
+    if photo is None:
         return
-    largest = message.photo[-1]
-    if (
-        largest.file_size is not None
-        and largest.file_size > MAX_IMAGE_SIZE_MB * 1024 * 1024
-    ):
+    if photo.size > MAX_IMAGE_SIZE_MB * 1024 * 1024:
         await message.answer(
             f"Файл слишком большой. Максимум — {MAX_IMAGE_SIZE_MB} МБ."
         )
         return
-    try:
-        data = await download_telegram_file(bot, largest.file_id)
-        ensure_within_size_limit(data, label="Фото")
-        logger.info(
-            "Фото, chat_id=%s size=%s",
-            message.chat.id,
-            len(data),
-        )
-        image_part = build_image_content(data, "image/jpeg")
-        caption = message.caption or ""
-        multimodal = build_multimodal_content(caption, [image_part])
-        placeholder = f"[Изображение: {caption.strip() or 'без подписи'}]"
-        user_media = [
-            UserMedia(
-                kind="image",
-                filename="photo.jpg",
-                mime_type="image/jpeg",
-                data=data,
-            )
-        ]
-    except VisionError as exc:
-        await message.answer(exc.message)
-        return
-    await R._process_vision_message(
-        message,
-        assistant,
-        topic_storage,
-        assistant_storage,
-        state,
-        multimodal_content=multimodal,
-        history_placeholder=placeholder,
-        user_media=user_media,
+    logger.info(
+        "photo_received",
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        grouped=bool(message.media_group_id),
+    )
+    turn = PhotoTurn(
+        message=message,
+        assistant=assistant,
+        topic_storage=topic_storage,
+        assistant_storage=assistant_storage,
+        state=state,
+        pending=pending_media,
+    )
+    await get_album_hub().add(
+        message.chat.id,
+        message.media_group_id,
+        photo,
+        turn,
+        deliver_album,
     )
 
 

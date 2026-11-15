@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.bot import runtime as R
+from app.bot.album import get_album_hub
 from app.bot.constants import (
     _KEEP_OUTGOING,
     MAX_VOICE_DURATION_SECONDS,
@@ -27,6 +28,8 @@ from app.bot.constants import (
     security,
     set_billing_user,
 )
+from app.bot.handlers.photo import deliver_album
+from app.storage.pending_media import PendingMediaStorage
 
 
 async def handle_text(
@@ -35,6 +38,7 @@ async def handle_text(
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
     state: FSMContext,
+    pending_media: PendingMediaStorage,
 ) -> None:
     """Обычный диалог в активной теме. Ответ языковой модели идёт потоком."""
     user_text = (message.text or "").strip()
@@ -52,6 +56,14 @@ async def handle_text(
         logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
         return
     sanitized_text = security.sanitize_prompt(user_text)
+    flushed = await get_album_hub().flush_text(
+        message.chat.id,
+        sanitized_text,
+        deliver_album,
+    )
+    if flushed:
+        return
+    del pending_media
     await R._process_user_message(
         message,
         assistant,

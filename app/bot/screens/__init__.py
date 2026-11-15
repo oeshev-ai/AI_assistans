@@ -13,6 +13,7 @@ from app.bot.screens.draft import (
     _icons_keyboard,
 )
 from app.bot.screens.image import _image_view
+from app.bot.screens.photo import _photo_action_view, _photo_base_pick_view
 from app.bot.screens.presets import (
     _preset_preview_parts,
     _presets_keyboard,
@@ -34,6 +35,8 @@ __all__ = [
     "_icons_keyboard",
     "_image_view",
     "_model_picker_parts",
+    "_photo_action_view",
+    "_photo_base_pick_view",
     "_preset_preview_parts",
     "_presets_keyboard",
     "_presets_text",

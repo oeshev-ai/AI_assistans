@@ -50,6 +50,7 @@ from app.bot.constants import (
     start_metrics_server,
 )
 from app.bot.handlers import _register_handlers
+from app.storage.pending_media import PendingMediaStorage, create_pending_media_storage
 
 
 def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
@@ -138,6 +139,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     """Создаёт клиент LLM, темы и профили ассистентов. Все живут в workflow_data."""
     topic_storage: TopicHistoryStorage | None = None
     assistant_storage: AssistantStorage | None = None
+    pending_media: PendingMediaStorage | None = None
     redis_url = os.getenv("REDIS_URL", "").strip()
     shared_redis = await _open_shared_redis(redis_url)
     rate_limiter.attach_redis(shared_redis)
@@ -148,8 +150,11 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
         topic_storage = await create_topic_storage(TopicConfig.from_env())
         assistant_storage = await create_assistant_storage(RedisConfig.from_env())
         assistant = AssistAIClient(AssistAIConfig.from_env())
+        pending_media = await create_pending_media_storage(redis_url)
     except ValidationError:
         logger.exception("bot_config_invalid")
+        if pending_media is not None:
+            await pending_media.close()
         if assistant_storage is not None:
             await assistant_storage.close()
         if topic_storage is not None:
@@ -160,6 +165,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["topic_storage"] = topic_storage
     dispatcher.workflow_data["assistant_storage"] = assistant_storage
     dispatcher.workflow_data["assistant"] = assistant
+    dispatcher.workflow_data["pending_media"] = pending_media
 
     metrics_port = int(os.getenv("METRICS_PORT", "8083"))
     health_port = int(os.getenv("HEALTH_PORT", "8082"))
@@ -246,6 +252,9 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     profiles = dispatcher.workflow_data.get("assistant_storage")
     if isinstance(profiles, AssistantStorage):
         await profiles.close()
+    pending = dispatcher.workflow_data.get("pending_media")
+    if isinstance(pending, PendingMediaStorage):
+        await pending.close()
     shared_redis = dispatcher.workflow_data.get("shared_redis")
     if isinstance(shared_redis, Redis):
         await shared_redis.aclose()

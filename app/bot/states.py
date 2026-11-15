@@ -37,3 +37,11 @@ class ImageSG(StatesGroup):
 
     config = State()
     prompt = State()
+
+
+class PhotoSG(StatesGroup):
+    """Фото: экран действия, инструкция правки или вопрос."""
+
+    action = State()
+    edit_instruction = State()
+    question = State()
