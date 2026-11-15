@@ -104,6 +104,7 @@ async def edit_images(
     *,
     model: str | None = None,
     labels: list[str] | None = None,
+    size: str | None = None,
     timeout: float = 180.0,
 ) -> list[str]:
     """Правит фото через arq (байты в Redis) или сразу в процессе."""
@@ -125,12 +126,13 @@ async def edit_images(
                 prompt,
                 model,
                 labels,
+                size,
             )
             if job is None:
                 await _pool.delete(key)
                 logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
                 return await assistant.edit_images(
-                    files, prompt, model=model, labels=labels
+                    files, prompt, model=model, labels=labels, size=size
                 )
             logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
             result = await job.result(timeout=timeout)
@@ -141,7 +143,9 @@ async def edit_images(
                 await _pool.delete(key)
             except Exception:
                 pass
-    return await assistant.edit_images(files, prompt, model=model, labels=labels)
+    return await assistant.edit_images(
+        files, prompt, model=model, labels=labels, size=size
+    )
 
 
 async def synthesize_speech(

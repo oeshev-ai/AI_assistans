@@ -240,53 +240,40 @@ async def _prepare_messages_with_image(
     ]
 
 
-def _turn_called_tool(messages: list[dict[str, Any]], start: int) -> bool:
-    """Был ли в этом ходе ответ инструмента, даже если картинка не собралась."""
-    return any(
-        isinstance(item, dict) and item.get("role") == "tool"
-        for item in messages[start:]
-    )
-
-
 def _compact_tool_content(content: str) -> str:
-    """Убирает URL и base64 из результатов медиа-инструментов."""
+    """Убирает URL и base64 из результата медиа-инструмента."""
     try:
         payload = json.loads(content)
     except ValueError:
         return content
     if not isinstance(payload, dict):
         return content
-    removed = False
-    for key in ("url", "b64_json", "data", "image_url", "image_b64"):
-        if key in payload:
-            payload.pop(key)
-            removed = True
-    raw_images = payload.get("images")
+    compacted = dict(payload)
+    changed = False
+    for key in ("url", "b64_json", "audio", "video", "data"):
+        value = compacted.get(key)
+        if isinstance(value, str) and (value.startswith("http") or len(value) > 80):
+            compacted.pop(key, None)
+            changed = True
+    raw_images = compacted.get("images")
     if isinstance(raw_images, list):
-        payload["images"] = [
+        compacted["images"] = [
             {"type": item.get("type")}
             if isinstance(item, dict) and "type" in item
             else {"type": "unknown"}
             for item in raw_images
         ]
-        if "status" not in payload:
-            payload["status"] = "success"
-        if "note" not in payload:
-            payload["note"] = (
-                "Изображение уже передано пользователю в Telegram. "
-                "Не вызывай generate_image повторно для этого запроса."
-            )
-        return json.dumps(payload, ensure_ascii=False)
-    if "image_count" in payload:
-        kept = {
-            key: payload[key]
-            for key in ("status", "image_count", "note", "base_index", "edit_type")
-            if key in payload
-        }
-        return json.dumps(kept, ensure_ascii=False)
-    if removed:
-        return json.dumps(payload, ensure_ascii=False)
-    return content
+        changed = True
+        if "status" not in compacted:
+            compacted["status"] = "success"
+        if "note" not in compacted:
+            compacted["note"] = "Медиа уже отправлено, повторно не вызывать."
+        return json.dumps(compacted, ensure_ascii=False)
+    if not changed:
+        return content
+    if "note" not in compacted:
+        compacted["note"] = "Медиа уже отправлено, повторно не вызывать."
+    return json.dumps(compacted, ensure_ascii=False)
 
 
 def _sanitize_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -689,17 +676,8 @@ async def _process_user_message(
     input_kind: InputKind = "text",
     status: Message | None = None,
     user_media: list[UserMedia] | None = None,
-    *,
-    history_text: str | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-    suppress_text_without_tools: bool = False,
-) -> bool:
-    """Общий pipeline текста и распознанного голоса в активной теме.
-
-    ``history_text`` пишется в тему, а ``user_text`` уходит модели.
-    ``suppress_text_without_tools`` скрывает ответ, если инструмент не вызван.
-    Возвращает False, только когда ответ скрыт из-за отсутствия инструмента.
-    """
+) -> None:
+    """Общий pipeline текста и распознанного голоса в активной теме."""
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     started = time.perf_counter()
@@ -724,7 +702,7 @@ async def _process_user_message(
         reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
         clear_request_context()
-        return False
+        return
     try:
         profile = await _active_profile(chat_id, assistant_storage)
         topic_id = await _active_topic(chat_id, profile.id, topic_storage)
@@ -734,22 +712,17 @@ async def _process_user_message(
             assistant_id=profile.id,
             topic_id=topic_id,
         )
-        stored_text = history_text if history_text is not None else user_text
         history_copy = await _prepare_messages(
-            chat_id, profile.id, stored_text, topic_id, topic_storage, profile
+            chat_id, profile.id, user_text, topic_id, topic_storage, profile
         )
-        if history_text is not None and history_copy:
-            last = history_copy[-1]
-            if isinstance(last, dict) and last.get("role") == "user":
-                history_copy[-1] = {**last, "content": user_text}
     except AssistantStorageError:
         reset_upload_request_context(upload_ctx_token)
         await _reply_profile_error(message)
-        return False
+        return
     except TopicStorageError:
         reset_upload_request_context(upload_ctx_token)
         await _reply_history_error(message)
-        return False
+        return
     text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
     logger.info(
         "processing_message",
@@ -771,7 +744,7 @@ async def _process_user_message(
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
         with scope, media_scope:
             async for delta in assistant.stream_chat(
-                messages=history_copy, model=text_model, tool_choice=tool_choice
+                messages=history_copy, model=text_model
             ):
                 if delta.kind != "content" or not delta.text:
                     continue
@@ -784,25 +757,12 @@ async def _process_user_message(
         answer = "".join(parts).strip()
         images = scope.images
         outbound = media_scope.bucket.items
-        called_tool = _turn_called_tool(history_copy, turn_start)
-        if (
-            suppress_text_without_tools
-            and not images
-            and not outbound
-            and not called_tool
-        ):
-            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _delete_bot_message(status)
-            keep = _release_outgoing(keep)
-            return False
-        if called_tool and not images and not outbound and not answer:
-            answer = "Не удалось изменить фото."
         if not answer and not images and not outbound:
             await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
             await _edit_stream(status, "Пустой ответ.", shown)
             keep = _release_outgoing(keep)
             await _append_chrome(state, [status.message_id])
-            return False
+            return
         if answer:
             visible = await _edit_stream(status, answer, shown)
             head = answer[:TELEGRAM_TEXT_LIMIT]
@@ -852,7 +812,6 @@ async def _process_user_message(
         )
         if answer and M._should_send_voice_reply(profile, input_kind):
             await _send_voice_reply(message, assistant, profile, answer)
-        return True
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
@@ -861,7 +820,6 @@ async def _process_user_message(
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
-        return False
     except Exception as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
@@ -870,7 +828,6 @@ async def _process_user_message(
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_INTERNAL, state)
-        return False
     finally:
         reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
@@ -1200,9 +1157,7 @@ async def _process_vision_message(
     history_placeholder: str,
     status_text: str = "Анализирую изображение…",
     user_media: list[UserMedia] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-    suppress_text_without_tools: bool = False,
-) -> bool:
+) -> None:
     """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
     chat_id = message.chat.id
     media_token = set_user_media(user_media or [])
@@ -1221,12 +1176,12 @@ async def _process_vision_message(
     except AssistantStorageError:
         reset_user_media(media_token)
         await _reply_profile_error(message)
-        return False
+        return
     except TopicStorageError:
         reset_user_media(media_token)
         await _reply_history_error(message)
-        return False
-    vision_model = M._vision_model_of(profile, assistant)
+        return
+    vision_model = M._vision_model_of(profile, assistant, chat_id=chat_id)
     logger.info(
         "Vision, chat_id=%s topic_id=%s, модель=%s, сообщений в запросе=%s",
         chat_id,
@@ -1247,9 +1202,7 @@ async def _process_vision_message(
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
         with scope, media_scope:
             async for delta in assistant.stream_chat(
-                messages=history_copy,
-                model=vision_model,
-                tool_choice=tool_choice,
+                messages=history_copy, model=vision_model
             ):
                 if delta.kind != "content" or not delta.text:
                     continue
@@ -1262,25 +1215,12 @@ async def _process_vision_message(
         answer = "".join(parts).strip()
         images = scope.images
         outbound = media_scope.bucket.items
-        called_tool = _turn_called_tool(history_copy, turn_start)
-        if (
-            suppress_text_without_tools
-            and not images
-            and not outbound
-            and not called_tool
-        ):
-            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _delete_bot_message(status)
-            keep = _release_outgoing(keep)
-            return False
-        if called_tool and not images and not outbound and not answer:
-            answer = "Не удалось изменить фото."
         if not answer and not images and not outbound:
             await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
             await _edit_stream(status, "Пустой ответ.", shown)
             keep = _release_outgoing(keep)
             await _append_chrome(state, [status.message_id])
-            return False
+            return
         if answer:
             visible = await _edit_stream(status, answer, shown)
             head = answer[:TELEGRAM_TEXT_LIMIT]
@@ -1331,7 +1271,6 @@ async def _process_vision_message(
         )
         if answer and M._should_send_voice_reply(profile, "text"):
             await _send_voice_reply(message, assistant, profile, answer)
-        return True
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
@@ -1339,7 +1278,6 @@ async def _process_vision_message(
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
-        return False
     except Exception as exc:
         keep = _release_outgoing(keep)
         await _send_extracted_images(message, scope.images)
@@ -1347,7 +1285,6 @@ async def _process_vision_message(
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
-        return False
     finally:
         reset_user_media(media_token)
         _release_outgoing(keep)

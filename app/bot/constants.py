@@ -195,7 +195,6 @@ _FLOW_KEYS = (
     "flow_icon",
     "flow_preset_id",
     "flow_photo_id",
-    "flow_photo_base",
     "image_model",
     "image_size",
 )
@@ -204,8 +203,8 @@ _SCREEN_TOPICS = "screen_topics"
 _SCREEN_SETTINGS = "screen_settings"
 _SCREEN_PICKER = "screen_picker"
 _SCREEN_IMAGE = "screen_image"
-_SCREEN_PRESETS = "screen_presets"
 _SCREEN_PHOTO = "screen_photo"
+_SCREEN_PRESETS = "screen_presets"
 _MENU_ANCHOR = "menu_anchor"
 _CHROME = "chrome_ids"
 _CHROME_BUCKET: ContextVar[list[int] | None] = ContextVar("chrome_bucket", default=None)
@@ -216,8 +215,8 @@ _SCREEN_KEYS = (
     _SCREEN_SETTINGS,
     _SCREEN_PICKER,
     _SCREEN_IMAGE,
-    _SCREEN_PRESETS,
     _SCREEN_PHOTO,
+    _SCREEN_PRESETS,
 )
 _VOICE_MODE_LABELS: dict[str, str] = {
     "off": "выкл",
@@ -237,7 +236,6 @@ from app.bot.states import (
     ImageSG,
     NewAssistantSG,
     NewTopicSG,
-    PhotoSG,
     RenameTopicSG,
 )
 

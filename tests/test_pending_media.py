@@ -45,6 +45,25 @@ async def test_memory_expires() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bump_round_and_replace() -> None:
+    store = InMemoryPendingMediaStorage(ttl_seconds=30)
+    await store.put(_sample())
+    updated = await store.bump_round(7, "asst", "Что сделать?")
+    assert updated is not None
+    assert updated.clarify_rounds == 1
+    assert updated.last_question == "Что сделать?"
+    replacement = _sample()
+    replacement.items[0].file_id = "file-2"
+    await store.put(replacement)
+    loaded = await store.get(7, "asst")
+    assert loaded is not None
+    assert loaded.items[0].file_id == "file-2"
+    popped = await store.pop(7, "asst")
+    assert popped is not None
+    assert await store.get(7, "asst") is None
+
+
+@pytest.mark.asyncio
 async def test_base_override_roundtrip() -> None:
     store = InMemoryPendingMediaStorage(ttl_seconds=30)
     await store.put(_sample())

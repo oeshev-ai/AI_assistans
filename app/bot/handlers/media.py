@@ -332,6 +332,14 @@ async def handle_document(
         ensure_within_size_limit(data, label="Файл")
         caption = message.caption or ""
         if mime == "application/pdf":
+            from app.bot.photo_routing import _photo_intent
+
+            if _photo_intent(caption) == "edit":
+                await message.answer(
+                    "Правка поддерживается только для изображений. "
+                    "PDF можно разобрать, но не изменить как фото."
+                )
+                return
             pages = process_pdf(data)
             logger.info(
                 "PDF, chat_id=%s name=%s size=%s pages=%s",

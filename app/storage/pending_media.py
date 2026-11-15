@@ -58,6 +58,10 @@ class PendingMedia:
     assistant_id: str
     items: list[PendingMediaItem]
     caption: str = ""
+    topic_id: str = ""
+    media_group_id: str | None = None
+    clarify_rounds: int = 0
+    last_question: str | None = None
     base_override: int | None = None
     role_retry_used: bool = False
     created_at: float = field(default_factory=time.time)
@@ -67,6 +71,10 @@ class PendingMedia:
             "chat_id": self.chat_id,
             "assistant_id": self.assistant_id,
             "caption": self.caption,
+            "topic_id": self.topic_id,
+            "media_group_id": self.media_group_id,
+            "clarify_rounds": self.clarify_rounds,
+            "last_question": self.last_question,
             "base_override": self.base_override,
             "role_retry_used": self.role_retry_used,
             "created_at": self.created_at,
@@ -107,11 +115,17 @@ class PendingMedia:
                     )
                 )
         override = data.get("base_override")
+        group = data.get("media_group_id")
+        question = data.get("last_question")
         return cls(
             chat_id=int(data.get("chat_id") or 0),
             assistant_id=str(data.get("assistant_id") or ""),
             items=items,
             caption=str(data.get("caption") or ""),
+            topic_id=str(data.get("topic_id") or ""),
+            media_group_id=group if isinstance(group, str) and group else None,
+            clarify_rounds=int(data.get("clarify_rounds") or 0),
+            last_question=question if isinstance(question, str) and question else None,
             base_override=int(override) if isinstance(override, int) else None,
             role_retry_used=bool(data.get("role_retry_used")),
             created_at=float(data.get("created_at") or time.time()),
@@ -148,6 +162,24 @@ class PendingMediaStorage(ABC):
             return None
         media.base_override = base_override
         await self.put(media)
+        return media
+
+    async def bump_round(
+        self, chat_id: int, assistant_id: str, question: str | None = None
+    ) -> PendingMedia | None:
+        """Увеличивает счётчик уточнений и запоминает последний вопрос."""
+        media = await self.get(chat_id, assistant_id)
+        if media is None:
+            return None
+        media.clarify_rounds += 1
+        media.last_question = question
+        await self.put(media)
+        logger.info(
+            "clarify_round",
+            chat_id=chat_id,
+            assistant_id=assistant_id,
+            round=media.clarify_rounds,
+        )
         return media
 
     async def mark_role_retry(self, chat_id: int, assistant_id: str) -> None:

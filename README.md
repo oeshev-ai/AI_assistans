@@ -13,10 +13,10 @@
 ## Что внутри
 
 - **Технологии:** Python 3.11, aiogram 3, Redis, ProxyAPI (LLM/Vision/STT/картинки), Yandex SpeechKit TTS, Yandex Object Storage, arq, Prometheus, Sentry, Docker Compose, GitHub Actions
-- **Архитектура:** пакет `app/` — `bot` (`handlers/` и `screens/` по доменам) → `llm` / `media` → `storage` + `infra`; опционально очередь arq для image/edit/TTS/STT
+- **Архитектура:** пакет `app/` — `bot` (`handlers/` и `screens/` по доменам) → `llm` / `media` → `storage` + `infra`; опционально очередь arq для image/TTS/STT
 - **Деплой:** VPS + Docker Compose + nginx (health/upload на localhost), CI: ruff / mypy / pytest
 
-**Возможности:** стриминг ответов, каталог персон, темы диалога, Vision (фото/PDF), альбомы с выбором основы и референсов, голос, generate/edit image и video, транскрипты файлом, погода и валюты через tools.
+**Возможности:** стриминг ответов, каталог персон, темы диалога, Vision (фото/PDF), голос, generate/edit image и video, транскрипты файлом, погода и валюты через tools. Фото и альбомы сначала разбирает отдельная дешёвая модель и возвращает JSON: правка, новая картинка, анализ или уточняющий вопрос без кнопок.
 
 ## Как запустить
 

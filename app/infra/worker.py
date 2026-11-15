@@ -88,43 +88,6 @@ async def generate_image_task(
     return await assistant.generate_image(prompt=prompt, model=model, size=size)
 
 
-async def edit_image_task(
-    ctx: dict[str, Any],
-    redis_key: str,
-    prompt: str,
-    model: str | None,
-    labels: list[str] | None = None,
-) -> list[str]:
-    assistant: AssistAIClient = ctx["assistant"]
-    redis = ctx["redis"]
-    raw = await redis.get(redis_key)
-    try:
-        await redis.delete(redis_key)
-    except Exception:
-        pass
-    if not raw:
-        raise ValueError("edit payload missing or expired in Redis")
-    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
-    payload = json.loads(text)
-    files: list[tuple[bytes, str, str]] = []
-    if isinstance(payload, list):
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            encoded = item.get("b64")
-            if not isinstance(encoded, str):
-                continue
-            files.append(
-                (
-                    base64.b64decode(encoded),
-                    str(item.get("filename") or "image.png"),
-                    str(item.get("mime") or "image/png"),
-                )
-            )
-    logger.info("job_edit_image", model=model, count=len(files))
-    return await assistant.edit_images(files, prompt, model=model, labels=labels)
-
-
 async def synthesize_speech_task(
     ctx: dict[str, Any],
     text: str,
@@ -147,6 +110,48 @@ async def synthesize_speech_task(
         "filename": speech.filename,
         "mime_type": speech.mime_type,
     }
+
+
+async def edit_image_task(
+    ctx: dict[str, Any],
+    redis_key: str,
+    prompt: str,
+    model: str | None,
+    labels: list[str] | None,
+    size: str | None = None,
+) -> list[str]:
+    """Достаёт файлы правки из Redis и вызывает ``edit_images``."""
+    assistant: AssistAIClient = ctx["assistant"]
+    redis = ctx["redis"]
+    raw = await redis.get(redis_key)
+    try:
+        await redis.delete(redis_key)
+    except Exception:
+        pass
+    if not raw:
+        raise ValueError("edit payload missing or expired in Redis")
+    text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    payload = json.loads(text)
+    if not isinstance(payload, list):
+        raise ValueError("edit payload is not a list")
+    files: list[tuple[bytes, str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        encoded = item.get("b64")
+        if not isinstance(encoded, str) or not encoded:
+            continue
+        files.append(
+            (
+                base64.b64decode(encoded),
+                str(item.get("filename") or "image.png"),
+                str(item.get("mime") or "image/png"),
+            )
+        )
+    logger.info("job_edit_image", files=len(files), model=model)
+    return await assistant.edit_images(
+        files, prompt, model=model, labels=labels, size=size
+    )
 
 
 async def transcribe_audio_task(

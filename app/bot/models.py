@@ -143,13 +143,37 @@ def _stored_image_size(profile: AssistantProfile) -> str:
     return "1024x1024"
 
 
-def _vision_model_of(profile: AssistantProfile, assistant: AssistAIClient) -> str:
-    """Модель анализа картинок: vision → text → дефолт клиента."""
-    return (
-        profile.vision_model
-        or profile.text_model
-        or assistant.config.default_text_model
+def _vision_model_of(
+    profile: AssistantProfile,
+    assistant: AssistAIClient,
+    *,
+    chat_id: int | None = None,
+) -> str:
+    """Модель анализа картинок: vision → text → дефолт клиента.
+
+    Непустой id вне каталога не пишется в Redis — только мягкий fallback.
+    """
+    if profile.vision_model:
+        if profile.vision_model in AVAILABLE_TEXT_MODELS:
+            return profile.vision_model
+        logger.warning(
+            "stale_model_fallback",
+            chat_id=chat_id,
+            model=profile.vision_model,
+            kind="vision",
+        )
+        return assistant.config.default_text_model
+    if not profile.text_model:
+        return assistant.config.default_text_model
+    if profile.text_model in AVAILABLE_TEXT_MODELS:
+        return profile.text_model
+    logger.warning(
+        "stale_model_fallback",
+        chat_id=chat_id,
+        model=profile.text_model,
+        kind="text",
     )
+    return assistant.config.default_text_model
 
 
 def _should_send_voice_reply(profile: AssistantProfile, input_kind: InputKind) -> bool:

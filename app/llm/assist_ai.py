@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import os
@@ -192,10 +191,7 @@ def _gpt6_chat_omit_tools(model_id: str) -> bool:
 
 
 def _attach_chat_tools(
-    payload: dict[str, Any],
-    tools: list[dict[str, Any]],
-    model_id: str,
-    tool_choice: str | dict[str, Any] | None = None,
+    payload: dict[str, Any], tools: list[dict[str, Any]], model_id: str
 ) -> None:
     """Добавляет tools в chat/completions с учётом ограничений GPT-6."""
     if not tools:
@@ -208,9 +204,25 @@ def _attach_chat_tools(
         )
         return
     payload["tools"] = tools
-    payload["tool_choice"] = "auto" if tool_choice is None else tool_choice
+    payload["tool_choice"] = "auto"
     if _gpt6_chat_tools_need_reasoning_none(model_id):
         payload["reasoning_effort"] = "none"
+
+
+def _apply_generation_options(
+    payload: dict[str, Any],
+    *,
+    response_format: dict[str, Any] | None,
+    temperature: float | None,
+    max_tokens: int | None,
+) -> None:
+    """Добавляет необязательные поля генерации, не трогая tools."""
+    if response_format is not None:
+        payload["response_format"] = response_format
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
 
 def _assistant_stream_tool_message(
@@ -303,6 +315,30 @@ class AssistAIError(Exception):
         self.status_code = status_code
 
 
+def _bounded_float(name: str, default: float) -> float:
+    """Читает float из окружения и ограничивает его диапазоном 0..1."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return min(1.0, max(0.0, value))
+
+
+def _positive_int(name: str, default: int) -> int:
+    """Читает положительное целое из окружения."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class AssistAIConfig(BaseModel):
     """Конфигурация клиента. Ключи не попадают в ``repr``.
 
@@ -337,6 +373,9 @@ class AssistAIConfig(BaseModel):
     speechkit_url: str = "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
+    photo_router_model: str = "deepseek/deepseek-v4.1-flash"
+    router_confidence: float = Field(default=0.55, ge=0, le=1)
+    router_max_tokens: int = Field(default=600, ge=1)
 
     @field_validator("base_url")
     @classmethod
@@ -413,6 +452,12 @@ class AssistAIConfig(BaseModel):
             speechkit_role=speechkit_role,
             speechkit_speed=speechkit_speed,
             speechkit_url=speechkit_url,
+            photo_router_model=os.getenv(
+                "PHOTO_ROUTER_MODEL", "deepseek/deepseek-v4.1-flash"
+            ).strip()
+            or "deepseek/deepseek-v4.1-flash",
+            router_confidence=_bounded_float("PHOTO_ROUTER_CONFIDENCE", 0.55),
+            router_max_tokens=_positive_int("PHOTO_ROUTER_MAX_TOKENS", 600),
         )
 
 
@@ -1321,81 +1366,68 @@ def image_model_family(model: str) -> ImageModelFamily:
     return "openai"
 
 
-def supports_multi_image(model: str) -> bool:
-    """Несколько входных фото принимает только семейство OpenAI (gpt-image / edits)."""
-    return image_model_family(model) == "openai"
+def supports_multi_image(model_id: str) -> bool:
+    """True, если edits принимает несколько файлов.
 
-
-def _composite_fallback_enabled() -> bool:
-    return os.getenv("ALLOW_COMPOSITE_FALLBACK", "0").strip() == "1"
-
-
-def composite_side_by_side(
-    files: list[tuple[bytes, str, str]],
-    labels: list[str] | None = None,
-) -> tuple[bytes, str, str]:
-    """Склеивает фото в один PNG слева направо с подписями."""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError as exc:
-        raise AssistAIError(
-            "Склейка нескольких фото недоступна: установите пакет Pillow."
-        ) from exc
-    if len(files) < 2:
-        raise ValueError("Для склейки нужно хотя бы два изображения.")
-    opened: list[Any] = []
-    for data, _name, _mime in files:
-        opened.append(Image.open(io.BytesIO(data)).convert("RGB"))
-    height = 512
-    resized: list[Any] = []
-    for image in opened:
-        width = max(1, int(image.width * height / max(image.height, 1)))
-        resized.append(image.resize((width, height)))
-    gap = 8
-    label_band = 28
-    total = sum(image.width for image in resized) + gap * (len(resized) - 1)
-    canvas = Image.new("RGB", (total, height + label_band), "white")
-    draw = ImageDraw.Draw(canvas)
-    x = 0
-    for index, image in enumerate(resized):
-        canvas.paste(image, (x, label_band))
-        label = (
-            labels[index]
-            if labels is not None and index < len(labels)
-            else str(index + 1)
-        )
-        draw.text((x + 4, 4), label, fill="black")
-        x += image.width + gap
-    buffer = io.BytesIO()
-    canvas.save(buffer, format="PNG")
-    return buffer.getvalue(), "composite.png", "image/png"
+    По карточкам каталога несколько ``image`` принимает семейство OpenAI
+    (``openai/gpt-image-*``). Остальные семейства и неизвестные id — одно фото.
+    """
+    cleaned = model_id.strip()
+    if not cleaned.casefold().startswith("openai/"):
+        return False
+    return image_model_family(cleaned) == "openai"
 
 
 def prepare_edit_files(
     files: list[tuple[bytes, str, str]],
-    model: str,
+    model_id: str,
     labels: list[str] | None = None,
 ) -> list[tuple[bytes, str, str]]:
-    """Оставляет файлы как есть, склеивает или отказывает. Референс не отбрасывается."""
-    if len(files) <= 1 or supports_multi_image(model):
-        return files
-    if _composite_fallback_enabled():
-        logger.info(
-            "edit_image_composite",
-            model=model,
-            count=len(files),
-        )
-        return [composite_side_by_side(files, labels)]
-    logger.info(
-        "multi_image_unsupported",
-        model=model,
-        count=len(files),
-    )
+    """Оставляет файлы по отдельности или собирает одно полотно.
+
+    OpenAI получает исходный порядок (основа первой). Модель без multi-image
+    при ``ALLOW_COMPOSITE_FALLBACK=1`` склеивает кадры рядом, иначе ошибка.
+    Референс при этом не отбрасывается молча.
+    """
+    if len(files) <= 1 or supports_multi_image(model_id):
+        return list(files)
+    if os.getenv("ALLOW_COMPOSITE_FALLBACK", "0").strip() == "1":
+        return [_composite_edit_canvas(files, labels)]
     raise AssistAIError(
-        "Эта модель не принимает несколько изображений за один запрос. "
-        "Выберите модель семейства OpenAI или включите склейку "
-        "(ALLOW_COMPOSITE_FALLBACK=1)."
+        f"Модель {model_id} не принимает несколько изображений. "
+        "Выберите другую в настройках или опишите словами, что взять со второго фото."
     )
+
+
+def _composite_edit_canvas(
+    files: list[tuple[bytes, str, str]],
+    labels: list[str] | None,
+) -> tuple[bytes, str, str]:
+    """Склеивает фото слева направо и подписывает половины номерами."""
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    opened: list[Image.Image] = []
+    try:
+        for data, _name, _mime in files:
+            opened.append(Image.open(BytesIO(data)).convert("RGB"))
+        height = max(image.height for image in opened)
+        width = sum(image.width for image in opened)
+        canvas = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(canvas)
+        offset = 0
+        for index, image in enumerate(opened):
+            canvas.paste(image, (offset, 0))
+            mark = labels[index] if labels and index < len(labels) else str(index + 1)
+            draw.text((offset + 4, 4), mark, fill=(0, 0, 0))
+            offset += image.width
+        buffer = BytesIO()
+        canvas.save(buffer, format="PNG")
+        return buffer.getvalue(), "composite.png", "image/png"
+    finally:
+        for image in opened:
+            image.close()
 
 
 def _is_flux_model(model: str) -> bool:
@@ -1646,7 +1678,12 @@ class AssistAIClient:
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
+        *,
+        use_tools: bool = True,
         tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Ведёт диалог с моделью и сама выполняет запрошенные инструменты.
 
@@ -1682,11 +1719,15 @@ class AssistAIClient:
                 "model": selected_model,
                 "messages": messages,
             }
-            _attach_chat_tools(
+            if use_tools:
+                _attach_chat_tools(payload, tools, selected_model)
+                if tool_choice is not None:
+                    payload["tool_choice"] = tool_choice
+            _apply_generation_options(
                 payload,
-                tools,
-                selected_model,
-                tool_choice if iteration == 1 else None,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
 
             logger.info(
@@ -1708,7 +1749,7 @@ class AssistAIClient:
 
             # Модель иногда прикладывает tool_calls при другом finish_reason.
             # Такой ответ тоже нужно выполнить, иначе вызов потеряется.
-            if finish_reason == "tool_calls" or tool_calls:
+            if use_tools and (finish_reason == "tool_calls" or tool_calls):
                 if not tool_calls:
                     raise AssistAIError(
                         "Модель вернула finish_reason=tool_calls без списка tool_calls."
@@ -1753,7 +1794,12 @@ class AssistAIClient:
         self,
         messages: list[dict[str, Any]],
         model: str | None = None,
+        *,
+        use_tools: bool = True,
         tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ChatDelta]:
         """Потоковый диалог с теми же инструментами, что и ``chat_completion``.
 
@@ -1791,11 +1837,15 @@ class AssistAIClient:
                 "messages": messages,
                 "stream": True,
             }
-            _attach_chat_tools(
+            if use_tools:
+                _attach_chat_tools(payload, tools, selected_model)
+                if tool_choice is not None:
+                    payload["tool_choice"] = tool_choice
+            _apply_generation_options(
                 payload,
-                tools,
-                selected_model,
-                tool_choice if iteration == 1 else None,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
 
             logger.info(
@@ -1844,10 +1894,12 @@ class AssistAIClient:
             ]
             reasoning_text = "".join(reasoning_parts)
             content_text = "".join(content_parts)
-            wants_tools = (finish_reason == "tool_calls" or bool(tool_calls)) and bool(
-                tool_calls
+            wants_tools = (
+                use_tools
+                and (finish_reason == "tool_calls" or bool(tool_calls))
+                and bool(tool_calls)
             )
-            if finish_reason == "tool_calls" and not tool_calls:
+            if use_tools and finish_reason == "tool_calls" and not tool_calls:
                 raise AssistAIError(
                     "Модель вернула finish_reason=tool_calls без списка tool_calls."
                 )
@@ -1994,46 +2046,29 @@ class AssistAIClient:
         mime_type: str = "image/png",
         model: str | None = None,
     ) -> list[str]:
-        """Редактирует одно изображение. Обёртка над ``edit_images``."""
-        return await self.edit_images(
-            [(image_bytes, filename, mime_type)],
-            prompt,
-            model=model,
-        )
-
-    async def edit_images(
-        self,
-        files: list[tuple[bytes, str, str]],
-        prompt: str,
-        *,
-        model: str | None = None,
-        labels: list[str] | None = None,
-    ) -> list[str]:
-        """Редактирует фото через ``/images/edits``. Основа — первый файл."""
-        if not files or any(not item[0] for item in files):
-            raise ValueError("Список изображений не может быть пустым.")
+        """Редактирует изображение через ``/images/edits`` (multipart)."""
+        if not image_bytes:
+            raise ValueError("image_bytes не может быть пустым.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt не может быть пустым.")
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        prepared = prepare_edit_files(files, selected_model, labels)
         url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
         form = {
             "model": selected_model,
             "prompt": security.sanitize_prompt(prompt.strip()),
         }
-        multipart: list[tuple[str, tuple[str, bytes, str]]] = [
-            ("image", (name, data, mime or "application/octet-stream"))
-            for data, name, mime in prepared
-        ]
+        files = {
+            "image": (filename, image_bytes, mime_type or "application/octet-stream")
+        }
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
-            "edit_image_call",
+            "edit_image",
             model=selected_model,
-            count=len(prepared),
+            bytes=len(image_bytes),
             prompt_chars=len(prompt),
         )
         try:
@@ -2046,7 +2081,7 @@ class AssistAIClient:
                     "User-Agent": "AssistAIClient/1.0",
                 },
             ) as client:
-                response = await client.post(url, data=form, files=multipart)
+                response = await client.post(url, data=form, files=files)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
@@ -2089,10 +2124,106 @@ class AssistAIClient:
             kind="image",
             amount_usd=cost_tracker.estimate_image_cost(len(images)),
         )
+        return images
+
+    async def edit_images(
+        self,
+        files: list[tuple[bytes, str, str]],
+        prompt: str,
+        *,
+        model: str | None = None,
+        labels: list[str] | None = None,
+        size: str | None = None,
+    ) -> list[str]:
+        """Правит несколько фото через multipart ``/images/edits``.
+
+        Первый файл — основа. Поле формы — ``image[]``. Размер уходит в полях
+        семейства модели, как у ``generate_image``.
+        """
+        if not files:
+            raise ValueError("files не может быть пустым.")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt не может быть пустым.")
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+
+        selected_model = model or self.config.default_image_edit_model
+        prepared = prepare_edit_files(files, selected_model, labels)
+        sanitized = security.sanitize_prompt(prompt.strip())
+        if labels:
+            numbered = ", ".join(labels)
+            sanitized = f"{sanitized}\nImage order: {numbered}."
+        if len(prepared) == 1 and len(files) > 1:
+            sanitized = (
+                f"{sanitized} The canvas is a side-by-side composite. "
+                "The left half is the base image."
+            )
+        body = _image_generation_body(selected_model, sanitized, size or "1024x1024")
+        form = {key: str(value) for key, value in body.items() if key not in {"n"}}
+        multipart = [
+            ("image[]", (name, data, mime or "application/octet-stream"))
+            for data, name, mime in prepared
+        ]
+        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
+        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
-            "edit_image_done",
+            "edit_image",
             model=selected_model,
-            count=len(images),
+            files=len(prepared),
+            prompt_chars=len(sanitized),
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers={
+                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "User-Agent": "AssistAIClient/1.0",
+                },
+            ) as client:
+                response = await client.post(url, data=form, files=multipart)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            raise AssistAIError(
+                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+        if not isinstance(data, dict):
+            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+        images: list[str] = []
+        raw_items = data.get("data")
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                url_value = item.get("url")
+                if isinstance(url_value, str) and url_value:
+                    images.append(url_value)
+                    continue
+                encoded = item.get("b64_json")
+                if isinstance(encoded, str) and encoded:
+                    images.append(encoded)
+        if not images:
+            raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
+        await cost_tracker.record(
+            kind="image",
+            amount_usd=cost_tracker.estimate_image_cost(len(images)),
         )
         return images
 
