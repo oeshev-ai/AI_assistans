@@ -31,6 +31,20 @@ from app.storage.pending_media import PendingMedia, PendingMediaStorage
 
 logger = structlog.get_logger("photo_flow")
 
+
+def _edit_size_for_model(
+    profile_size: str, generate_model: str, edit_model: str
+) -> str | None:
+    """Размер персоны уходит в правку только если семьи совпадают.
+
+    У «Помощника» генерация на FLUX (``1K``), а правка на GPT Image.
+    ``1K`` в форму OpenAI не подставляется: размер считается по исходнику.
+    """
+    if image_model_family(edit_model) == image_model_family(generate_model):
+        return profile_size
+    return None
+
+
 _CANCEL = frozenset({"отмена", "стоп", "cancel"})
 _ANALYZE_QUESTION = {
     "analyze": "Опиши подробно, что изображено",
@@ -292,11 +306,8 @@ async def _edit(
     labels = [str(base + 1), *[str(index + 1) for index in refs]]
     generate_model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
     model = turn.assistant.config.default_image_edit_model
-    stored_size = M._stored_image_size(profile)
-    edit_size = (
-        stored_size
-        if image_model_family(model) == image_model_family(generate_model)
-        else None
+    edit_size = _edit_size_for_model(
+        M._stored_image_size(profile), generate_model, model
     )
     prompt = security.sanitize_prompt(instruction)
     if refs:

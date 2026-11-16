@@ -1448,6 +1448,16 @@ class GenerateImageTool(BaseTool):
         )
 
 
+def note_generation_id(generation_id: str | None) -> None:
+    """Кладёт id в scope текущего хода. В JSON для модели его не добавляют."""
+    if not isinstance(generation_id, str) or not generation_id:
+        return
+    bucket = _REQUEST_IMAGES.get()
+    if bucket is None:
+        return
+    bucket.append({"generation_id": generation_id})
+
+
 def image_model_family(model: str) -> ImageModelFamily:
     """Семейство image-модели: от него зависит формат размера в запросе."""
     lowered = model.casefold()
@@ -2131,7 +2141,7 @@ class AssistAIClient:
             width, height = source_image_size(first_bytes)
         except Exception:
             logger.warning("edit_size_unreadable")
-            return "1024x1024"
+            return "auto"
         return fit_image_size(width, height)
 
     def _downscale_edit_input(self, data: bytes, mime: str) -> tuple[bytes, str]:

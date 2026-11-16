@@ -9,6 +9,7 @@ from app.llm.models_config import (
 )
 from app.storage.assistant_presets import (
     ASSISTANT_PRESETS,
+    _size_ok,
     get_preset,
     preset_profile,
     validate_catalog,
@@ -30,6 +31,12 @@ def test_preset_models_in_catalogs() -> None:
             assert preset.image_model in AVAILABLE_IMAGE_MODELS
         if preset.tts_model is not None:
             assert preset.tts_model in AVAILABLE_TTS_MODELS
+
+
+def test_openai_size_aliases_stay_valid() -> None:
+    assert _size_ok("openai/gpt-image-2.6-flare", "1024x1792")
+    assert _size_ok("openai/gpt-image-2.6-flare", "1792x1024")
+    assert _size_ok("openai/gpt-image-2.6-flare", "1024x1536")
 
 
 def test_helper_generates_on_flux_klein() -> None:

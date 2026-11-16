@@ -16,6 +16,7 @@ from app.llm.assist_ai import (
     SpeechResult,
     _error_json,
     _exception_text,
+    note_generation_id,
 )
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
@@ -251,6 +252,10 @@ class EditImageTool(BaseTool):
             return _error_json(_exception_text(exc))
 
         _LAST_EDIT_BASE.set(base)
+        for generation_id in getattr(self._client, "_generation_ids", []):
+            note_generation_id(
+                generation_id if isinstance(generation_id, str) else None
+            )
         bucket = _outbound()
         for index, image in enumerate(result):
             if image.startswith(("http://", "https://")):

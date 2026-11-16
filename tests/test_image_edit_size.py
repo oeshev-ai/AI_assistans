@@ -82,3 +82,60 @@ async def test_fixed_mode_keeps_square(
     )
     body = route.calls[0].request.content.decode("latin1")
     assert "1024x1024" in body
+
+
+@pytest.mark.asyncio
+async def test_unreadable_source_falls_back_to_auto(
+    assist_client: AssistAIClient, respx_mock: MockRouter
+) -> None:
+    import structlog.testing
+
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/edited.png"}]}
+        )
+    )
+    assist_client.config = assist_client.config.model_copy(
+        update={"image_edit_size_mode": "source"}
+    )
+    with structlog.testing.capture_logs() as logs:
+        await assist_client.edit_images(
+            [(b"not-an-image", "bad.jpg", "image/jpeg")],
+            "правка",
+            model="openai/gpt-image-2.6-flare",
+        )
+    body = route.calls[0].request.content.decode("latin1")
+    assert 'name="size"' in body
+    assert "\r\nauto\r\n" in body or "\nauto\n" in body
+    assert any(item.get("event") == "edit_size_unreadable" for item in logs)
+
+
+@pytest.mark.asyncio
+async def test_flux_profile_size_is_not_sent_on_openai_edit(
+    assist_client: AssistAIClient, respx_mock: MockRouter
+) -> None:
+    from PIL import Image
+
+    from app.bot.photo_flow import _edit_size_for_model
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1536, 1024), (8, 8, 8)).save(buffer, format="PNG")
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/edited.png"}]}
+        )
+    )
+    edit_size = _edit_size_for_model(
+        "1K",
+        "black-forest-labs/flux-3-image-klein",
+        "openai/gpt-image-2.6-flare",
+    )
+    await assist_client.edit_images(
+        [(buffer.getvalue(), "base.png", "image/png")],
+        "замени фон",
+        model="openai/gpt-image-2.6-flare",
+        size=edit_size,
+    )
+    body = route.calls[0].request.content.decode("latin1")
+    assert "1K" not in body
+    assert "1536x1024" in body

@@ -248,14 +248,16 @@ def _strip_generation_ids(content: str) -> str:
         return content
     if not isinstance(payload, dict):
         return content
-    raw_images = payload.get("images")
-    if not isinstance(raw_images, list):
-        return content
     changed = False
-    for item in raw_images:
-        if isinstance(item, dict) and "generation_id" in item:
-            item.pop("generation_id", None)
-            changed = True
+    if "generation_ids" in payload:
+        payload.pop("generation_ids", None)
+        changed = True
+    raw_images = payload.get("images")
+    if isinstance(raw_images, list):
+        for item in raw_images:
+            if isinstance(item, dict) and "generation_id" in item:
+                item.pop("generation_id", None)
+                changed = True
     if not changed:
         return content
     return json.dumps(payload, ensure_ascii=False)
@@ -289,9 +291,11 @@ def _attach_generation_ids(
     ]
     if not any(isinstance(item, str) and item for item in pending):
         return
+    last_tool: dict[str, Any] | None = None
     for message in messages:
         if message.get("role") != "tool" or not isinstance(message.get("content"), str):
             continue
+        last_tool = message
         try:
             payload = json.loads(message["content"])
         except ValueError:
@@ -315,6 +319,15 @@ def _attach_generation_ids(
                 changed = True
         if changed:
             message["content"] = json.dumps(payload, ensure_ascii=False)
+    leftover = [item for item in pending if isinstance(item, str) and item]
+    if leftover and last_tool is not None and isinstance(last_tool.get("content"), str):
+        try:
+            payload = json.loads(last_tool["content"])
+        except ValueError:
+            return
+        if isinstance(payload, dict) and "generation_id" not in last_tool["content"]:
+            payload["generation_ids"] = leftover
+            last_tool["content"] = json.dumps(payload, ensure_ascii=False)
 
 
 def _compact_tool_content(content: str) -> str:

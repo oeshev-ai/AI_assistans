@@ -35,6 +35,8 @@ def test_model_hint_empty_for_unknown() -> None:
 
 
 def test_image_catalog_starts_with_flare_and_drops_deprecated() -> None:
+    assert len(AVAILABLE_IMAGE_MODELS) == 5
+    assert len(AVAILABLE_TEXT_MODELS) == 8
     assert AVAILABLE_IMAGE_MODELS[0] == "openai/gpt-image-2.6-flare"
     deprecated = {
         "openai/gpt-image-1-mini",
