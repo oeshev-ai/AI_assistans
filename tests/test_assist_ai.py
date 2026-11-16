@@ -512,10 +512,10 @@ async def test_image_model_scope_used_when_tool_omits_model(
 
     assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
     tool = assist_client._tools_registry["generate_image"]
-    with ImageModelScope("openai/gpt-image-1.5"):
+    with ImageModelScope("openai/gpt-image-2.6-flare"):
         payload = json.loads(await tool.execute(prompt="кот"))
 
-    assert seen["model"] == "openai/gpt-image-1.5"
+    assert seen["model"] == "openai/gpt-image-2.6-flare"
     assert payload["status"] == "success"
 
 
@@ -586,7 +586,7 @@ async def test_openai_image_keeps_pixel_size(
 
     await assist_client.generate_image(
         "кот",
-        model="openai/gpt-image-1-mini",
+        model="openai/gpt-image-2.6-flare",
         size="1024x1024",
     )
 

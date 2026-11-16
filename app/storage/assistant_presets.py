@@ -51,8 +51,8 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "Не выдумывай факты: если данных не хватает, честно скажи об этом."
         ),
         text_model="openai/gpt-6-luna",
-        image_model="openai/gpt-image-1-mini",
-        image_size="1024x1024",
+        image_model="black-forest-labs/flux-3-image-klein",
+        image_size="1K",
         voice_mode="auto",
     ),
     AssistantPreset(
@@ -117,7 +117,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "за правильные догадки."
         ),
         text_model="google/gemini-3.8-flash",
-        image_model="openai/gpt-image-1.5",
+        image_model="openai/gpt-image-2.6-flare",
         image_size="1024x1024",
         voice_mode="auto",
         tts_model="elevenlabs/eleven-multilingual-v2",
@@ -153,7 +153,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "и сразу вызывай generate_image. После генерации кратко подтверди "
             "готовность и предложи уточнить стиль, ракурс или освещение."
         ),
-        text_model="google/gemini-3.5-flash-lite",
+        text_model="google/gemini-3.8-flash",
         image_model="black-forest-labs/flux-3-image",
         image_size="2K",
         voice_mode="off",
@@ -169,7 +169,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "задавай только при крайней необходимости."
         ),
         text_model="deepseek/deepseek-v4.1-flash",
-        image_model="bytedance-seed/seedream-5-0-flash",
+        image_model="black-forest-labs/flux-3-image-klein",
         image_size="1K",
         voice_mode="off",
     ),
@@ -264,7 +264,16 @@ def _size_ok(model_id: str, size: str) -> bool:
         return size in {"1K", "2K"}
     if family in {"qwen", "recraft"}:
         return size in {"1:1", "16:9", "9:16"}
-    return size in {"1024x1024", "1024x1792", "1792x1024"}
+    return size in {
+        "1024x1024",
+        "1536x1024",
+        "1024x1536",
+        "2048x2048",
+        "3840x2160",
+        "2160x3840",
+        "1024x1792",
+        "1792x1024",
+    }
 
 
 def _tts_voices_for_model(model_id: str) -> tuple[str, ...]:

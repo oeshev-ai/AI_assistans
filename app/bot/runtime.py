@@ -192,7 +192,7 @@ async def _prepare_messages(
         limit,
     )
     stored = await storage.get_history(chat_id, assistant_id, topic_id)
-    dialog = [dict(item) for item in stored if item.get("role") != "system"]
+    dialog = _dialog_for_model(stored)
     if len(dialog) != len(stored):
         # Промпт персоны подставляется только в запрос. Старый system в теме
         # занимает слот trim и расходится с активным ассистентом — убираем.
@@ -224,7 +224,7 @@ async def _prepare_messages_with_image(
         limit,
     )
     stored = await storage.get_history(chat_id, assistant_id, topic_id)
-    dialog = [dict(item) for item in stored if item.get("role") != "system"]
+    dialog = _dialog_for_model(stored)
     if len(dialog) != len(stored):
         await storage.clear_topic(chat_id, assistant_id, topic_id)
         for item in dialog:
@@ -238,6 +238,83 @@ async def _prepare_messages_with_image(
         *prior,
         {"role": "user", "content": multimodal_content},
     ]
+
+
+def _strip_generation_ids(content: str) -> str:
+    """Убирает generation_id из истории перед тем, как она снова уйдёт в модель."""
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return content
+    if not isinstance(payload, dict):
+        return content
+    raw_images = payload.get("images")
+    if not isinstance(raw_images, list):
+        return content
+    changed = False
+    for item in raw_images:
+        if isinstance(item, dict) and "generation_id" in item:
+            item.pop("generation_id", None)
+            changed = True
+    if not changed:
+        return content
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _dialog_for_model(stored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Копия истории без system и без generation_id."""
+    dialog: list[dict[str, Any]] = []
+    for item in stored:
+        if item.get("role") == "system":
+            continue
+        copy = dict(item)
+        content = copy.get("content")
+        if (
+            copy.get("role") == "tool"
+            and isinstance(content, str)
+            and "generation_id" in content
+        ):
+            copy["content"] = _strip_generation_ids(content)
+        dialog.append(copy)
+    return dialog
+
+
+def _attach_generation_ids(
+    messages: list[dict[str, Any]], images: list[dict[str, Any]]
+) -> None:
+    """Кладёт generation_id в сохранённый tool-JSON, не в ответ модели этого хода."""
+    pending = [
+        image.get("generation_id") if isinstance(image, dict) else None
+        for image in images
+    ]
+    if not any(isinstance(item, str) and item for item in pending):
+        return
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_images = payload.get("images")
+        if not isinstance(raw_images, list):
+            continue
+        changed = False
+        for item in raw_images:
+            if not pending:
+                break
+            generation_id = pending.pop(0)
+            if (
+                isinstance(item, dict)
+                and isinstance(generation_id, str)
+                and generation_id
+            ):
+                item["generation_id"] = generation_id
+                changed = True
+        if changed:
+            message["content"] = json.dumps(payload, ensure_ascii=False)
 
 
 def _compact_tool_content(content: str) -> str:
@@ -356,6 +433,7 @@ async def _remember_model_turn(
         if cleaned is not None:
             to_store.append(cleaned)
 
+    _attach_generation_ids(to_store, images)
     final_text = answer.strip()
     if not final_text and images:
         final_text = _image_completion_text(new_messages, len(images))

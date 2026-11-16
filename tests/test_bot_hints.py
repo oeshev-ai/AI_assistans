@@ -23,7 +23,7 @@ def _assistant() -> SimpleNamespace:
     return SimpleNamespace(
         config=SimpleNamespace(
             default_text_model="qwen/qwen3.8-flash",
-            default_image_model="openai/gpt-image-1-mini",
+            default_image_model="openai/gpt-image-2.6-flare",
         )
     )
 

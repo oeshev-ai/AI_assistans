@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from app.bot.runtime import _strip_generation_ids
 from app.storage.topic_history import InMemoryTopicStorage
 from bot import (
     _compact_tool_content,
@@ -146,4 +147,60 @@ async def test_remember_model_turn_stores_tool_round_without_base64() -> None:
     assert history[3]["role"] == "assistant"
     assert "кот" in history[3]["content"]
     assert "generate_image" in history[3]["content"]
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_generation_id_is_stored_but_not_sent_to_the_model() -> None:
+    storage = InMemoryTopicStorage()
+    topic_id = await storage.create_topic(1, AID, "Рисование")
+    await storage.append_message(
+        1, AID, topic_id, {"role": "user", "content": "нарисуй кота"}, 50
+    )
+    new_messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_img",
+                    "type": "function",
+                    "function": {
+                        "name": "generate_image",
+                        "arguments": '{"prompt":"кот"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_img",
+            "content": json.dumps(
+                {
+                    "status": "success",
+                    "prompt": "кот",
+                    "images": [{"type": "base64"}],
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {"role": "assistant", "content": "Готово."},
+    ]
+
+    await _remember_model_turn(
+        1,
+        AID,
+        topic_id,
+        storage,
+        new_messages,
+        answer="Готово.",
+        images=[{"type": "base64", "value": "AAAA", "generation_id": "gen_1"}],
+    )
+
+    history = await storage.get_history(1, AID, topic_id)
+    tool_payload = json.loads(history[2]["content"])
+    assert tool_payload["images"] == [{"type": "base64", "generation_id": "gen_1"}]
+    visible = json.loads(_strip_generation_ids(history[2]["content"]))
+    assert visible["images"] == [{"type": "base64"}]
+    assert "generation_id" not in visible["images"][0]
     await storage.close()

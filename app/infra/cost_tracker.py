@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from contextvars import ContextVar
@@ -40,9 +41,110 @@ LLM_BUDGET_REMAINING = Gauge(
 CHAT_INPUT_PER_1K = float(os.getenv("COST_CHAT_INPUT_PER_1K", "0.00015"))
 CHAT_OUTPUT_PER_1K = float(os.getenv("COST_CHAT_OUTPUT_PER_1K", "0.0006"))
 IMAGE_USD = float(os.getenv("COST_IMAGE_USD", "0.04"))
+IMAGE_FLUX_USD = float(os.getenv("COST_IMAGE_FLUX_USD", str(IMAGE_USD)))
+IMAGE_OUT_USD_PER_1M = float(os.getenv("IMAGE_OUT_USD_PER_1M", "30"))
+IMAGE_IN_USD_PER_1M = float(os.getenv("IMAGE_IN_USD_PER_1M", "8"))
+TEXT_IN_USD_PER_1M = float(os.getenv("TEXT_IN_USD_PER_1M", "5"))
+TEXT_OUT_USD_PER_1M = float(os.getenv("TEXT_OUT_USD_PER_1M", "10"))
+# Выходные токены GPT Image. Измерено: 1024²/low=824, 1024×1536 и 1536×1024/high=1353.
+# Остальные пары — оценка калькулятора, не проверяли. Ориентация токены не меняет.
+_IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
+    ("1024x1024", "low"): 824,
+    ("1024x1024", "medium"): 1449,  # оценка
+    ("1024x1024", "high"): 1756,  # оценка калькулятора, не проверяли
+    ("1024x1024", "xhigh"): 3122,  # оценка
+    ("1024x1024", "max"): 7024,  # оценка
+    ("1024x1536", "low"): 664,  # оценка
+    ("1024x1536", "medium"): 1132,  # оценка
+    ("1024x1536", "high"): 1353,
+    ("1024x1536", "xhigh"): 2459,  # оценка
+    ("1024x1536", "max"): 5488,  # оценка
+}
+IMAGE_INPUT_TOKEN_CAP = 1536  # наблюдение: 12 MP → 1452 (44×33); берём верхнюю границу
 VIDEO_USD = float(os.getenv("COST_VIDEO_USD", "0.20"))
 STT_PER_MINUTE = float(os.getenv("COST_STT_PER_MINUTE", "0.006"))
 TTS_PER_1K_CHARS = float(os.getenv("COST_TTS_PER_1K_CHARS", "0.015"))
+
+
+def _openai_image_model(model: str) -> bool:
+    return model.strip().casefold().startswith("openai/")
+
+
+def estimate_input_image_tokens(width: int, height: int) -> int:
+    """Входные image-токены: ceil(w/32)×ceil(h/32), не выше наблюдаемого потолка."""
+    patches = math.ceil(max(width, 1) / 32) * math.ceil(max(height, 1) / 32)
+    return min(patches, IMAGE_INPUT_TOKEN_CAP)
+
+
+def _output_size_class(size: str | None) -> str:
+    """Ближайший класс таблицы: квадрат или прямоугольник 1024×1536."""
+    if not isinstance(size, str) or "x" not in size.casefold():
+        return "1024x1024"
+    left, _, right = size.lower().partition("x")
+    try:
+        width = int(left)
+        height = int(right)
+    except ValueError:
+        return "1024x1024"
+    if width <= 0 or height <= 0:
+        return "1024x1024"
+    if abs(width - height) / max(width, height) <= 0.05:
+        return "1024x1024"
+    return "1024x1536"
+
+
+def _image_output_tokens(quality: str | None, size: str | None) -> int | None:
+    if not quality:
+        return None
+    return _IMAGE_OUTPUT_TOKENS.get(
+        (_output_size_class(size), quality.strip().casefold())
+    )
+
+
+def _token_count(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def cost_from_usage(usage: dict[str, Any]) -> float:
+    """Стоимость по модальностям. ``output_tokens`` целиком не умножается на 30."""
+    raw_in = usage.get("input_tokens_details") or {}
+    raw_out = usage.get("output_tokens_details") or {}
+    details_in = raw_in if isinstance(raw_in, dict) else {}
+    details_out = raw_out if isinstance(raw_out, dict) else {}
+    text_in = _token_count(details_in.get("text_tokens", usage.get("input_tokens", 0)))
+    image_in = _token_count(details_in.get("image_tokens", 0))
+    image_out = _token_count(
+        details_out.get(
+            "image_tokens",
+            usage.get("output_tokens", usage.get("completion_tokens", 0)),
+        )
+    )
+    text_out = _token_count(details_out.get("text_tokens", 0))
+    if text_out:
+        logger.warning("image_text_output_tokens", tokens=text_out)
+    return (
+        text_in * TEXT_IN_USD_PER_1M
+        + image_in * IMAGE_IN_USD_PER_1M
+        + image_out * IMAGE_OUT_USD_PER_1M
+        + text_out * TEXT_OUT_USD_PER_1M
+    ) / 1_000_000
+
+
+def _image_cost_from_usage(usage: dict[str, Any] | None) -> float | None:
+    if not isinstance(usage, dict):
+        return None
+    recognized = {
+        "input_tokens",
+        "output_tokens",
+        "completion_tokens",
+        "input_tokens_details",
+        "output_tokens_details",
+    }
+    if not recognized.intersection(usage):
+        return None
+    return cost_from_usage(usage)
 
 
 class BudgetExceededError(Exception):
@@ -92,8 +194,25 @@ class CostTracker:
         )
 
     @staticmethod
-    def estimate_image_cost(count: int = 1) -> float:
-        return IMAGE_USD * max(1, count)
+    def estimate_image_cost(
+        count: int = 1,
+        *,
+        model: str | None = None,
+        quality: str | None = None,
+        size: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> float:
+        """Стоимость картинки: usage, затем таблица quality, иначе плоская ставка."""
+        copies = max(1, count)
+        if model and not _openai_image_model(model):
+            return IMAGE_FLUX_USD * copies
+        from_usage = _image_cost_from_usage(usage)
+        if from_usage is not None:
+            return from_usage
+        tokens = _image_output_tokens(quality, size)
+        if tokens is None:
+            return IMAGE_USD * copies
+        return copies * tokens * IMAGE_OUT_USD_PER_1M / 1_000_000
 
     @staticmethod
     def estimate_stt_cost(duration_seconds: float) -> float:

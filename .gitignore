@@ -46,3 +46,6 @@ prompt.md
 
 # Redis RDB backups
 backups/
+
+docs/
+artifacts/

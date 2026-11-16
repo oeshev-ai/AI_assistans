@@ -27,7 +27,7 @@ async def test_base_file_is_first(
             (b"ref-bytes", "ref.png", "image/png"),
         ],
         "поменяй фон",
-        model="openai/gpt-image-2",
+        model="openai/gpt-image-2.6-flare",
     )
     assert images
     request = route.calls[0].request
@@ -53,5 +53,5 @@ async def test_content_policy_text_is_passed_through(
         await assist_client.edit_images(
             [(b"base-bytes", "base.png", "image/png")],
             "правка",
-            model="openai/gpt-image-2",
+            model="openai/gpt-image-2.6-flare",
         )

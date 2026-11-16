@@ -23,7 +23,7 @@ def test_openai_keeps_separate_files() -> None:
         (_png((255, 0, 0)), "a.png", "image/png"),
         (_png((0, 0, 255)), "b.png", "image/png"),
     ]
-    prepared = prepare_edit_files(files, "openai/gpt-image-2")
+    prepared = prepare_edit_files(files, "openai/gpt-image-2.6-flare")
     assert len(prepared) == 2
     assert prepared[0][1] == "a.png"
 

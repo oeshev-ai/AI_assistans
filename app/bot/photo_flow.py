@@ -13,7 +13,7 @@ from app.bot.photo_router import PhotoDecision, decide
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker, set_billing_user
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
-from app.llm.assist_ai import AssistAIError, ImageModelScope
+from app.llm.assist_ai import AssistAIError, ImageModelScope, image_model_family
 from app.llm.vision import (
     VisionError,
     build_multimodal_content,
@@ -290,7 +290,14 @@ async def _edit(
     ordered = [loaded[base], *[loaded[index] for index in refs]]
     files = [(item.data, item.filename, item.mime_type) for item in ordered]
     labels = [str(base + 1), *[str(index + 1) for index in refs]]
-    model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
+    generate_model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
+    model = turn.assistant.config.default_image_edit_model
+    stored_size = M._stored_image_size(profile)
+    edit_size = (
+        stored_size
+        if image_model_family(model) == image_model_family(generate_model)
+        else None
+    )
     prompt = security.sanitize_prompt(instruction)
     if refs:
         prompt = f"{prompt}\nImage 1 is the base (photo {base + 1}). " + " ".join(
@@ -324,7 +331,7 @@ async def _edit(
                     prompt,
                     model=model,
                     labels=labels,
-                    size=M._stored_image_size(profile),
+                    size=edit_size,
                 )
             except AssistAIError as exc:
                 if "несколько изображений" in exc.message:

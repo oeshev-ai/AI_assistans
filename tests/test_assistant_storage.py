@@ -84,7 +84,7 @@ async def test_save_switch_and_models_stay_on_one_chat(
     assert active is not None
     assert active.name == "Синоптик"
     assert active.text_model == "openai/gpt-4o-mini"
-    assert active.image_model == "openai/gpt-image-1-mini"
+    assert active.image_model == "openai/gpt-image-2.6-flare"
 
     other = await storage.get_active_assistant(2)
     assert other is not None

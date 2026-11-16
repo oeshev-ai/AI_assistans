@@ -7,32 +7,25 @@
 
 from __future__ import annotations
 
+import os
+
 AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
-    "qwen/qwen3.8-flash",
     "deepseek/deepseek-v4.1-flash",
-    "openai/gpt-6-luna",
-    "anthropic/claude-haiku-5-5",
-    "z-ai/glm-5.3-flash",
-    "google/gemini-3.1-flash-lite",
-    "google/gemini-3.5-flash-lite",
-    "qwen/qwen3.8-max-0902",
     "google/gemini-3.8-flash",
-    "anthropic/claude-sonnet-5-5",
-    "openai/gpt-6-sol",
-    "openai/gpt-6.1-terra",
     "google/gemini-4-argon",
+    "anthropic/claude-sonnet-5-5",
+    "openai/gpt-6-luna",
+    "openai/gpt-6.1-terra",
+    "openai/gpt-6-sol",
+    "qwen/qwen3.8-max-0902",
 )
 
-# Картинки: OpenAI и FLUX — как раньше; Qwen/Seedream/Recraft — свои поля размера.
+# Картинки: GPT Image 2.6 — основная; FLUX, Qwen и Recraft — свои поля размера.
 AVAILABLE_IMAGE_MODELS: tuple[str, ...] = (
-    "openai/gpt-image-1-mini",
-    "openai/gpt-image-1.5",
-    "openai/gpt-image-2",
+    "openai/gpt-image-2.6-flare",
     "black-forest-labs/flux-3-image-klein",
     "black-forest-labs/flux-3-image",
-    "qwen/qwen-image-2.1-turbo",
     "qwen/qwen-image-2.1-pro",
-    "bytedance-seed/seedream-5-0-flash",
     "recraft/recraft-v4.1",
 )
 
@@ -68,13 +61,8 @@ ELEVENLABS_TTS_VOICES: tuple[str, ...] = (
 
 MODEL_HINTS: dict[str, str] = {
     # Текст
-    "qwen/qwen3.8-flash": "Быстрый универсал: диалог, переводы, много запросов",
     "deepseek/deepseek-v4.1-flash": "Дёшево: логика, код, математика, чёткая структура",
     "openai/gpt-6-luna": "Универсальный ассистент, аккуратно вызывает инструменты",
-    "anthropic/claude-haiku-5-5": "Быстро и дёшево: краткие ответы, суммаризация",
-    "z-ai/glm-5.3-flash": "Быстрый универсал, силён в переводах RU-ZH/EN",
-    "google/gemini-3.1-flash-lite": "Самый экономный: короткие ответы, простая рутина",
-    "google/gemini-3.5-flash-lite": "Экономный и шустрый: простые задачи, промпты",
     "qwen/qwen3.8-max-0902": "Сложные тексты, аналитика, переводы со стилем",
     "google/gemini-3.8-flash": "Баланс: длинный контекст, документы, обучение",
     "anthropic/claude-sonnet-5-5": "Код, ревью, рефакторинг, точные инструкции",
@@ -82,14 +70,10 @@ MODEL_HINTS: dict[str, str] = {
     "openai/gpt-6.1-terra": "Флагман: тексты, креатив, агентные задачи",
     "google/gemini-4-argon": "Старший Gemini: фото, PDF, очень длинный контекст",
     # Картинки
-    "openai/gpt-image-1-mini": "Быстрые дешёвые черновики и простые сцены",
-    "openai/gpt-image-1.5": "Точнее промпт, читаемее надписи: схемы, инфографика",
-    "openai/gpt-image-2": "Сложные сцены и текст на картинке: постеры, обложки",
+    "openai/gpt-image-2.6-flare": "Универсал: фото, правки, надписи, несколько фото",
     "black-forest-labs/flux-3-image-klein": "Быстрый FLUX: наброски, варианты, итерации",
     "black-forest-labs/flux-3-image": "Арт и фотореализм: постеры, иллюстрации",
-    "qwen/qwen-image-2.1-turbo": "Быстрые визуалы с надписями: баннеры, плакаты",
     "qwen/qwen-image-2.1-pro": "Типографика и текст: афиши, обложки, карточки",
-    "bytedance-seed/seedream-5-0-flash": "Эффектные креативы для соцсетей, быстро",
     "recraft/recraft-v4.1": "Дизайн-графика: логотипы, иконки, схемы, вектор",
 }
 
@@ -97,6 +81,40 @@ MODEL_HINTS: dict[str, str] = {
 def is_elevenlabs_tts_model(model: str | None) -> bool:
     """True для моделей ElevenLabs через ProxyAPI."""
     return (model or "").strip().casefold().startswith("elevenlabs/")
+
+
+LEGACY_IMAGE_MODEL_ALIASES: dict[str, str] = {
+    "openai/gpt-image-1-mini": "openai/gpt-image-2.6-flare",
+    "openai/gpt-image-1.5": "openai/gpt-image-2.6-flare",
+    "openai/gpt-image-2": "openai/gpt-image-2.6-flare",
+    "openai/gpt-image-2.5-flare": "openai/gpt-image-2.6-flare",
+    "qwen/qwen-image-2.1-turbo": "qwen/qwen-image-2.1-pro",
+    "bytedance-seed/seedream-5-0-flash": "black-forest-labs/flux-3-image-klein",
+}
+
+LEGACY_TEXT_MODEL_ALIASES: dict[str, str] = {
+    "qwen/qwen3.8-flash": "deepseek/deepseek-v4.1-flash",
+    "z-ai/glm-5.3-flash": "deepseek/deepseek-v4.1-flash",
+    "google/gemini-3.1-flash-lite": "google/gemini-3.8-flash",
+    "google/gemini-3.5-flash-lite": "google/gemini-3.8-flash",
+    "anthropic/claude-haiku-5-5": "google/gemini-3.8-flash",
+}
+
+
+def _aliases_enabled(env_name: str) -> bool:
+    return os.getenv(env_name, "1").strip().casefold() not in {"0", "false", "no"}
+
+
+def resolve_image_model(model_id: str | None) -> str | None:
+    if not model_id or not _aliases_enabled("IMAGE_LEGACY_ALIASES"):
+        return model_id
+    return LEGACY_IMAGE_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
+
+
+def resolve_text_model(model_id: str | None) -> str | None:
+    if not model_id or not _aliases_enabled("TEXT_LEGACY_ALIASES"):
+        return model_id
+    return LEGACY_TEXT_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
 
 
 def model_hint(model_id: str | None) -> str:

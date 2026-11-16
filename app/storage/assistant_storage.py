@@ -7,19 +7,55 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
 from typing import Literal, TypeVar
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from app.llm.models_config import (
+    LEGACY_IMAGE_MODEL_ALIASES,
+    LEGACY_TEXT_MODEL_ALIASES,
+    resolve_image_model,
+    resolve_text_model,
+)
 from app.storage.history_storage import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
+
+
+def legacy_aliases_enabled() -> bool:
+    """``IMAGE_LEGACY_ALIASES=0`` оставляет старый image-id до soft-fallback."""
+    raw = os.getenv("IMAGE_LEGACY_ALIASES")
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def alias_model(model: str | None, table: dict[str, str], kind: str) -> str | None:
+    """Меняет снятый id на актуальный и пишет old/new без данных пользователя."""
+    expected = (
+        LEGACY_IMAGE_MODEL_ALIASES if kind == "image" else LEGACY_TEXT_MODEL_ALIASES
+    )
+    if table is not expected:
+        logger.warning("alias_table_ignored", kind=kind)
+    resolved = (
+        resolve_image_model(model) if kind == "image" else resolve_text_model(model)
+    )
+    if resolved is None or resolved == model:
+        return model
+    logger.info(
+        "image_model_aliased" if kind == "image" else "text_model_aliased",
+        old=model,
+        new=resolved,
+    )
+    return resolved
+
 
 DEFAULT_ASSISTANT_ID = "standard"
 DEFAULT_ASSISTANT_NAME = "Стандартный"
@@ -100,6 +136,19 @@ class AssistantProfile(BaseModel):
     def _normalize_icon(cls, value: str) -> str:
         cleaned = value.strip() if isinstance(value, str) else ""
         return cleaned or "🤖"
+
+    @model_validator(mode="after")
+    def _alias_legacy_models(self) -> AssistantProfile:
+        self.image_model = alias_model(
+            self.image_model, LEGACY_IMAGE_MODEL_ALIASES, "image"
+        )
+        self.text_model = alias_model(
+            self.text_model, LEGACY_TEXT_MODEL_ALIASES, "text"
+        )
+        self.vision_model = alias_model(
+            self.vision_model, LEGACY_TEXT_MODEL_ALIASES, "text"
+        )
+        return self
 
 
 def default_assistant_profile() -> AssistantProfile:

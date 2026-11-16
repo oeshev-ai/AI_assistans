@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 import httpx
 import structlog
@@ -46,6 +46,7 @@ from app.infra.cost_tracker import BudgetExceededError, cost_tracker
 from app.infra.metrics import API_CALLS, ERRORS, LATENCY, track_api_call
 from app.infra.security import security
 from app.llm.exchangerate import Conversion, ExchangeAPIError, get_exchange_rate
+from app.llm.models_config import resolve_image_model
 from app.llm.openweather import (
     AirPollutionData,
     CurrentWeather,
@@ -327,6 +328,41 @@ def _bounded_float(name: str, default: float) -> float:
     return min(1.0, max(0.0, value))
 
 
+def _choice(name: str, default: str, allowed: set[str]) -> str:
+    """Читает значение из окружения и сверяет его с допустимым набором."""
+    raw = os.getenv(name, "").strip().casefold()
+    if not raw:
+        return default
+    if raw not in allowed:
+        raise ValueError(f"{name}={raw} не входит в {sorted(allowed)}")
+    return raw
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Читает 0/1. Пустая переменная оставляет дефолт."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    cleaned = raw.strip().casefold()
+    if cleaned in {"1", "true", "yes", "on"}:
+        return True
+    if cleaned in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} должен быть 0 или 1")
+
+
+def _non_negative_int(name: str, default: int) -> int:
+    """Читает целое ≥ 0. Пустое или битое значение оставляет дефолт."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
 def _positive_int(name: str, default: int) -> int:
     """Читает положительное целое из окружения."""
     raw = os.getenv(name, "").strip()
@@ -357,13 +393,20 @@ class AssistAIConfig(BaseModel):
     openweather_api_key: str = Field(default="", repr=False)
     exchangerate_api_key: str = Field(default="", repr=False)
     base_url: str = "https://api.proxyapi.ru/v1"
-    default_text_model: str = "qwen/qwen3.8-flash"
-    default_image_model: str = "openai/gpt-image-1-mini"
+    default_text_model: str = "deepseek/deepseek-v4.1-flash"
+    default_image_model: str = "openai/gpt-image-2.6-flare"
     default_transcribe_model: str = "openai/whisper-large-v3"
     default_tts_model: str = "openai/gpt-4o-mini-tts"
     default_tts_voice: str = "alloy"
     default_tts_format: str = "opus"
-    default_image_edit_model: str = "openai/gpt-image-2.5-flare"
+    default_image_edit_model: str = "openai/gpt-image-2.6-flare"
+    image_quality: Literal["low", "medium", "high", "xhigh", "max", "auto"] = "high"
+    image_complexity_generate: Literal["low", "medium", "high"] = "high"
+    image_complexity_edit: Literal["low", "medium", "high"] = "low"
+    image_edit_size_mode: Literal["source", "auto", "fixed"] = "source"
+    image_input_max_edge: int = Field(default=1536, ge=0)
+    send_complexity: bool = True
+    legacy_model_aliases: bool = True
     default_video_model: str = "bytedance/seedance-2.0"
     tts_provider: Literal["speechkit", "proxyapi"] = "proxyapi"
     speechkit_api_key: str = Field(default="", repr=False)
@@ -376,6 +419,14 @@ class AssistAIConfig(BaseModel):
     photo_router_model: str = "deepseek/deepseek-v4.1-flash"
     router_confidence: float = Field(default=0.55, ge=0, le=1)
     router_max_tokens: int = Field(default=600, ge=1)
+
+    @field_validator("default_image_model", "default_image_edit_model", mode="after")
+    @classmethod
+    def _alias_legacy_image_model(cls, value: str) -> str:
+        resolved = resolve_image_model(value) or value
+        if resolved != value:
+            logger.warning("image_model_aliased", source="env", old=value, new=resolved)
+        return resolved
 
     @field_validator("base_url")
     @classmethod
@@ -440,9 +491,49 @@ class AssistAIConfig(BaseModel):
             default_tts_model=default_tts_model,
             default_tts_voice=default_tts_voice,
             default_tts_format=default_tts_format,
+            default_image_model=os.getenv(
+                "PROXYAPI_IMAGE_MODEL", "openai/gpt-image-2.6-flare"
+            ).strip()
+            or "openai/gpt-image-2.6-flare",
             default_image_edit_model=os.getenv(
-                "PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.5-flare"
+                "PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.6-flare"
+            ).strip()
+            or "openai/gpt-image-2.6-flare",
+            image_quality=cast(
+                Literal["low", "medium", "high", "xhigh", "max", "auto"],
+                _choice(
+                    "IMAGE_QUALITY",
+                    "high",
+                    {"low", "medium", "high", "xhigh", "max", "auto"},
+                ),
             ),
+            image_complexity_generate=cast(
+                Literal["low", "medium", "high"],
+                _choice(
+                    "IMAGE_COMPLEXITY_GENERATE",
+                    "high",
+                    {"low", "medium", "high"},
+                ),
+            ),
+            image_complexity_edit=cast(
+                Literal["low", "medium", "high"],
+                _choice(
+                    "IMAGE_COMPLEXITY_EDIT",
+                    "low",
+                    {"low", "medium", "high"},
+                ),
+            ),
+            image_input_max_edge=_non_negative_int("IMAGE_INPUT_MAX_EDGE", 1536),
+            image_edit_size_mode=cast(
+                Literal["source", "auto", "fixed"],
+                _choice(
+                    "IMAGE_EDIT_SIZE_MODE",
+                    "source",
+                    {"source", "auto", "fixed"},
+                ),
+            ),
+            send_complexity=_env_flag("IMAGE_SEND_COMPLEXITY", True),
+            legacy_model_aliases=_env_flag("IMAGE_LEGACY_ALIASES", True),
             default_video_model=os.getenv(
                 "PROXYAPI_VIDEO_MODEL", "bytedance/seedance-2.0"
             ),
@@ -1257,7 +1348,7 @@ class GenerateImageTool(BaseTool):
                 "model": {
                     "type": "string",
                     "description": (
-                        "Модель генерации, например openai/gpt-image-1-mini. "
+                        "Модель генерации, например openai/gpt-image-2.6-flare. "
                         "Необязательно."
                     ),
                 },
@@ -1319,15 +1410,20 @@ class GenerateImageTool(BaseTool):
             logger.exception("generate_image: непредвиденная ошибка")
             return _error_json(_exception_text(exc))
 
-        packed = [
-            {
+        generation_ids = getattr(self._client, "_generation_ids", [])
+        packed = []
+        for index, image in enumerate(images):
+            item = {
                 "type": "url"
                 if image.startswith(("http://", "https://"))
                 else "base64",
                 "value": image,
             }
-            for image in images
-        ]
+            if index < len(generation_ids):
+                generation_id = generation_ids[index]
+                if isinstance(generation_id, str) and generation_id:
+                    item["generation_id"] = generation_id
+            packed.append(item)
         bucket = _REQUEST_IMAGES.get()
         if bucket is None:
             logger.warning(
@@ -1526,13 +1622,80 @@ def _recraft_size_fields(cleaned: str) -> dict[str, Any]:
     return {"size": cleaned}
 
 
-def _image_generation_body(model: str, prompt: str, size: str) -> dict[str, Any]:
+_OPENAI_SIZE_ALIASES = {
+    "1024x1792": "1024x1536",
+    "1792x1024": "1536x1024",
+}
+_IMAGE_PARAM_REJECTED = re.compile(
+    r"complexity|quality|unknown|unsupported", re.IGNORECASE
+)
+
+
+def _image_params_rejected(exc: AssistAIError, payload: dict[str, Any]) -> bool:
+    """True, если 400 похож на отказ от quality/complexity и их ещё можно убрать."""
+    if exc.status_code != 400:
+        return False
+    if "quality" not in payload and "complexity" not in payload:
+        return False
+    return _IMAGE_PARAM_REJECTED.search(exc.message) is not None
+
+
+def _image_records(data: dict[str, Any]) -> list[dict[str, str]]:
+    """URL или base64 и, если провайдер прислал, ``generation_id``."""
+    records: list[dict[str, str]] = []
+    raw_items = data.get("data")
+    if not isinstance(raw_items, list):
+        return records
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        encoded = item.get("b64_json")
+        if isinstance(url, str) and url:
+            record = {"type": "url", "value": url}
+        elif isinstance(encoded, str) and encoded:
+            record = {"type": "base64", "value": encoded}
+        else:
+            continue
+        generation_id = item.get("generation_id")
+        if isinstance(generation_id, str) and generation_id:
+            record["generation_id"] = generation_id
+        records.append(record)
+    return records
+
+
+def _usage_dict(data: dict[str, Any]) -> dict[str, Any] | None:
+    usage = data.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def _without_image_params(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"quality", "complexity"}
+    }
+
+
+def _image_generation_body(
+    model: str,
+    prompt: str,
+    size: str,
+    *,
+    quality: str | None = None,
+    complexity: str | None = None,
+    send_complexity: bool = True,
+) -> dict[str, Any]:
     """Тело ``images/generations`` с учётом семейства модели."""
     fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
     cleaned = size.strip()
     family = image_model_family(model)
     if family == "openai":
-        fields["size"] = cleaned
+        fields["size"] = _OPENAI_SIZE_ALIASES.get(cleaned, cleaned)
+        if quality:
+            fields["quality"] = quality
+        if complexity and send_complexity:
+            fields["complexity"] = complexity
         return fields
     if family == "flux":
         fields.update(_flux_size_fields(cleaned))
@@ -1614,6 +1777,7 @@ class AssistAIClient:
         self._tools_registry: dict[str, BaseTool] = {}
         self._weather_client: OpenWeatherClient | None = None
         self._closed: bool = False
+        self._generation_ids: list[str | None] = []
         self._register_builtin_tools()
 
     def _register_builtin_tools(self) -> None:
@@ -1952,6 +2116,110 @@ class AssistAIClient:
             f"Превышен лимит вызовов инструментов: {self.config.max_tool_iterations}"
         )
 
+    def _resolve_edit_size(self, explicit: str | None, first_bytes: bytes) -> str:
+        """Размер правки: явный аргумент важнее режима конфига."""
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        mode = self.config.image_edit_size_mode
+        if mode == "fixed":
+            return "1024x1024"
+        if mode == "auto":
+            return "auto"
+        from app.media.media_utils import fit_image_size, source_image_size
+
+        try:
+            width, height = source_image_size(first_bytes)
+        except Exception:
+            logger.warning("edit_size_unreadable")
+            return "1024x1024"
+        return fit_image_size(width, height)
+
+    def _downscale_edit_input(self, data: bytes, mime: str) -> tuple[bytes, str]:
+        """Даунскейл байтов правки. Размер запроса считается до этого шага."""
+        from app.media.media_utils import downscale_for_edit
+
+        return downscale_for_edit(data, mime, self.config.image_input_max_edge)
+
+    async def _post_image_json(
+        self, payload: dict[str, Any], timeout: httpx.Timeout
+    ) -> dict[str, Any]:
+        """POST генерации. Один повтор без quality/complexity, если провайдер их отверг."""
+        try:
+            return await self._post_json(_IMAGES_PATH, payload, timeout=timeout)
+        except AssistAIError as exc:
+            if not _image_params_rejected(exc, payload):
+                raise
+            logger.warning(
+                "image_params_rejected",
+                model=payload.get("model"),
+                status_code=exc.status_code,
+            )
+            return await self._post_json(
+                _IMAGES_PATH, _without_image_params(payload), timeout=timeout
+            )
+
+    async def _post_image_edit(
+        self,
+        form: dict[str, str],
+        files: dict[str, tuple[str, bytes, str]]
+        | list[tuple[str, tuple[str, bytes, str]]],
+    ) -> dict[str, Any]:
+        """Multipart ``/images/edits`` с одним повтором без quality/complexity."""
+        try:
+            return await self._post_edit_once(form, files)
+        except AssistAIError as exc:
+            if not _image_params_rejected(exc, form):
+                raise
+            logger.warning(
+                "image_params_rejected",
+                model=form.get("model"),
+                status_code=exc.status_code,
+            )
+            return await self._post_edit_once(_without_image_params(form), files)
+
+    async def _post_edit_once(
+        self,
+        form: dict[str, str],
+        files: dict[str, tuple[str, bytes, str]]
+        | list[tuple[str, tuple[str, bytes, str]]],
+    ) -> dict[str, Any]:
+        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
+        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers={
+                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "User-Agent": "AssistAIClient/1.0",
+                },
+            ) as client:
+                response = await client.post(url, data=form, files=files)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            raise AssistAIError(
+                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise AssistAIError(
+                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+        if not isinstance(data, dict):
+            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+        return data
+
     async def generate_image(
         self,
         prompt: str,
@@ -1988,14 +2256,25 @@ class AssistAIClient:
         if not security.validate_prompt_length(prompt):
             raise ValueError("Prompt слишком длинный")
         sanitized_prompt = security.sanitize_prompt(prompt)
-        image_cost = cost_tracker.estimate_image_cost(1)
+        selected_model = model or self.config.default_image_model
+        image_cost = cost_tracker.estimate_image_cost(
+            1,
+            model=selected_model,
+            quality=self.config.image_quality,
+            size=size,
+        )
         try:
             await cost_tracker.check_budget(estimated=image_cost)
         except BudgetExceededError as exc:
             raise AssistAIError(exc.message) from exc
-
-        selected_model = model or self.config.default_image_model
-        payload = _image_generation_body(selected_model, sanitized_prompt, size.strip())
+        payload = _image_generation_body(
+            selected_model,
+            sanitized_prompt,
+            size.strip(),
+            quality=self.config.image_quality,
+            complexity=self.config.image_complexity_generate,
+            send_complexity=self.config.send_complexity,
+        )
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         size_label = (
@@ -2010,21 +2289,11 @@ class AssistAIClient:
             size=size_label,
             prompt_chars=len(sanitized_prompt),
         )
-        data = await self._post_json(_IMAGES_PATH, payload, timeout=timeout)
+        data = await self._post_image_json(payload, timeout=timeout)
 
-        images: list[str] = []
-        raw_items = data.get("data")
-        if isinstance(raw_items, list):
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                url = item.get("url")
-                if isinstance(url, str) and url:
-                    images.append(url)
-                    continue
-                encoded = item.get("b64_json")
-                if isinstance(encoded, str) and encoded:
-                    images.append(encoded)
+        records = _image_records(data)
+        self._generation_ids = [record.get("generation_id") for record in records]
+        images = [record["value"] for record in records]
 
         if not images:
             logger.error("generate_image: в ответе нет url и b64_json")
@@ -2033,7 +2302,13 @@ class AssistAIClient:
         logger.info("generate_image: получено изображений: %s", len(images))
         await cost_tracker.record(
             kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(len(images)),
+            amount_usd=cost_tracker.estimate_image_cost(
+                len(images),
+                model=selected_model,
+                quality=self.config.image_quality,
+                size=str(size_label),
+                usage=_usage_dict(data),
+            ),
         )
         return images
 
@@ -2055,74 +2330,42 @@ class AssistAIClient:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
-        form = {
-            "model": selected_model,
-            "prompt": security.sanitize_prompt(prompt.strip()),
-        }
+        edit_size = self._resolve_edit_size(None, image_bytes)
+        image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
+        body = _image_generation_body(
+            selected_model,
+            security.sanitize_prompt(prompt.strip()),
+            edit_size,
+            quality=self.config.image_quality,
+            complexity=self.config.image_complexity_edit,
+            send_complexity=self.config.send_complexity,
+        )
+        form = {key: str(value) for key, value in body.items() if key != "n"}
         files = {
             "image": (filename, image_bytes, mime_type or "application/octet-stream")
         }
-        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
-        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
             "edit_image",
             model=selected_model,
             bytes=len(image_bytes),
             prompt_chars=len(prompt),
         )
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                verify=_ssl_context(),
-                headers={
-                    "Authorization": f"Bearer {self.config.proxyapi_key}",
-                    "User-Agent": "AssistAIClient/1.0",
-                },
-            ) as client:
-                response = await client.post(url, data=form, files=files)
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            detail = _response_error_text(exc.response)
-            raise AssistAIError(
-                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
-                status_code=exc.response.status_code,
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise AssistAIError(
-                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
-            ) from exc
-        except httpx.RequestError as exc:
-            raise AssistAIError(
-                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
-            ) from exc
+        data = await self._post_image_edit(form, files)
 
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
-        if not isinstance(data, dict):
-            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
-
-        images: list[str] = []
-        raw_items = data.get("data")
-        if isinstance(raw_items, list):
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                url_value = item.get("url")
-                if isinstance(url_value, str) and url_value:
-                    images.append(url_value)
-                    continue
-                encoded = item.get("b64_json")
-                if isinstance(encoded, str) and encoded:
-                    images.append(encoded)
+        records = _image_records(data)
+        self._generation_ids = [record.get("generation_id") for record in records]
+        images = [record["value"] for record in records]
         if not images:
             raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
         await cost_tracker.record(
             kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(len(images)),
+            amount_usd=cost_tracker.estimate_image_cost(
+                len(images),
+                model=selected_model,
+                quality=self.config.image_quality,
+                size=edit_size,
+                usage=_usage_dict(data),
+            ),
         )
         return images
 
@@ -2148,7 +2391,12 @@ class AssistAIClient:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        prepared = prepare_edit_files(files, selected_model, labels)
+        edit_size = self._resolve_edit_size(size, files[0][0])
+        scaled: list[tuple[bytes, str, str]] = []
+        for raw, name, mime in files:
+            scaled_data, scaled_mime = self._downscale_edit_input(raw, mime)
+            scaled.append((scaled_data, name, scaled_mime))
+        prepared = prepare_edit_files(scaled, selected_model, labels)
         sanitized = security.sanitize_prompt(prompt.strip())
         if labels:
             numbered = ", ".join(labels)
@@ -2158,72 +2406,40 @@ class AssistAIClient:
                 f"{sanitized} The canvas is a side-by-side composite. "
                 "The left half is the base image."
             )
-        body = _image_generation_body(selected_model, sanitized, size or "1024x1024")
+        body = _image_generation_body(
+            selected_model,
+            sanitized,
+            edit_size,
+            quality=self.config.image_quality,
+            complexity=self.config.image_complexity_edit,
+            send_complexity=self.config.send_complexity,
+        )
         form = {key: str(value) for key, value in body.items() if key not in {"n"}}
         multipart = [
             ("image[]", (name, data, mime or "application/octet-stream"))
             for data, name, mime in prepared
         ]
-        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
-        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
-        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
             "edit_image",
             model=selected_model,
             files=len(prepared),
             prompt_chars=len(sanitized),
         )
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                verify=_ssl_context(),
-                headers={
-                    "Authorization": f"Bearer {self.config.proxyapi_key}",
-                    "User-Agent": "AssistAIClient/1.0",
-                },
-            ) as client:
-                response = await client.post(url, data=form, files=multipart)
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            detail = _response_error_text(exc.response)
-            raise AssistAIError(
-                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
-                status_code=exc.response.status_code,
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise AssistAIError(
-                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
-            ) from exc
-        except httpx.RequestError as exc:
-            raise AssistAIError(
-                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
-            ) from exc
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
-        if not isinstance(data, dict):
-            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
-        images: list[str] = []
-        raw_items = data.get("data")
-        if isinstance(raw_items, list):
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                url_value = item.get("url")
-                if isinstance(url_value, str) and url_value:
-                    images.append(url_value)
-                    continue
-                encoded = item.get("b64_json")
-                if isinstance(encoded, str) and encoded:
-                    images.append(encoded)
+        payload = await self._post_image_edit(form, multipart)
+        records = _image_records(payload)
+        self._generation_ids = [record.get("generation_id") for record in records]
+        images = [record["value"] for record in records]
         if not images:
             raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
         await cost_tracker.record(
             kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(len(images)),
+            amount_usd=cost_tracker.estimate_image_cost(
+                len(images),
+                model=selected_model,
+                quality=self.config.image_quality,
+                size=edit_size,
+                usage=_usage_dict(payload),
+            ),
         )
         return images
 

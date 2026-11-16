@@ -31,6 +31,7 @@ from app.bot.constants import (
     model_hint,
     resolve_speechkit_voice,
 )
+from app.llm.models_config import resolve_text_model
 
 
 def _text_model_of(
@@ -43,7 +44,7 @@ def _text_model_of(
 
     Непустой id вне каталога не пишется в Redis — только мягкий fallback.
     """
-    selected = profile.text_model
+    selected = _aliased_text_model(profile.text_model)
     if not selected:
         return assistant.config.default_text_model
     if selected in AVAILABLE_TEXT_MODELS:
@@ -153,27 +154,37 @@ def _vision_model_of(
 
     Непустой id вне каталога не пишется в Redis — только мягкий fallback.
     """
-    if profile.vision_model:
-        if profile.vision_model in AVAILABLE_TEXT_MODELS:
-            return profile.vision_model
+    vision = _aliased_text_model(profile.vision_model)
+    if vision:
+        if vision in AVAILABLE_TEXT_MODELS:
+            return vision
         logger.warning(
             "stale_model_fallback",
             chat_id=chat_id,
-            model=profile.vision_model,
+            model=vision,
             kind="vision",
         )
         return assistant.config.default_text_model
-    if not profile.text_model:
+    text = _aliased_text_model(profile.text_model)
+    if not text:
         return assistant.config.default_text_model
-    if profile.text_model in AVAILABLE_TEXT_MODELS:
-        return profile.text_model
+    if text in AVAILABLE_TEXT_MODELS:
+        return text
     logger.warning(
         "stale_model_fallback",
         chat_id=chat_id,
-        model=profile.text_model,
+        model=text,
         kind="text",
     )
     return assistant.config.default_text_model
+
+
+def _aliased_text_model(model_id: str | None) -> str | None:
+    """Снятый текстовый id → актуальный до проверки каталога."""
+    resolved = resolve_text_model(model_id)
+    if resolved and model_id and resolved != model_id:
+        logger.info("text_model_aliased", old=model_id, new=resolved)
+    return resolved
 
 
 def _should_send_voice_reply(profile: AssistantProfile, input_kind: InputKind) -> bool:

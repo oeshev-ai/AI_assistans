@@ -34,6 +34,20 @@ def test_model_hint_empty_for_unknown() -> None:
     assert model_hint("unknown/model") == ""
 
 
+def test_image_catalog_starts_with_flare_and_drops_deprecated() -> None:
+    assert AVAILABLE_IMAGE_MODELS[0] == "openai/gpt-image-2.6-flare"
+    deprecated = {
+        "openai/gpt-image-1-mini",
+        "openai/gpt-image-1.5",
+        "openai/gpt-image-2",
+        "qwen/qwen-image-2.1-turbo",
+        "bytedance-seed/seedream-5-0-flash",
+    }
+    assert deprecated.isdisjoint(AVAILABLE_IMAGE_MODELS)
+    assert deprecated.isdisjoint(MODEL_HINTS)
+    assert len(MODEL_HINTS["openai/gpt-image-2.6-flare"]) <= 60
+
+
 def test_text_catalog_uses_new_ids() -> None:
     assert "openai/gpt-6-sol" in AVAILABLE_TEXT_MODELS
     assert "openai/gpt-6.1-terra" in AVAILABLE_TEXT_MODELS

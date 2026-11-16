@@ -32,6 +32,13 @@ def test_preset_models_in_catalogs() -> None:
             assert preset.tts_model in AVAILABLE_TTS_MODELS
 
 
+def test_helper_generates_on_flux_klein() -> None:
+    preset = get_preset("helper")
+    assert preset is not None
+    assert preset.image_model == "black-forest-labs/flux-3-image-klein"
+    assert preset.image_size == "1K"
+
+
 def test_get_preset() -> None:
     assert get_preset("dev") is not None
     assert get_preset("missing") is None
