@@ -53,7 +53,8 @@ class RedisConfig(BaseModel):
     @classmethod
     def from_env(cls) -> RedisConfig:
         """Читает ``REDIS_URL``, ``HISTORY_TTL_DAYS`` и ``MAX_HISTORY_LENGTH``."""
-        load_dotenv(Path(__file__).resolve().parent / ".env")
+        # Project root .env, then cwd fallback (same pattern as app.bot.main).
+        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         load_dotenv()
         return cls(
             redis_url=os.getenv("REDIS_URL", ""),

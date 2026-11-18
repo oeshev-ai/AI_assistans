@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
+from app.infra import metrics as metrics_mod
 from app.infra.metrics import (
     ACTIVE_USERS,
     API_CALLS,
     note_active_user,
+    start_metrics_server,
     track_api_call,
 )
 
@@ -48,3 +52,10 @@ def test_active_users_gauge() -> None:
     note_active_user(2)
     note_active_user(1)
     assert ACTIVE_USERS._value.get() >= 2
+
+
+def test_metrics_server_defaults_to_localhost_bind() -> None:
+    source = inspect.getsource(start_metrics_server)
+    assert "METRICS_BIND" in source
+    assert "127.0.0.1" in source
+    assert callable(metrics_mod.start_metrics_server)

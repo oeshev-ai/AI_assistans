@@ -3090,7 +3090,9 @@ class AssistAIClient:
             logger.error("Неизвестный инструмент: %s", name)
             return _error_json(f"Неизвестный инструмент: {name}")
 
-        logger.info("Вызов инструмента %s, аргументы=%s", name, arguments)
+        # Keys only — prompts/PII must not land in info logs.
+        arg_keys = sorted(arguments) if isinstance(arguments, dict) else []
+        logger.info("Вызов инструмента %s, arg_keys=%s", name, arg_keys)
         try:
             result = await tool.execute(**arguments)
         except Exception as exc:

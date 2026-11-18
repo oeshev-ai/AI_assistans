@@ -91,3 +91,28 @@ async def test_redis_key_has_file_id_only() -> None:
     assert loaded is not None
     assert loaded.items[0].file_id == "file-1"
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_memory_pop_is_single_winner() -> None:
+    store = InMemoryPendingMediaStorage(ttl_seconds=30)
+    await store.put(_sample())
+    first = await store.pop(7, "asst")
+    second = await store.pop(7, "asst")
+    assert first is not None
+    assert first.items[0].file_id == "file-1"
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_redis_pop_is_atomic() -> None:
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    client = fakeredis.FakeRedis(decode_responses=True)
+    store = RedisPendingMediaStorage(client, ttl_seconds=30, owns_client=False)
+    await store.put(_sample())
+    first = await store.pop(7, "asst")
+    second = await store.pop(7, "asst")
+    assert first is not None
+    assert second is None
+    assert await client.get("chat:7:asst:asst:pending_photo") is None
+    await client.aclose()

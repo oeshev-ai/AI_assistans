@@ -45,3 +45,41 @@ def test_upload_request_context() -> None:
     finally:
         reset_upload_request_context(token)
     assert get_upload_request_context() is None
+
+
+@pytest.mark.asyncio
+async def test_claim_processing_is_single_winner() -> None:
+    store = UploadSessionStore(redis=None)
+    session = await store.create(chat_id=1, user_id=2)
+    first = await store.claim_processing(
+        session.upload_id,
+        session.token,
+        from_statuses={"pending"},
+        updates={"filename": "a.mp3"},
+    )
+    second = await store.claim_processing(
+        session.upload_id,
+        session.token,
+        from_statuses={"pending"},
+    )
+    assert first is not None
+    assert first.status == "processing"
+    assert first.filename == "a.mp3"
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_claim_processing_redis_single_winner() -> None:
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    client = fakeredis.FakeRedis(decode_responses=True)
+    store = UploadSessionStore(redis=client)
+    session = await store.create(chat_id=1, user_id=2)
+    first = await store.claim_processing(
+        session.upload_id, session.token, from_statuses={"pending"}
+    )
+    second = await store.claim_processing(
+        session.upload_id, session.token, from_statuses={"pending"}
+    )
+    assert first is not None and first.status == "processing"
+    assert second is None
+    await client.aclose()

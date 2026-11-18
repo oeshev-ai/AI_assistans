@@ -47,6 +47,38 @@ async def test_redis_backed_spend(fakeredis_client) -> None:
     assert float(await fakeredis_client.get(day_keys[0])) == pytest.approx(0.12)
 
 
+@pytest.mark.asyncio
+async def test_reserve_then_record_does_not_double_count() -> None:
+    tracker = CostTracker()
+    tracker.daily_budget = 1.0
+    tracker.user_daily_budget = 0
+    await tracker.check_budget(1, estimated=0.2)
+    await tracker.record(kind="chat", amount_usd=0.15, user_id=1)
+    day = tracker._day_key()
+    assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_budget_reservations_cap(fakeredis_client) -> None:
+    import asyncio
+
+    tracker = CostTracker()
+    tracker.attach_redis(fakeredis_client)
+    tracker.daily_budget = 0.1
+    tracker.user_daily_budget = 0
+
+    async def attempt() -> bool:
+        try:
+            await tracker.check_budget(1, estimated=0.06)
+            return True
+        except BudgetExceededError:
+            return False
+
+    outcomes = await asyncio.gather(*[attempt() for _ in range(4)])
+    assert sum(1 for ok in outcomes if ok) == 1
+    assert sum(1 for ok in outcomes if not ok) == 3
+
+
 @pytest.fixture
 async def fakeredis_client():
     fakeredis = pytest.importorskip("fakeredis.aioredis")

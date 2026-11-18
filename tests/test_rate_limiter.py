@@ -78,3 +78,18 @@ async def test_window_expiry_frees_slot(monkeypatch: pytest.MonkeyPatch) -> None
     assert await limiter.check_text_limit(user_id) is False
     now["t"] += 61.0
     assert await limiter.check_text_limit(user_id) is True
+
+
+@pytest.mark.asyncio
+async def test_redis_atomic_limit_under_concurrency(fakeredis_client) -> None:
+    import asyncio
+
+    limiter = RateLimiter()
+    limiter.attach_redis(fakeredis_client)
+    user_id = 77
+
+    results = await asyncio.gather(
+        *[limiter.check_text_limit(user_id) for _ in range(TEXT_LIMIT + 8)]
+    )
+    assert sum(1 for ok in results if ok) == TEXT_LIMIT
+    assert sum(1 for ok in results if not ok) == 8

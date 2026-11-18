@@ -223,7 +223,9 @@ class EditImageTool(BaseTool):
         files = [(item.data, item.filename, item.mime_type) for item in ordered]
         selected = model.strip() if isinstance(model, str) and model.strip() else None
         edit_type = kwargs.get("edit_type")
-        prompt = instruction.strip()
+        from app.infra.security import security
+
+        prompt = security.sanitize_prompt(instruction.strip())
         if isinstance(edit_type, str) and edit_type.strip():
             prompt = f"{edit_type.strip()}: {prompt}"
         logger.info(
@@ -391,13 +393,16 @@ class GenerateVideoTool(BaseTool):
         prompt = kwargs.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return _error_json("Параметр prompt обязателен.")
+        from app.infra.security import security
+
+        prompt = security.sanitize_prompt(prompt.strip())
         model = kwargs.get("model")
         selected = model.strip() if isinstance(model, str) and model.strip() else None
         duration = kwargs.get("duration")
         resolution = kwargs.get("resolution")
         try:
             video = await self._client.generate_video(
-                prompt=prompt.strip(),
+                prompt=prompt,
                 model=selected,
                 duration=duration if isinstance(duration, int) else None,
                 resolution=resolution if isinstance(resolution, str) else None,

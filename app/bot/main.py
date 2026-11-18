@@ -50,6 +50,8 @@ from app.bot.constants import (
     start_metrics_server,
 )
 from app.bot.handlers import _register_handlers
+from app.bot.middleware import AllowlistMiddleware
+from app.infra.access import parse_allowed_user_ids
 from app.storage.pending_media import PendingMediaStorage, create_pending_media_storage
 
 
@@ -304,6 +306,21 @@ async def main() -> None:
     bot = _ChromeBot(token=token, session=AiohttpSession())
     storage = await create_fsm_storage(os.getenv("REDIS_URL", "").strip())
     dispatcher = Dispatcher(storage=storage)
+    allowed_ids = parse_allowed_user_ids()
+    if allowed_ids:
+        logger.info("allowlist_enabled", users=len(allowed_ids))
+    else:
+        env = os.getenv("ENVIRONMENT", "development").strip().lower()
+        if env == "production":
+            logger.warning(
+                "allowlist_open_in_production",
+                hint="Set TELEGRAM_ALLOWED_USER_IDS to limit API spend",
+            )
+        else:
+            logger.info("allowlist_disabled", mode="allow_all")
+    allowlist = AllowlistMiddleware(allowed_ids)
+    dispatcher.message.middleware(allowlist)
+    dispatcher.callback_query.middleware(allowlist)
     dispatcher.startup.register(on_startup)
     dispatcher.shutdown.register(on_shutdown)
     _register_handlers(dispatcher)

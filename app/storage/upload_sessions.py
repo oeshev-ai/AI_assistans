@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 logger = structlog.get_logger("upload_sessions")
 
@@ -87,6 +89,7 @@ class UploadSessionStore:
     def __init__(self, redis: Redis | None = None) -> None:
         self._redis = redis
         self._memory: dict[str, UploadSession] = {}
+        self._lock = asyncio.Lock()
 
     async def create(
         self,
@@ -145,6 +148,78 @@ class UploadSessionStore:
     async def update(self, session: UploadSession) -> None:
         ttl = max(60, int(session.expires_at - time.time()))
         await self._save(session, ttl_sec=ttl)
+
+    async def claim_processing(
+        self,
+        upload_id: str,
+        token: str,
+        *,
+        from_statuses: set[str],
+        updates: dict[str, Any] | None = None,
+    ) -> UploadSession | None:
+        """Atomically move session to ``processing`` if status ∈ ``from_statuses``.
+
+        Returns the claimed session, or ``None`` if auth failed / already claimed.
+        """
+        if self._redis is not None:
+            return await self._claim_processing_redis(
+                upload_id, token, from_statuses=from_statuses, updates=updates
+            )
+        async with self._lock:
+            session = await self.get_authorized(upload_id, token)
+            if session is None or session.status not in from_statuses:
+                return None
+            if updates:
+                for key, value in updates.items():
+                    if hasattr(session, key):
+                        setattr(session, key, value)
+            session.status = "processing"
+            await self.update(session)
+            return session
+
+    async def _claim_processing_redis(
+        self,
+        upload_id: str,
+        token: str,
+        *,
+        from_statuses: set[str],
+        updates: dict[str, Any] | None,
+    ) -> UploadSession | None:
+        assert self._redis is not None
+        key = f"{_REDIS_PREFIX}{upload_id}"
+        for _ in range(8):
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.unwatch()
+                        return None
+                    text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                    session = UploadSession.from_json(text)
+                    if session.expires_at < time.time():
+                        await pipe.unwatch()
+                        await self.delete(upload_id)
+                        return None
+                    if not secrets.compare_digest(session.token, token):
+                        await pipe.unwatch()
+                        return None
+                    if session.status not in from_statuses:
+                        await pipe.unwatch()
+                        return None
+                    if updates:
+                        for field, value in updates.items():
+                            if hasattr(session, field):
+                                setattr(session, field, value)
+                    session.status = "processing"
+                    ttl = max(60, int(session.expires_at - time.time()))
+                    pipe.multi()
+                    pipe.set(key, session.to_json(), ex=ttl)
+                    await pipe.execute()
+                    return session
+            except WatchError:
+                continue
+        return None
 
     async def delete(self, upload_id: str) -> None:
         if self._redis is not None:

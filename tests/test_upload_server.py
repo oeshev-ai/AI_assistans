@@ -72,11 +72,19 @@ async def test_same_origin_file_upload_flow() -> None:
     client = TestClient(server)
     await client.start_server()
     try:
+        # ?t= → Set-Cookie + redirect to clean URL (TestClient follows).
         page = await client.get(f"/upload/{session.upload_id}?t={session.token}")
         assert page.status == 200
+        assert page.url.path == f"/upload/{session.upload_id}"
+        assert "t=" not in str(page.url)
         text = await page.text()
         assert "/api/uploads/" in text
         assert "FormData" in text
+        assert "TOKEN" not in text
+        assert session.token not in text
+        assert "upload_token" in client.session.cookie_jar.filter_cookies(
+            client.make_url("/")
+        )
 
         form = FormData()
         form.add_field(
@@ -85,14 +93,29 @@ async def test_same_origin_file_upload_flow() -> None:
             filename="lecture.mp3",
             content_type="audio/mpeg",
         )
+        # Auth via HttpOnly cookie only — no ?t= on API.
         resp = await client.post(
-            f"/api/uploads/{session.upload_id}/file?t={session.token}",
+            f"/api/uploads/{session.upload_id}/file",
             data=form,
         )
         assert resp.status == 200, await resp.text()
         body = await resp.json()
         assert body["ok"] is True
         assert body["objectKey"] in storage.objects
+
+        # Second POST must not double-process.
+        form2 = FormData()
+        form2.add_field(
+            "file",
+            b"ID3fake-mp3-bytes-2",
+            filename="lecture2.mp3",
+            content_type="audio/mpeg",
+        )
+        dup = await client.post(
+            f"/api/uploads/{session.upload_id}/file",
+            data=form2,
+        )
+        assert dup.status == 409
 
         for _ in range(50):
             if completed:

@@ -192,8 +192,9 @@ async def handle_voice(
         await R._edit_stream(status, "🤷 В голосовом не распознано речи.", "")
         await R._append_chrome(state, [status.message_id])
         return
+    sanitized_voice = security.sanitize_prompt(transcribed)
     if SHOW_RECOGNIZED_TEXT:
-        preview = transcribed[:VOICE_RECOGNIZED_PREVIEW_LIMIT]
+        preview = sanitized_voice[:VOICE_RECOGNIZED_PREVIEW_LIMIT]
         await R._edit_stream(
             status,
             f"🗣 Вы сказали:\n«{preview}»\n\nГотовлю ответ…",
@@ -205,7 +206,7 @@ async def handle_voice(
         topic_storage,
         assistant_storage,
         state,
-        user_text=transcribed,
+        user_text=sanitized_voice,
         input_kind="voice",
         status=status,
     )

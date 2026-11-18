@@ -37,7 +37,8 @@ async def health_check(
             health["components"]["redis"] = "ok"
             await refresh_redis_gauge(redis_client)
         except Exception as exc:
-            health["components"]["redis"] = f"error: {exc}"
+            logger.warning("health_redis_failed", error=str(exc))
+            health["components"]["redis"] = "error"
             health["status"] = "degraded"
 
     if proxy_probe is None:
@@ -47,7 +48,8 @@ async def health_check(
             await proxy_probe()
             health["components"]["proxy_api"] = "ok"
         except Exception as exc:
-            health["components"]["proxy_api"] = f"error: {exc}"
+            logger.warning("health_proxy_failed", error=str(exc))
+            health["components"]["proxy_api"] = "error"
             health["status"] = "degraded"
 
     if request.app.get("upload_enabled"):

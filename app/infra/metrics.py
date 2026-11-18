@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Awaitable, Callable
 from functools import wraps
@@ -52,12 +53,17 @@ _metrics_started = False
 _active_user_hits: dict[int, float] = {}
 
 
-def start_metrics_server(port: int = 8080) -> None:
-    """Start the Prometheus HTTP scrape endpoint (default ``/metrics``)."""
+def start_metrics_server(port: int = 8080, addr: str | None = None) -> None:
+    """Start the Prometheus HTTP scrape endpoint (default ``/metrics``).
+
+    Default bind is ``127.0.0.1`` (override with ``METRICS_BIND``, use
+    ``0.0.0.0`` inside Docker so published ports work).
+    """
     global _metrics_started
     if _metrics_started:
         return
-    start_http_server(port)
+    bind = (addr or os.getenv("METRICS_BIND", "127.0.0.1")).strip() or "127.0.0.1"
+    start_http_server(port, addr=bind)
     _metrics_started = True
 
 

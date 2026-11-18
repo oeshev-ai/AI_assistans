@@ -8,7 +8,7 @@
 
 ## Решение
 
-Собран production-ready бот на aiogram 3 и едином клиенте LLM (ProxyAPI): персоны с промптами и моделями, темы в Redis, function calling, Vision, STT/TTS, генерация и правка картинок. Тяжёлые задачи выносятся в arq-worker; большие файлы принимаются по одноразовой HTTPS-ссылке в Object Storage. Наблюдаемость — JSON-логи, Prometheus, health, rate limits, circuit breaker, бюджеты LLM.
+Собран production-ready бот на aiogram 3 и едином клиенте LLM (ProxyAPI): персоны с промптами и моделями, темы в Redis, function calling, Vision, STT/TTS, генерация и правка картинок. Тяжёлые задачи опционально уходят в arq-worker; большие файлы — по одноразовой HTTPS-ссылке в Object Storage. Наблюдаемость — JSON-логи, Prometheus, health, rate limits, circuit breaker, бюджеты LLM.
 
 ## Что внутри
 
@@ -37,6 +37,14 @@ cp .env.example .env   # минимум: TELEGRAM_BOT_TOKEN, PROXYAPI_API_KEY
 docker compose up -d --build
 ```
 
+По умолчанию поднимаются `redis` + `bot`; image/TTS/STT выполняются **в процессе бота** (`ARQ_ENABLED=0`). Очередь arq — опционально:
+
+```bash
+# в .env: ARQ_ENABLED=1
+docker compose --profile arq up -d --build
+# worker: arq worker.WorkerSettings
+```
+
 Локально без Docker: `python -m venv .venv`, активировать, `pip install -r requirements.txt`, заполнить `.env`, `python -m app.bot` (для истории удобен `docker compose up -d redis`).
 
 Тесты: `pytest tests/ -v`.
@@ -44,9 +52,10 @@ docker compose up -d --build
 ## Результат
 
 - Один бот закрывает диалог, персон, медиа и tools вместо набора разрозненных скриптов
-- История и профили переживают рестарт (Redis); без Redis — in-memory fallback
+- История и профили переживают рестарт (Redis, `maxmemory-policy noeviction`); без Redis — in-memory fallback
 - Файлы > ~20 МБ обрабатываются через upload → Object Storage → авто-STT
-- Прод-контур: лимиты, circuit breaker, метрики, health, CI на каждый push
+- Прод-контур: allowlist (`TELEGRAM_ALLOWED_USER_IDS`), опциональный `REDIS_PASSWORD`, лимиты, circuit breaker, метрики, health, CI
+- Альбомы фото буферизуются в процессе бота — один экземпляр polling (не несколько реплик без sticky routing)
 
 ## Контакт
 

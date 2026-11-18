@@ -17,6 +17,18 @@ TEXT_WINDOW_SECONDS = 60.0
 IMAGE_LIMIT = 5
 IMAGE_WINDOW_SECONDS = 3600.0
 
+# Atomic sliding-window consume: prune → count → zadd (or deny).
+_ALLOW_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+local count = redis.call('ZCARD', KEYS[1])
+if count >= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+return 1
+"""
+
 
 class RateLimiter:
     """Sliding-window limiter for LLM text and image generation.
@@ -104,18 +116,17 @@ class RateLimiter:
         key = self._key(user_id, operation)
         now = time.time()
         member = f"{now}:{uuid.uuid4().hex}"
-        pipe = self._redis.pipeline()
-        pipe.zremrangebyscore(key, 0, now - window)
-        pipe.zcard(key)
-        removed, count = await pipe.execute()
-        _ = removed
-        if int(count) >= limit:
-            return False
-        pipe = self._redis.pipeline()
-        pipe.zadd(key, {member: now})
-        pipe.expire(key, int(window) + 1)
-        await pipe.execute()
-        return True
+        allowed = await self._redis.eval(
+            _ALLOW_LUA,
+            1,
+            key,
+            now - window,
+            limit,
+            now,
+            member,
+            int(window) + 1,
+        )
+        return int(allowed) == 1
 
     async def _allow_memory(
         self, user_id: int, operation: str, limit: int, window: float

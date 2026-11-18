@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,6 +24,8 @@ from app.storage.upload_sessions import (
 logger = structlog.get_logger("upload_server")
 
 UploadCompleteHandler = Callable[[UploadSession], Awaitable[None]]
+
+_COOKIE_NAME = "upload_token"
 
 
 class UploadObjectStorage(Protocol):
@@ -76,17 +80,45 @@ def _allowed_mime_types() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _request_is_https(request: web.Request) -> bool:
+    if request.secure:
+        return True
+    return request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+
+
 def _extract_token(request: web.Request) -> str:
-    token = request.rel_url.query.get("t", "").strip()
-    if token:
-        return token
+    # Prefer cookie / headers so the token does not linger in URLs after redirect.
+    cookie = (request.cookies.get(_COOKIE_NAME) or "").strip()
+    if cookie:
+        return cookie
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return (request.headers.get("X-Upload-Token") or "").strip()
+    header = (request.headers.get("X-Upload-Token") or "").strip()
+    if header:
+        return header
+    return request.rel_url.query.get("t", "").strip()
 
 
-def _page_html(upload_id: str, token: str, max_mb: int) -> str:
+def _set_upload_cookie(
+    response: web.Response,
+    token: str,
+    *,
+    max_age: int,
+    secure: bool,
+) -> None:
+    response.set_cookie(
+        _COOKIE_NAME,
+        token,
+        max_age=max(60, max_age),
+        httponly=True,
+        samesite="Lax",
+        secure=secure,
+        path="/",
+    )
+
+
+def _page_html(upload_id: str, max_mb: int) -> str:
     allowed = ", ".join(ALLOWED_EXTENSIONS)
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -151,7 +183,6 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
   </div>
   <script>
     const UPLOAD_ID = {upload_id!r};
-    const TOKEN = {token!r};
     const MAX_MB = {max_mb};
     const ALLOWED_EXT = {list(ALLOWED_EXTENSIONS)!r};
 
@@ -191,15 +222,16 @@ def _page_html(upload_id: str, token: str, max_mb: int) -> str:
       try {{
         // Файл идёт на наш домен (same-origin), сервер сам кладёт в S3 —
         // так не нужен браузерный CORS к storage.yandexcloud.net (Telegram WebView).
+        // Auth: HttpOnly cookie set by /upload redirect (no token in JS/query).
         setStatus('Загружаю файл…');
         const form = new FormData();
         form.append('file', file, file.name);
-        const uploadUrl = '/api/uploads/' + UPLOAD_ID + '/file?t=' + encodeURIComponent(TOKEN);
+        const uploadUrl = '/api/uploads/' + UPLOAD_ID + '/file';
 
         await new Promise((resolve, reject) => {{
           const xhr = new XMLHttpRequest();
           xhr.open('POST', uploadUrl);
-          xhr.setRequestHeader('X-Upload-Token', TOKEN);
+          xhr.withCredentials = true;
           xhr.timeout = 60 * 60 * 1000;
           xhr.upload.onprogress = (e) => {{
             if (e.lengthComputable) fill.style.width = Math.round(e.loaded / e.total * 100) + '%';
@@ -248,6 +280,7 @@ def setup_upload_routes(
 
     async def page(request: web.Request) -> web.Response:
         upload_id = request.match_info["upload_id"]
+        query_token = request.rel_url.query.get("t", "").strip()
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
         if session is None:
@@ -264,8 +297,29 @@ def setup_upload_routes(
                 content_type="text/plain",
                 charset="utf-8",
             )
-        html = _page_html(upload_id, token, storage.config.max_upload_mb)
-        return web.Response(text=html, content_type="text/html", charset="utf-8")
+        # First hop from Telegram still has ?t= — exchange for HttpOnly cookie
+        # and drop the token from the address bar / subsequent Referer.
+        if query_token and secrets.compare_digest(query_token, session.token):
+            max_age = max(60, int(session.expires_at - time.time()))
+            resp = web.HTTPFound(f"/upload/{upload_id}")
+            _set_upload_cookie(
+                resp,
+                session.token,
+                max_age=max_age,
+                secure=_request_is_https(request),
+            )
+            raise resp
+        html = _page_html(upload_id, storage.config.max_upload_mb)
+        resp = web.Response(text=html, content_type="text/html", charset="utf-8")
+        if not request.cookies.get(_COOKIE_NAME):
+            max_age = max(60, int(session.expires_at - time.time()))
+            _set_upload_cookie(
+                resp,
+                session.token,
+                max_age=max_age,
+                secure=_request_is_https(request),
+            )
+        return resp
 
     async def presign(request: web.Request) -> web.Response:
         upload_id = request.match_info["upload_id"]
@@ -371,32 +425,37 @@ def setup_upload_routes(
                 status=400,
             )
 
-        session.object_key = object_key
-        session.filename = str(body.get("fileName") or session.filename or "media.bin")
-        session.mime_type = str(
-            body.get("fileType")
-            or head.get("ContentType")
-            or session.mime_type
-            or "application/octet-stream"
+        claimed = await store.claim_processing(
+            upload_id,
+            token,
+            from_statuses={"pending", "uploaded"},
+            updates={
+                "object_key": object_key,
+                "filename": str(
+                    body.get("fileName") or session.filename or "media.bin"
+                ),
+                "mime_type": str(
+                    body.get("fileType")
+                    or head.get("ContentType")
+                    or session.mime_type
+                    or "application/octet-stream"
+                ),
+                "file_size": size,
+            },
         )
-        session.file_size = size
-        session.status = "uploaded"
-        await store.update(session)
-
-        # Сразу «processing», чтобы complete нельзя было дёрнуть дважды.
-        session.status = "processing"
-        await store.update(session)
+        if claimed is None:
+            return web.json_response({"error": "Сессия уже обработана"}, status=409)
 
         async def _run() -> None:
             try:
-                await on_complete(session)
+                await on_complete(claimed)
             except Exception:
                 logger.exception(
-                    "upload_complete_handler_failed", upload_id=session.upload_id
+                    "upload_complete_handler_failed", upload_id=claimed.upload_id
                 )
-                session.status = "failed"
-                session.error = "processing_failed"
-                await store.update(session)
+                claimed.status = "failed"
+                claimed.error = "processing_failed"
+                await store.update(claimed)
 
         asyncio.create_task(_run())
         return web.json_response({"ok": True, "status": "processing"})
@@ -405,20 +464,31 @@ def setup_upload_routes(
         """Same-origin multipart → S3 (обход CORS / Telegram WebView)."""
         upload_id = request.match_info["upload_id"]
         token = _extract_token(request)
-        session = await store.get_authorized(upload_id, token)
+        # Claim early so two parallel POSTs cannot both process.
+        session = await store.claim_processing(
+            upload_id, token, from_statuses={"pending"}
+        )
         if session is None:
-            return web.json_response({"error": "Сессия не найдена"}, status=404)
-        if session.status != "pending":
+            existing = await store.get_authorized(upload_id, token)
+            if existing is None:
+                return web.json_response({"error": "Сессия не найдена"}, status=404)
             return web.json_response({"error": "Сессия уже использована"}, status=409)
+
+        async def _release_claim(error: str | None = None) -> None:
+            session.status = "pending" if error is None else "failed"
+            session.error = error
+            await store.update(session)
 
         reader = await request.multipart()
         field = await reader.next()
         if not isinstance(field, BodyPartReader) or field.name != "file":
+            await _release_claim()
             return web.json_response({"error": "Ожидалось поле file"}, status=400)
 
         file_name = Path(field.filename or "media.bin").name
         lower_name = file_name.lower()
         if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+            await _release_claim()
             return web.json_response(
                 {"error": "Недопустимое расширение файла"}, status=400
             )
@@ -433,6 +503,7 @@ def setup_upload_routes(
             effective_type not in allowed_mimes
             and effective_type != "application/octet-stream"
         ):
+            await _release_claim()
             return web.json_response(
                 {"error": f"MIME не разрешён: {effective_type}"}, status=400
             )
@@ -458,11 +529,13 @@ def setup_upload_routes(
                         tmp.write(chunk)
 
             if too_large:
+                await _release_claim()
                 return web.json_response(
                     {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
                     status=400,
                 )
             if size <= 0:
+                await _release_claim()
                 return web.json_response({"error": "Пустой файл"}, status=400)
 
             key = object_key_for(session, file_name)
@@ -500,9 +573,11 @@ def setup_upload_routes(
                 }
             )
         except S3StorageError as exc:
+            await _release_claim(error="s3_upload_failed")
             return web.json_response({"error": exc.message}, status=500)
         except Exception as exc:
             logger.exception("upload_file_failed", upload_id=upload_id)
+            await _release_claim(error="upload_failed")
             return web.json_response({"error": f"Ошибка загрузки: {exc}"}, status=500)
         finally:
             if tmp_path:

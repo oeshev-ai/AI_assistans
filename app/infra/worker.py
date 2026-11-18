@@ -1,10 +1,15 @@
 """arq worker process for heavy ProxyAPI jobs.
 
-Run::
+Run (Docker Compose / repo root shim ``worker.py``)::
+
+    arq worker.WorkerSettings
+
+Equivalent package path::
 
     arq app.infra.worker.WorkerSettings
 
-Requires ``REDIS_URL`` and ``PROXYAPI_API_KEY``.
+Requires ``REDIS_URL`` and ``PROXYAPI_API_KEY``. Enable with ``ARQ_ENABLED=1``
+and ``docker compose --profile arq up -d``.
 """
 
 from __future__ import annotations

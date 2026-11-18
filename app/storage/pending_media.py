@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -148,9 +149,10 @@ class PendingMediaStorage(ABC):
         """Удаляет альбом."""
 
     async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
-        """Читает и удаляет альбом."""
+        """Atomically read-and-delete альбом (override in Redis/memory)."""
         media = await self.get(chat_id, assistant_id)
-        await self.clear(chat_id, assistant_id)
+        if media is not None:
+            await self.clear(chat_id, assistant_id)
         return media
 
     async def set_base_override(
@@ -202,6 +204,7 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
         self._ttl = ttl_seconds if ttl_seconds is not None else pending_ttl_seconds()
         self._items: dict[tuple[int, str], tuple[PendingMedia, float]] = {}
         self._closed = False
+        self._lock = asyncio.Lock()
 
     def _key(self, chat_id: int, assistant_id: str) -> tuple[int, str]:
         return chat_id, assistant_id
@@ -210,30 +213,53 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
         if self._closed:
             raise PendingMediaError("Хранилище отложенных фото закрыто.")
         deadline = time.monotonic() + self._ttl
-        self._items[self._key(media.chat_id, media.assistant_id)] = (media, deadline)
+        async with self._lock:
+            self._items[self._key(media.chat_id, media.assistant_id)] = (
+                media,
+                deadline,
+            )
 
     async def get(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
         key = self._key(chat_id, assistant_id)
-        found = self._items.get(key)
-        if found is None:
-            return None
-        media, deadline = found
-        if time.monotonic() > deadline:
-            self._items.pop(key, None)
-            logger.info(
-                "pending_expired",
-                chat_id=chat_id,
-                assistant_id=assistant_id,
-            )
-            return None
-        return media
+        async with self._lock:
+            found = self._items.get(key)
+            if found is None:
+                return None
+            media, deadline = found
+            if time.monotonic() > deadline:
+                self._items.pop(key, None)
+                logger.info(
+                    "pending_expired",
+                    chat_id=chat_id,
+                    assistant_id=assistant_id,
+                )
+                return None
+            return media
 
     async def clear(self, chat_id: int, assistant_id: str) -> None:
-        self._items.pop(self._key(chat_id, assistant_id), None)
+        async with self._lock:
+            self._items.pop(self._key(chat_id, assistant_id), None)
+
+    async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
+        key = self._key(chat_id, assistant_id)
+        async with self._lock:
+            found = self._items.pop(key, None)
+            if found is None:
+                return None
+            media, deadline = found
+            if time.monotonic() > deadline:
+                logger.info(
+                    "pending_expired",
+                    chat_id=chat_id,
+                    assistant_id=assistant_id,
+                )
+                return None
+            return media
 
     async def close(self) -> None:
         self._closed = True
-        self._items.clear()
+        async with self._lock:
+            self._items.clear()
 
 
 class RedisPendingMediaStorage(PendingMediaStorage):
@@ -290,6 +316,21 @@ class RedisPendingMediaStorage(PendingMediaStorage):
             await self._redis.delete(self._redis_key(chat_id, assistant_id))
         except RedisError as exc:
             raise PendingMediaError("Не удалось удалить отложенные фото.") from exc
+
+    async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
+        key = self._redis_key(chat_id, assistant_id)
+        try:
+            # GETDEL is atomic (Redis 6.2+); fakeredis and redis:7 support it.
+            raw = await self._redis.getdel(key)
+        except RedisError as exc:
+            raise PendingMediaError("Не удалось извлечь отложенные фото.") from exc
+        if not raw:
+            return None
+        text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+        try:
+            return PendingMedia.from_json(text)
+        except (json.JSONDecodeError, PendingMediaError) as exc:
+            raise PendingMediaError("Повреждённые отложенные фото.") from exc
 
     async def close(self) -> None:
         if self._closed:
