@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from app.bot.runtime import _should_send_voice_reply
 from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
-from bot import _should_send_voice_reply
 
 
 def _profile(mode: str) -> AssistantProfile:

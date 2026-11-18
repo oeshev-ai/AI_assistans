@@ -301,25 +301,25 @@ def setup_upload_routes(
         # and drop the token from the address bar / subsequent Referer.
         if query_token and secrets.compare_digest(query_token, session.token):
             max_age = max(60, int(session.expires_at - time.time()))
-            resp = web.HTTPFound(f"/upload/{upload_id}")
+            redirect = web.HTTPFound(f"/upload/{upload_id}")
             _set_upload_cookie(
-                resp,
+                redirect,
                 session.token,
                 max_age=max_age,
                 secure=_request_is_https(request),
             )
-            raise resp
+            raise redirect
         html = _page_html(upload_id, storage.config.max_upload_mb)
-        resp = web.Response(text=html, content_type="text/html", charset="utf-8")
+        page = web.Response(text=html, content_type="text/html", charset="utf-8")
         if not request.cookies.get(_COOKIE_NAME):
             max_age = max(60, int(session.expires_at - time.time()))
             _set_upload_cookie(
-                resp,
+                page,
                 session.token,
                 max_age=max_age,
                 secure=_request_is_https(request),
             )
-        return resp
+        return page
 
     async def presign(request: web.Request) -> web.Response:
         upload_id = request.match_info["upload_id"]

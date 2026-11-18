@@ -1,22 +1,22 @@
-"""Подсказки моделей и soft-fallback устаревших id в bot.py."""
+"""Подсказки моделей и soft-fallback устаревших id."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+from app.bot.constants import TELEGRAM_TEXT_LIMIT
+from app.bot.models import (
+    _fit_screen,
+    _hints_block,
+    _image_model_of,
+    _text_model_of,
+)
 from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     model_hint,
 )
 from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
-from bot import (
-    TELEGRAM_TEXT_LIMIT,
-    _fit_screen,
-    _hints_block,
-    _image_model_of,
-    _text_model_of,
-)
 
 
 def _assistant() -> SimpleNamespace:

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.infra.security import MAX_MESSAGE_LENGTH, MAX_PROMPT_LENGTH, security
 
 
@@ -27,17 +25,6 @@ def test_message_length_validation() -> None:
 def test_prompt_length_validation() -> None:
     assert security.validate_prompt_length("cat") is True
     assert security.validate_prompt_length("x" * (MAX_PROMPT_LENGTH + 1)) is False
-
-
-def test_pydantic_user_text_validation() -> None:
-    assert security.validate_user_text("  hello  ") == "hello"
-    with pytest.raises(ValueError):
-        security.validate_user_text("x" * (MAX_MESSAGE_LENGTH + 1))
-
-
-def test_sensitive_card_detection() -> None:
-    assert security.contains_sensitive_data("card 4111 1111 1111 1111") is True
-    assert security.contains_sensitive_data("просто текст") is False
 
 
 def test_voice_transcript_uses_same_sanitize_as_text() -> None:

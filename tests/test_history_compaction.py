@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from bot import _compact_tool_content
+from app.bot.runtime import _compact_tool_content
 
 
 def test_edit_result_drops_url_and_base64() -> None:

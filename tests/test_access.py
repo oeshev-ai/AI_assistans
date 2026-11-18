@@ -20,13 +20,13 @@ def test_parse_skips_invalid_tokens() -> None:
 
 
 def test_open_mode_allows_anyone() -> None:
-    allowed = frozenset()
+    allowed: frozenset[int] = frozenset()
     assert is_user_allowed(1, allowed) is True
     assert is_user_allowed(None, allowed) is True
 
 
 def test_closed_mode_requires_membership() -> None:
-    allowed = frozenset({10, 20})
+    allowed: frozenset[int] = frozenset({10, 20})
     assert is_user_allowed(10, allowed) is True
     assert is_user_allowed(99, allowed) is False
     assert is_user_allowed(None, allowed) is False

@@ -7,14 +7,14 @@ from typing import Any
 
 import pytest
 
-from app.bot.runtime import _strip_generation_ids
-from app.storage.topic_history import InMemoryTopicStorage
-from bot import (
+from app.bot.runtime import (
     _compact_tool_content,
     _image_completion_text,
     _remember_model_turn,
     _sanitize_history_message,
+    _strip_generation_ids,
 )
+from app.storage.topic_history import InMemoryTopicStorage
 
 AID = "standard"
 

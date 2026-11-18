@@ -9,6 +9,7 @@ import httpx
 import pytest
 from respx import MockRouter
 
+from app.bot.runtime import _extract_generated_images
 from app.llm.assist_ai import (
     AssistAIClient,
     AssistAIError,
@@ -19,7 +20,6 @@ from app.llm.assist_ai import (
     _gpt6_chat_tools_need_reasoning_none,
     _ToolCallBuilder,
 )
-from bot import _extract_generated_images
 
 CHAT_URL = "https://api.proxyapi.ru/v1/chat/completions"
 

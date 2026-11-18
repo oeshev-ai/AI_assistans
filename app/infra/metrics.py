@@ -62,7 +62,8 @@ def start_metrics_server(port: int = 8080, addr: str | None = None) -> None:
     global _metrics_started
     if _metrics_started:
         return
-    bind = (addr or os.getenv("METRICS_BIND", "127.0.0.1")).strip() or "127.0.0.1"
+    raw = addr if addr is not None else os.getenv("METRICS_BIND")
+    bind = (raw or "127.0.0.1").strip() or "127.0.0.1"
     start_http_server(port, addr=bind)
     _metrics_started = True
 

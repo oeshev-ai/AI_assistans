@@ -6,13 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.bot.models import _image_model_of
 from app.llm.assist_ai import AssistAIConfig
 from app.storage.assistant_storage import (
     DEFAULT_PERSONA_PROMPT,
     LEGACY_IMAGE_MODEL_ALIASES,
     AssistantProfile,
 )
-from bot import _image_model_of
 
 
 def _assistant(*, aliases: bool = True) -> SimpleNamespace:

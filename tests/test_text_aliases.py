@@ -6,10 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.bot.models import _vision_model_of
+from app.bot.models import _text_model_of, _vision_model_of
 from app.llm.models_config import LEGACY_TEXT_MODEL_ALIASES
 from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
-from bot import _text_model_of
 
 
 def _assistant() -> SimpleNamespace:
