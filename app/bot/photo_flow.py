@@ -329,11 +329,10 @@ async def _edit(
     ordered = [loaded[base], *[loaded[index] for index in refs]]
     files = [(item.data, item.filename, item.mime_type) for item in ordered]
     labels = [str(base + 1), *[str(index + 1) for index in refs]]
-    generate_model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
     model = turn.assistant.config.default_image_edit_model
-    edit_size = _edit_size_for_model(
-        M._stored_image_size(profile), generate_model, model
-    )
+    # Edit must keep source aspect ratio (IMAGE_EDIT_SIZE_MODE=source).
+    # Persona image_size is for generate only — passing it here squashes
+    # e.g. 3:2 photos to the persona canvas when generate model is also Flare.
     prompt = security.sanitize_prompt(instruction)
     if refs:
         prompt = f"{prompt}\nImage 1 is the base (photo {base + 1}). " + " ".join(
@@ -346,13 +345,14 @@ async def _edit(
         reference_indexes=refs,
         edit_type=decision.edit_type,
         model=model,
+        size="source",
     )
     status = await _status(turn, "Правлю изображение…")
     token = set_user_media(ordered)
     try:
         import app.infra.job_queue as job_queue
 
-        with ImageModelScope(model, M._stored_image_size(profile)), MediaTurnScope():
+        with ImageModelScope(model, None), MediaTurnScope():
             try:
                 # Budget preflight — в AssistAIClient.edit_images.
                 result = await job_queue.edit_images(
@@ -361,7 +361,7 @@ async def _edit(
                     prompt,
                     model=model,
                     labels=labels,
-                    size=edit_size,
+                    size=None,
                 )
             except BudgetExceededError as exc:
                 await message.answer(exc.message)

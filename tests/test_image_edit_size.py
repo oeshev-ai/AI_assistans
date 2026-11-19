@@ -139,3 +139,46 @@ async def test_flux_profile_size_is_not_sent_on_openai_edit(
     body = route.calls[0].request.content.decode("latin1")
     assert "1K" not in body
     assert "1536x1024" in body
+
+
+def test_same_family_helper_still_returns_profile_for_generate_refs() -> None:
+    """Generate-with-refs may use persona size; edit path must pass None instead."""
+    from app.bot.photo_flow import _edit_size_for_model
+
+    assert (
+        _edit_size_for_model(
+            "1024x1536",
+            "openai/gpt-image-2.6-flare",
+            "openai/gpt-image-2.6-flare",
+        )
+        == "1024x1536"
+    )
+
+
+@pytest.mark.asyncio
+async def test_flare_persona_size_must_not_override_source_on_edit(
+    assist_client: AssistAIClient, respx_mock: MockRouter
+) -> None:
+    """Photo edit with Flare persona keeps source 3:2, not persona 1024x1536."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1536, 1024), (8, 8, 8)).save(buffer, format="PNG")
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"url": "https://cdn.example/edited.png"}]}
+        )
+    )
+    assist_client.config = assist_client.config.model_copy(
+        update={"image_edit_size_mode": "source"}
+    )
+    # Edit path now passes size=None (not persona canvas).
+    await assist_client.edit_images(
+        [(buffer.getvalue(), "base.png", "image/png")],
+        "замени фон",
+        model="openai/gpt-image-2.6-flare",
+        size=None,
+    )
+    body = route.calls[0].request.content.decode("latin1")
+    assert "1536x1024" in body
+    assert "1024x1536" not in body
