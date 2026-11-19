@@ -71,6 +71,14 @@ async def handle_text(
         logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
         return
     sanitized_text = security.sanitize_prompt(user_text)
+    from app.bot.album import get_album_hub
+    from app.bot.handlers.photo import deliver_album
+
+    flushed = await get_album_hub().flush_text(
+        message.chat.id, sanitized_text, deliver_album
+    )
+    if flushed:
+        return
     if pending_media is not None:
         from app.bot.photo_flow import consume_pending_text
 

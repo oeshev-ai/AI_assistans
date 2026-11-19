@@ -66,8 +66,13 @@ async def start_health_server(
     redis_client: Any | None = None,
     proxy_probe: HealthProbe | None = None,
     setup_app: AppSetup | None = None,
+    bind: str | None = None,
 ) -> web.AppRunner:
-    """Start an aiohttp app exposing ``GET /health`` on ``0.0.0.0:port``."""
+    """Start an aiohttp app exposing ``GET /health``.
+
+    Default bind is ``127.0.0.1`` (override with ``HEALTH_BIND``, use
+    ``0.0.0.0`` inside Docker so published ports work).
+    """
     import os
 
     # Запас под multipart + большие медиа (прокси-upload через наш домен).
@@ -83,7 +88,9 @@ async def start_health_server(
         setup_app(app)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    raw = bind if bind is not None else os.getenv("HEALTH_BIND")
+    host = (raw or "127.0.0.1").strip() or "127.0.0.1"
+    site = web.TCPSite(runner, host, port)
     await site.start()
-    logger.info("health_server_started", port=port)
+    logger.info("health_server_started", port=port, bind=host)
     return runner

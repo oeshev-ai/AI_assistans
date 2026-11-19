@@ -126,6 +126,80 @@ async def test_same_origin_file_upload_flow() -> None:
         await client.close()
 
 
+def test_forwarded_proto_requires_trust_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.media.upload_server import _request_is_https
+
+    req = SimpleNamespace(secure=False, headers={"X-Forwarded-Proto": "https"})
+    monkeypatch.delenv("TRUST_PROXY", raising=False)
+    assert _request_is_https(req) is False  # type: ignore[arg-type]
+    monkeypatch.setenv("TRUST_PROXY", "1")
+    assert _request_is_https(req) is True  # type: ignore[arg-type]
+
+
+def test_legacy_presign_routes_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UPLOAD_LEGACY_PRESIGN", "0")
+    store = UploadSessionStore(redis=None)
+    app = web.Application()
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=FakeStorage(),
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    paths = []
+    for resource in app.router.resources():
+        info = resource.get_info()
+        formatter = info.get("formatter") or info.get("path") or ""
+        paths.append(str(formatter))
+    joined = " ".join(paths)
+    assert "{upload_id}/file" in joined or "/file" in joined
+    assert "presign" not in joined
+    assert "complete" not in joined
+
+
+@pytest.mark.asyncio
+async def test_upload_errors_are_opaque() -> None:
+    from app.storage.s3_storage import S3StorageError
+
+    class BoomStorage(FakeStorage):
+        async def upload_file(
+            self, *, object_key: str, file_path: str, content_type: str
+        ) -> None:
+            raise S3StorageError("bucket secret-xyz denied at 10.0.0.5")
+
+    store = UploadSessionStore(redis=None)
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application(client_max_size=10 * 1024 * 1024)
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=BoomStorage(),
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        page = await client.get(f"/upload/{session.upload_id}?t={session.token}")
+        assert page.status == 200
+        form = FormData()
+        form.add_field(
+            "file",
+            b"ID3bytes",
+            filename="a.mp3",
+            content_type="audio/mpeg",
+        )
+        resp = await client.post(f"/api/uploads/{session.upload_id}/file", data=form)
+        body = await resp.json()
+        assert resp.status == 500
+        assert body["error"] == "Ошибка загрузки"
+        assert "secret-xyz" not in str(body)
+        assert "10.0.0.5" not in str(body)
+    finally:
+        await client.close()
+
+
 @pytest.mark.asyncio
 async def test_request_large_media_upload_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.media.media_tools import RequestLargeMediaUploadTool

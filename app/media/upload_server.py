@@ -80,9 +80,22 @@ def _allowed_mime_types() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _trust_proxy() -> bool:
+    flag = os.getenv("TRUST_PROXY", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _legacy_presign_enabled() -> bool:
+    flag = os.getenv("UPLOAD_LEGACY_PRESIGN", "0").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
 def _request_is_https(request: web.Request) -> bool:
+    """HTTPS for Secure cookies. Trust X-Forwarded-Proto only if TRUST_PROXY=1."""
     if request.secure:
         return True
+    if not _trust_proxy():
+        return False
     return request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
 
 
@@ -370,7 +383,8 @@ def setup_upload_routes(
                 object_key=key, content_type=effective_type
             )
         except S3StorageError as exc:
-            return web.json_response({"error": exc.message}, status=500)
+            logger.warning("upload_presign_s3_failed", error=str(exc.message))
+            return web.json_response({"error": "Ошибка подготовки загрузки"}, status=500)
 
         session.object_key = key
         session.filename = file_name
@@ -414,7 +428,8 @@ def setup_upload_routes(
         try:
             head = await storage.head_object(object_key)
         except S3StorageError as exc:
-            return web.json_response({"error": exc.message}, status=400)
+            logger.warning("upload_complete_head_failed", error=str(exc.message))
+            return web.json_response({"error": "Объект не найден"}, status=400)
 
         size = int(head.get("ContentLength") or 0)
         if size <= 0:
@@ -573,12 +588,17 @@ def setup_upload_routes(
                 }
             )
         except S3StorageError as exc:
+            logger.warning(
+                "upload_file_s3_failed",
+                upload_id=upload_id,
+                error=str(exc.message),
+            )
             await _release_claim(error="s3_upload_failed")
-            return web.json_response({"error": exc.message}, status=500)
-        except Exception as exc:
+            return web.json_response({"error": "Ошибка загрузки"}, status=500)
+        except Exception:
             logger.exception("upload_file_failed", upload_id=upload_id)
             await _release_claim(error="upload_failed")
-            return web.json_response({"error": f"Ошибка загрузки: {exc}"}, status=500)
+            return web.json_response({"error": "Ошибка загрузки"}, status=500)
         finally:
             if tmp_path:
                 try:
@@ -587,10 +607,12 @@ def setup_upload_routes(
                     logger.debug("upload_temp_cleanup_failed", path=tmp_path)
 
     app.router.add_get("/upload/{upload_id}", page)
-    app.router.add_post("/api/uploads/{upload_id}/presign", presign)
-    app.router.add_post("/api/uploads/{upload_id}/complete", complete)
     app.router.add_post("/api/uploads/{upload_id}/file", upload_file)
-    logger.info("upload_routes_registered")
+    if _legacy_presign_enabled():
+        app.router.add_post("/api/uploads/{upload_id}/presign", presign)
+        app.router.add_post("/api/uploads/{upload_id}/complete", complete)
+        logger.info("upload_legacy_presign_enabled")
+    logger.info("upload_routes_registered", legacy_presign=_legacy_presign_enabled())
 
 
 def _guess_mime(filename: str) -> str:

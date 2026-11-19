@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.infra.access import is_user_allowed, parse_allowed_user_ids
+from app.infra.access import is_production, is_user_allowed, parse_allowed_user_ids
 
 
 def test_parse_empty_is_open_mode() -> None:
@@ -30,3 +30,10 @@ def test_closed_mode_requires_membership() -> None:
     assert is_user_allowed(10, allowed) is True
     assert is_user_allowed(99, allowed) is False
     assert is_user_allowed(None, allowed) is False
+
+
+def test_is_production(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert is_production() is True
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    assert is_production() is False

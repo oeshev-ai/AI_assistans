@@ -51,23 +51,45 @@ from app.bot.constants import (
 )
 from app.bot.handlers import _register_handlers
 from app.bot.middleware import AllowlistMiddleware
-from app.infra.access import parse_allowed_user_ids
+from app.infra.access import is_production, parse_allowed_user_ids
+from app.infra.security import redact_url_credentials
 from app.storage.pending_media import PendingMediaStorage, create_pending_media_storage
+
+_SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "token",
+        "api_key",
+        "authorization",
+        "secret",
+        "redis_url",
+        "redis_password",
+    }
+)
+
+
+def _redact_sentry_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in _SENSITIVE_KEYS:
+                out[key] = "[REDACTED]"
+            else:
+                out[key] = _redact_sentry_value(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_sentry_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_url_credentials(value)
+    return value
 
 
 def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
-    """Strip secrets from Sentry payloads before upload."""
+    """Strip secrets and URL passwords from Sentry payloads before upload."""
     _ = hint
     if not isinstance(event, dict):
         return event
-    request = event.get("request")
-    if isinstance(request, dict):
-        data = request.get("data")
-        if isinstance(data, dict):
-            for key in ("password", "token", "api_key", "Authorization"):
-                if key in data:
-                    data[key] = "[REDACTED]"
-    return event
+    return _redact_sentry_value(event)
 
 
 def init_sentry() -> None:
@@ -95,8 +117,11 @@ def init_sentry() -> None:
 
 
 async def create_fsm_storage(redis_url: str) -> BaseStorage:
-    """Redis FSM storage with MemoryStorage fallback."""
+    """Redis FSM storage; MemoryStorage only outside production."""
     if not redis_url:
+        if is_production():
+            logger.error("fsm_redis_required_in_production")
+            raise SystemExit(1)
         logger.warning("fsm_memory_storage", reason="REDIS_URL not set")
         return MemoryStorage()
     try:
@@ -112,9 +137,15 @@ async def create_fsm_storage(redis_url: str) -> BaseStorage:
         finally:
             await probe.aclose()
         storage = RedisStorage.from_url(redis_url)
-        logger.info("fsm_redis_storage", url=redis_url)
+        safe_url = redact_url_credentials(redis_url)
+        logger.info("fsm_redis_storage", url=safe_url)
         return storage
+    except SystemExit:
+        raise
     except Exception as exc:
+        if is_production():
+            logger.error("fsm_redis_failed_fatal", error=str(exc))
+            raise SystemExit(1) from exc
         logger.error("fsm_redis_failed", error=str(exc), fallback="memory")
         return MemoryStorage()
 
@@ -146,6 +177,15 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     shared_redis = await _open_shared_redis(redis_url)
     rate_limiter.attach_redis(shared_redis)
     cost_tracker.attach_redis(shared_redis)
+    if (
+        is_production()
+        and cost_tracker.daily_budget <= 0
+        and cost_tracker.user_daily_budget <= 0
+    ):
+        logger.warning(
+            "llm_budgets_unlimited_in_production",
+            hint="Set LLM_USER_DAILY_BUDGET_USD (e.g. 1.5) to cap spend",
+        )
     await job_queue.init_job_queue(redis_url)
     dispatcher.workflow_data["shared_redis"] = shared_redis
     try:
@@ -310,14 +350,13 @@ async def main() -> None:
     if allowed_ids:
         logger.info("allowlist_enabled", users=len(allowed_ids))
     else:
-        env = os.getenv("ENVIRONMENT", "development").strip().lower()
-        if env == "production":
-            logger.warning(
-                "allowlist_open_in_production",
+        if is_production():
+            logger.error(
+                "allowlist_required_in_production",
                 hint="Set TELEGRAM_ALLOWED_USER_IDS to limit API spend",
             )
-        else:
-            logger.info("allowlist_disabled", mode="allow_all")
+            raise SystemExit(1)
+        logger.info("allowlist_disabled", mode="allow_all")
     allowlist = AllowlistMiddleware(allowed_ids)
     dispatcher.message.middleware(allowlist)
     dispatcher.callback_query.middleware(allowlist)

@@ -26,12 +26,15 @@ def _redis_settings_from_url(redis_url: str) -> Any:
     from arq.connections import RedisSettings
 
     parsed = urlparse(redis_url)
+    # Empty userinfo (redis://:@host) must not become AUTH "".
+    password = parsed.password or None
+    username = parsed.username or None
     return RedisSettings(
         host=parsed.hostname or "localhost",
         port=parsed.port or 6379,
         database=int((parsed.path or "/0").lstrip("/") or 0),
-        password=parsed.password,
-        username=parsed.username,
+        password=password,
+        username=username,
     )
 
 

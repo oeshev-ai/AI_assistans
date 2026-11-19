@@ -383,6 +383,15 @@ class CostTracker:
                 )
                 return int(result) == 1
             except Exception as exc:
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "cost_tracker_redis_reserve_failed",
+                        error=str(exc),
+                        fallback="deny",
+                    )
+                    return False
                 logger.warning(
                     "cost_tracker_redis_reserve_failed",
                     error=str(exc),

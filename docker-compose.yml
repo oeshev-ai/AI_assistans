@@ -35,14 +35,18 @@ services:
     env_file:
       - .env
     environment:
-      # Host is always the compose service; optional REDIS_PASSWORD from .env.
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      # Host is compose service; omit userinfo when REDIS_PASSWORD is empty
+      # (redis://:@host breaks arq AUTH). Password set → redis://:pass@redis:6379/0
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
       ENVIRONMENT: production
       # Keep in sync with .env; worker profile alone is not enough.
       ARQ_ENABLED: ${ARQ_ENABLED:-0}
       METRICS_PORT: ${METRICS_PORT:-8083}
       METRICS_BIND: "0.0.0.0"
       HEALTH_PORT: ${HEALTH_PORT:-8082}
+      HEALTH_BIND: "0.0.0.0"
+      # nginx terminates TLS and forwards X-Forwarded-Proto
+      TRUST_PROXY: "1"
     ports:
       # Только localhost: наружу отдаёт nginx (assist.mrischool.ru → 8082)
       - "127.0.0.1:${METRICS_PORT:-8083}:${METRICS_PORT:-8083}"
@@ -58,7 +62,7 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
       ARQ_ENABLED: "1"
       ENVIRONMENT: production
     command: ["arq", "worker.WorkerSettings"]

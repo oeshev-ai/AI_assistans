@@ -49,6 +49,12 @@ async def test_init_disabled_without_flag(monkeypatch: pytest.MonkeyPatch) -> No
     assert job_queue.is_queue_enabled() is False
 
 
+def test_redis_settings_empty_password_is_none() -> None:
+    settings = job_queue._redis_settings_from_url("redis://:@redis:6379/0")
+    assert settings.password is None
+    assert settings.host == "redis"
+
+
 @pytest.mark.asyncio
 async def test_synthesize_speech_inline() -> None:
     await job_queue.close_job_queue()

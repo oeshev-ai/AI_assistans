@@ -101,6 +101,16 @@ class RateLimiter:
             try:
                 return await self._allow_redis(user_id, operation, limit, window)
             except Exception as exc:
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "rate_limiter_redis_failed_deny",
+                        error=str(exc),
+                        operation=operation,
+                        user_id=user_id,
+                    )
+                    return False
                 logger.warning(
                     "rate_limiter_redis_failed_fallback_memory",
                     error=str(exc),

@@ -9,6 +9,11 @@ import structlog
 logger = structlog.get_logger("access")
 
 
+def is_production() -> bool:
+    """True when ``ENVIRONMENT=production`` (compose sets this on bot/worker)."""
+    return os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+
+
 def parse_allowed_user_ids(raw: str | None = None) -> frozenset[int]:
     """Parse ``TELEGRAM_ALLOWED_USER_IDS`` (comma/space separated ints).
 

@@ -43,8 +43,8 @@ def redis_settings() -> Any:
         host=parsed.hostname or "localhost",
         port=parsed.port or 6379,
         database=int((parsed.path or "/0").lstrip("/") or 0),
-        password=parsed.password,
-        username=parsed.username,
+        password=parsed.password or None,
+        username=parsed.username or None,
     )
 
 

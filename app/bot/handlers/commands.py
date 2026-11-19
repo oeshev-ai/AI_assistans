@@ -52,7 +52,7 @@ async def cmd_cancel(
     pending_media: PendingMediaStorage,
 ) -> None:
     """Сбрасывает текущий пошаговый ввод. Без шага отвечает, что отменять нечего."""
-    had_album = get_album_hub().cancel_chat(message.chat.id)
+    had_album = await get_album_hub().cancel_chat(message.chat.id)
     had_pending = False
     try:
         profile = await R._active_profile(message.chat.id, assistant_storage)

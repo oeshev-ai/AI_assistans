@@ -70,4 +70,4 @@ async def test_single_photo_cancels_open_buffer() -> None:
     await hub.add(1, "group", _photo(1), "svc", on_ready)
     await hub.add(1, None, _photo(8), "svc", on_ready)
     assert ready == ["id-8"]
-    assert hub.cancel_chat(1) is False
+    assert await hub.cancel_chat(1) is False

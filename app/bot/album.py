@@ -122,8 +122,8 @@ class AlbumHub:
     def _keys_for(self, chat_id: int) -> list[tuple[int, str]]:
         return [key for key in self._buf if key[0] == chat_id]
 
-    def cancel_chat(self, chat_id: int) -> bool:
-        """Сбрасывает открытый буфер, не вызывая обработчик."""
+    def _cancel_chat_unlocked(self, chat_id: int) -> bool:
+        """Сброс буфера. Вызывать только под ``self._lock``."""
         keys = self._keys_for(chat_id)
         if not keys:
             return False
@@ -135,6 +135,11 @@ class AlbumHub:
                 task.cancel()
         return True
 
+    async def cancel_chat(self, chat_id: int) -> bool:
+        """Сбрасывает открытый буфер, не вызывая обработчик."""
+        async with self._lock:
+            return self._cancel_chat_unlocked(chat_id)
+
     async def add(
         self,
         chat_id: int,
@@ -144,7 +149,8 @@ class AlbumHub:
         on_ready: ReadyCallback,
     ) -> None:
         if group_id is None:
-            self.cancel_chat(chat_id)
+            async with self._lock:
+                self._cancel_chat_unlocked(chat_id)
             built = assemble_album([photo])
             await on_ready(built, services)
             return
