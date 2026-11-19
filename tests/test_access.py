@@ -32,7 +32,7 @@ def test_closed_mode_requires_membership() -> None:
     assert is_user_allowed(None, allowed) is False
 
 
-def test_is_production(monkeypatch) -> None:  # noqa: ANN001
+def test_is_production(monkeypatch) -> None:
     monkeypatch.setenv("ENVIRONMENT", "production")
     assert is_production() is True
     monkeypatch.setenv("ENVIRONMENT", "development")
