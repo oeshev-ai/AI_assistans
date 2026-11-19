@@ -18,7 +18,11 @@ from app.infra.cost_tracker import (
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
 from app.llm.errors import AssistAIError
-from app.llm.image_ops import ImageModelScope, image_model_family
+from app.llm.image_ops import (
+    ImageModelScope,
+    image_model_family,
+    supports_multi_image,
+)
 from app.llm.vision import (
     VisionError,
     build_multimodal_content,
@@ -48,6 +52,19 @@ def _edit_size_for_model(
     if image_model_family(edit_model) == image_model_family(generate_model):
         return profile_size
     return None
+
+
+def _generate_with_refs_model(generate_model: str, edit_model: str) -> str:
+    """Model for intent=generate when reference photos are present.
+
+    ``generate_image`` cannot take input images, so the call stays on
+    ``edit_images``. Prefer the persona generate model when it supports
+    multi-image edits; otherwise keep the dedicated edit model (e.g. FLUX →
+    GPT Image).
+    """
+    if supports_multi_image(generate_model):
+        return generate_model
+    return edit_model
 
 
 _CANCEL = frozenset({"отмена", "стоп", "cancel"})
@@ -433,13 +450,19 @@ async def _generate(
         prompt = f"{prompt}\n" + " ".join(
             f"Image {index + 1} is a reference photo." for index in range(len(files))
         )
-    edit_size = _edit_size_for_model(size, generate_model, edit_model)
     status = await _status(turn, "Рисую изображение…")
     token = set_user_media(loaded)
     try:
         import app.infra.job_queue as job_queue
 
-        model = edit_model if files else generate_model
+        if files:
+            model = _generate_with_refs_model(generate_model, edit_model)
+            edit_size = _edit_size_for_model(size, generate_model, model)
+            complexity = turn.assistant.config.image_complexity_generate
+        else:
+            model = generate_model
+            edit_size = None
+            complexity = None
         with ImageModelScope(model, size), MediaTurnScope():
             # Budget preflight — в generate_image / edit_images.
             if files:
@@ -447,9 +470,10 @@ async def _generate(
                     turn.assistant,
                     files,
                     prompt,
-                    model=edit_model,
+                    model=model,
                     labels=labels,
                     size=edit_size,
+                    complexity=complexity,
                 )
             else:
                 result = await job_queue.generate_image(

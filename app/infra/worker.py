@@ -49,27 +49,56 @@ def redis_settings() -> Any:
     )
 
 
-async def startup(ctx: dict[str, Any]) -> None:
+async def attach_worker_billing_redis(redis_url: str) -> Any:
+    """Attach shared cost Redis; fail closed in production.
+
+    Returns the Redis client, or ``None`` outside production when URL is empty /
+    unreachable (in-memory cost tracker).
+    """
     from redis.asyncio import Redis
 
+    from app.infra.access import is_production
     from app.infra.cost_tracker import cost_tracker
 
+    if not redis_url:
+        if is_production():
+            logger.error("worker_billing_redis_required_in_production")
+            raise SystemExit(1)
+        logger.warning("worker_cost_redis_skipped", reason="REDIS_URL not set")
+        return None
+    try:
+        billing_redis = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+        )
+        await billing_redis.ping()
+        cost_tracker.attach_redis(billing_redis)
+        return billing_redis
+    except Exception as exc:
+        if is_production():
+            logger.error("worker_cost_redis_failed_fatal", error=str(exc))
+            raise SystemExit(1) from exc
+        logger.warning("worker_cost_redis_failed", error=str(exc))
+        return None
+
+
+async def startup(ctx: dict[str, Any]) -> None:
+    from app.infra.cost_tracker import cost_tracker
+    from app.infra.job_queue import validate_arq_image_timeout
+
+    try:
+        validate_arq_image_timeout()
+    except ValueError as exc:
+        logger.error("arq_timeout_misconfigured", error=str(exc))
+        raise SystemExit(1) from exc
+
     ctx["assistant"] = AssistAIClient(AssistAIConfig.from_env())
+    cost_tracker.require_llm_budgets_configured()
     redis_url = os.getenv("REDIS_URL", "").strip()
-    billing_redis = None
-    if redis_url:
-        try:
-            billing_redis = Redis.from_url(
-                redis_url,
-                decode_responses=True,
-                socket_connect_timeout=2.0,
-                socket_timeout=2.0,
-            )
-            await billing_redis.ping()
-            cost_tracker.attach_redis(billing_redis)
-            ctx["billing_redis"] = billing_redis
-        except Exception as exc:
-            logger.warning("worker_cost_redis_failed", error=str(exc))
+    billing_redis = await attach_worker_billing_redis(redis_url)
+    ctx["billing_redis"] = billing_redis
     logger.info("worker_started")
 
 
@@ -148,6 +177,7 @@ async def edit_image_task(
     labels: list[str] | None,
     size: str | None = None,
     billing_user_id: int | None = None,
+    complexity: str | None = None,
 ) -> list[str]:
     """Достаёт файлы правки из Redis и вызывает ``edit_images``."""
     assistant: AssistAIClient = ctx["assistant"]
@@ -182,10 +212,16 @@ async def edit_image_task(
         "job_edit_image",
         files=len(files),
         model=model,
+        complexity=complexity,
         billing_user_id=billing_user_id,
     )
     return await assistant.edit_images(
-        files, prompt, model=model, labels=labels, size=size
+        files,
+        prompt,
+        model=model,
+        labels=labels,
+        size=size,
+        complexity=complexity,
     )
 
 

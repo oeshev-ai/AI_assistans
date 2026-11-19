@@ -49,6 +49,18 @@ async def test_init_disabled_without_flag(monkeypatch: pytest.MonkeyPatch) -> No
     assert job_queue.is_queue_enabled() is False
 
 
+@pytest.mark.asyncio
+async def test_init_rejects_short_arq_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARQ_ENABLED", "1")
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "180")
+    await job_queue.close_job_queue()
+    with pytest.raises(SystemExit):
+        await job_queue.init_job_queue("redis://localhost:6379/0")
+
+
 def test_redis_settings_empty_password_is_none() -> None:
     settings = job_queue._redis_settings_from_url("redis://:@redis:6379/0")
     assert settings.password is None
@@ -64,12 +76,29 @@ def test_image_result_timeout_covers_polza_wait(
     assert job_queue.image_result_timeout(120.0) == pytest.approx(120.0)
 
 
-def test_image_result_timeout_caps_at_arq_job_timeout(
+def test_image_result_timeout_ignores_short_arq_job_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
     monkeypatch.setenv("ARQ_JOB_TIMEOUT", "200")
-    assert job_queue.image_result_timeout() == pytest.approx(200.0)
+    assert job_queue.image_result_timeout() == pytest.approx(270.0)
+
+
+def test_validate_arq_image_timeout_rejects_short_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "200")
+    with pytest.raises(ValueError, match="ARQ_JOB_TIMEOUT"):
+        job_queue.validate_arq_image_timeout()
+
+
+def test_validate_arq_image_timeout_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
+    job_queue.validate_arq_image_timeout()
 
 
 @pytest.mark.asyncio

@@ -1015,11 +1015,15 @@ class ImageOpsMixin(ProviderTransportMixin):
         model: str | None = None,
         labels: list[str] | None = None,
         size: str | None = None,
+        complexity: str | None = None,
     ) -> list[str]:
         """Правит несколько фото через multipart ``/images/edits`` или Polza media.
 
         Первый файл — основа. Поле формы — ``image[]``. Размер уходит в полях
         семейства модели, как у ``generate_image``.
+
+        ``complexity`` overrides ``config.image_complexity_edit`` when set (used
+        by photo generate-with-refs to keep generate-tier quality).
         """
         if not files:
             raise ValueError("files не может быть пустым.")
@@ -1032,6 +1036,7 @@ class ImageOpsMixin(ProviderTransportMixin):
 
         selected_model = model or self.config.default_image_edit_model
         edit_size = self._resolve_edit_size(size, files[0][0])
+        edit_complexity = complexity or self.config.image_complexity_edit
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -1068,6 +1073,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                     files=len(prepared),
                     prompt_chars=len(sanitized),
                     provider=provider.id,
+                    complexity=edit_complexity,
                 )
                 if provider.kind == "polza_media":
                     return await self._polza_image(
@@ -1082,7 +1088,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                     sanitized,
                     edit_size,
                     quality=self.config.image_quality,
-                    complexity=self.config.image_complexity_edit,
+                    complexity=edit_complexity,
                     send_complexity=self.config.send_complexity,
                 )
                 form = {

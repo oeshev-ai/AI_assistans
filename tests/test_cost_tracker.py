@@ -105,6 +105,115 @@ async def test_concurrent_budget_reservations_cap(fakeredis_client) -> None:
     assert sum(1 for ok in outcomes if not ok) == 3
 
 
+@pytest.mark.asyncio
+async def test_incr_raises_in_production_on_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+    class BoomRedis:
+        def pipeline(self):
+            pipe = type("P", (), {})()
+
+            def incrbyfloat(*_a, **_k):
+                return pipe
+
+            def expire(*_a, **_k):
+                return pipe
+
+            async def execute():
+                raise ConnectionError("redis down incr")
+
+            pipe.incrbyfloat = incrbyfloat  # type: ignore[attr-defined]
+            pipe.expire = expire  # type: ignore[attr-defined]
+            pipe.execute = execute  # type: ignore[attr-defined]
+            return pipe
+
+    tracker = CostTracker()
+    tracker.attach_redis(BoomRedis())
+    with pytest.raises(ConnectionError):
+        await tracker._incr("cost:day:t", 0.5, ttl_seconds=60)
+    assert "cost:day:t" not in tracker._memory
+
+
+@pytest.mark.asyncio
+async def test_get_raises_in_production_on_redis_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+    class BoomRedis:
+        async def get(self, _key: str):
+            raise ConnectionError("redis down get")
+
+    tracker = CostTracker()
+    tracker._memory["cost:day:t"] = 9.9
+    tracker.attach_redis(BoomRedis())
+    with pytest.raises(ConnectionError):
+        await tracker._get("cost:day:t")
+
+
+@pytest.mark.asyncio
+async def test_incr_falls_back_to_memory_outside_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "development")
+
+    class BoomRedis:
+        def pipeline(self):
+            pipe = type("P", (), {})()
+
+            def incrbyfloat(*_a, **_k):
+                return pipe
+
+            def expire(*_a, **_k):
+                return pipe
+
+            async def execute():
+                raise ConnectionError("redis down incr")
+
+            pipe.incrbyfloat = incrbyfloat  # type: ignore[attr-defined]
+            pipe.expire = expire  # type: ignore[attr-defined]
+            pipe.execute = execute  # type: ignore[attr-defined]
+            return pipe
+
+    tracker = CostTracker()
+    tracker.attach_redis(BoomRedis())
+    await tracker._incr("cost:day:t", 0.5, ttl_seconds=60)
+    assert tracker._memory["cost:day:t"] == pytest.approx(0.5)
+
+
+def test_require_budgets_fatal_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    tracker = CostTracker()
+    tracker.daily_budget = 0.0
+    tracker.user_daily_budget = 0.0
+    with pytest.raises(SystemExit):
+        tracker.require_llm_budgets_configured()
+
+
+def test_require_budgets_ok_with_user_cap_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    tracker = CostTracker()
+    tracker.daily_budget = 0.0
+    tracker.user_daily_budget = 1.5
+    tracker.require_llm_budgets_configured()
+
+
+def test_require_budgets_ok_unlimited_in_development(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    tracker = CostTracker()
+    tracker.daily_budget = 0.0
+    tracker.user_daily_budget = 0.0
+    tracker.require_llm_budgets_configured()
+
+
 @pytest.fixture
 async def fakeredis_client():
     fakeredis = pytest.importorskip("fakeredis.aioredis")

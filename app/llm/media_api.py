@@ -33,6 +33,19 @@ from app.llm.transport import (
 
 logger = structlog.get_logger("AssistAI.media")
 
+_VIDEO_FAILED_USER = "Генерация видео завершилась ошибкой. Попробуйте позже."
+_VIDEO_POLL_USER = "Не удалось опросить статус видео. Попробуйте позже."
+_VIDEO_DOWNLOAD_USER = "Не удалось скачать видео. Попробуйте позже."
+
+
+def video_user_error(kind: str) -> str:
+    """Stable Telegram-safe copy for video failures (no provider payloads/URLs)."""
+    if kind == "poll":
+        return _VIDEO_POLL_USER
+    if kind == "download":
+        return _VIDEO_DOWNLOAD_USER
+    return _VIDEO_FAILED_USER
+
 
 @dataclass(frozen=True)
 class SpeechResult:
@@ -268,9 +281,13 @@ class MediaApiMixin(ProviderTransportMixin):
                 if status in {"completed", "succeeded", "success"}:
                     break
                 if status in {"failed", "error", "cancelled"}:
-                    raise AssistAIError(
-                        f"Генерация видео завершилась ошибкой: {status_payload}"
+                    logger.warning(
+                        "generate_video_failed",
+                        status=status,
+                        job_id=job_id,
+                        payload_keys=sorted(status_payload.keys()),
                     )
+                    raise AssistAIError(video_user_error("failed"))
                 await asyncio.sleep(_VIDEO_POLL_INTERVAL)
                 try:
                     response = await self._video_get(
@@ -283,9 +300,8 @@ class MediaApiMixin(ProviderTransportMixin):
                     response.raise_for_status()
                     body = response.json()
                 except httpx.HTTPError as exc:
-                    raise AssistAIError(
-                        f"Не удалось опросить статус видео: {exc}"
-                    ) from exc
+                    logger.warning("generate_video_poll_failed", error=str(exc))
+                    raise AssistAIError(video_user_error("poll")) from exc
                 if not isinstance(body, dict):
                     raise AssistAIError("Некорректный статус видео-задачи.")
                 status_payload = body
@@ -319,7 +335,8 @@ class MediaApiMixin(ProviderTransportMixin):
                 )
                 response.raise_for_status()
             except httpx.HTTPError as exc:
-                raise AssistAIError(f"Не удалось скачать видео: {exc}") from exc
+                logger.warning("generate_video_download_failed", error=str(exc))
+                raise AssistAIError(video_user_error("download")) from exc
             data = response.content
             if not data:
                 raise AssistAIError("ProxyAPI вернул пустой видеофайл.")

@@ -51,10 +51,17 @@ async def init_job_queue(redis_url: str) -> None:
         _enabled = False
         return
     try:
+        validate_arq_image_timeout()
+    except ValueError as exc:
+        logger.error("arq_timeout_misconfigured", error=str(exc))
+        raise SystemExit(1) from exc
+    try:
         from arq import create_pool
 
         _pool = await create_pool(_redis_settings_from_url(redis_url))
         logger.info("arq_pool_ready")
+    except SystemExit:
+        raise
     except Exception as exc:
         logger.error("arq_pool_failed", error=str(exc), fallback="inline")
         _pool = None
@@ -82,28 +89,46 @@ def _billing_user_id(explicit: int | None = None) -> int | None:
     return get_billing_user()
 
 
-def image_result_timeout(explicit: float | None = None) -> float:
-    """Wait for queued image jobs at least as long as Polza poll budget.
-
-    Default used to be 180s while ``POLZA_TOTAL_WAIT`` is 240s, so the bot could
-    give up before a paid worker result arrived.
-    """
-    if explicit is not None:
-        return explicit
+def _polza_image_wait_needed() -> float:
+    """Minimum bot wait / worker job timeout for Polza poll + margin."""
     from app.infra.envparse import env_float
 
     polza_wait = env_float("POLZA_TOTAL_WAIT", 240.0)
+    return max(180.0, polza_wait + 30.0)
+
+
+def validate_arq_image_timeout() -> None:
+    """Fail if ``ARQ_JOB_TIMEOUT`` cannot cover Polza poll + margin.
+
+    A shorter worker timeout kills paid image jobs while the bot may still wait
+    (or historically gave up early). Call when the arq queue/worker is enabled.
+    """
+    from app.infra.envparse import env_float
+
     arq_timeout = env_float("ARQ_JOB_TIMEOUT", 300.0)
-    needed = max(180.0, polza_wait + 30.0)
+    needed = _polza_image_wait_needed()
     if arq_timeout > 0 and arq_timeout < needed:
-        logger.warning(
+        logger.error(
             "arq_image_timeout_below_polza_wait",
             arq_job_timeout=arq_timeout,
-            polza_total_wait=polza_wait,
+            polza_total_wait=env_float("POLZA_TOTAL_WAIT", 240.0),
             needed=needed,
         )
-        return arq_timeout
-    return needed
+        raise ValueError(
+            f"ARQ_JOB_TIMEOUT ({arq_timeout}) must be >= POLZA_TOTAL_WAIT+30 "
+            f"({needed})"
+        )
+
+
+def image_result_timeout(explicit: float | None = None) -> float:
+    """Wait for queued image jobs at least as long as Polza poll budget.
+
+    Never returns below ``POLZA_TOTAL_WAIT + 30``. Misconfigured
+    ``ARQ_JOB_TIMEOUT`` is rejected by ``validate_arq_image_timeout``.
+    """
+    if explicit is not None:
+        return explicit
+    return _polza_image_wait_needed()
 
 
 async def generate_image(
@@ -144,6 +169,7 @@ async def edit_images(
     model: str | None = None,
     labels: list[str] | None = None,
     size: str | None = None,
+    complexity: str | None = None,
     timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> list[str]:
@@ -170,6 +196,7 @@ async def edit_images(
                 labels,
                 size,
                 user_id,
+                complexity,
             )
         except Exception as exc:
             logger.warning("arq_edit_enqueue_failed", error=str(exc))
@@ -178,13 +205,23 @@ async def edit_images(
             except Exception:
                 pass
             return await assistant.edit_images(
-                files, prompt, model=model, labels=labels, size=size
+                files,
+                prompt,
+                model=model,
+                labels=labels,
+                size=size,
+                complexity=complexity,
             )
         if job is None:
             await _pool.delete(key)
             logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
             return await assistant.edit_images(
-                files, prompt, model=model, labels=labels, size=size
+                files,
+                prompt,
+                model=model,
+                labels=labels,
+                size=size,
+                complexity=complexity,
             )
         logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
         try:
@@ -199,7 +236,12 @@ async def edit_images(
                 pass
             raise
     return await assistant.edit_images(
-        files, prompt, model=model, labels=labels, size=size
+        files,
+        prompt,
+        model=model,
+        labels=labels,
+        size=size,
+        complexity=complexity,
     )
 
 

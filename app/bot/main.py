@@ -156,8 +156,15 @@ async def create_fsm_storage(redis_url: str) -> BaseStorage:
 
 
 async def _open_shared_redis(redis_url: str) -> Redis | None:
-    """Optional Redis client for rate limits and health checks."""
+    """Shared Redis for rate limits, cost tracker, and upload sessions.
+
+    Required in production (same fail-closed policy as FSM/topics). Outside
+    production an empty or unreachable URL falls back to in-process memory.
+    """
     if not redis_url:
+        if is_production():
+            logger.error("shared_redis_required_in_production")
+            raise SystemExit(1)
         return None
     try:
         client = Redis.from_url(
@@ -169,6 +176,9 @@ async def _open_shared_redis(redis_url: str) -> Redis | None:
         await client.ping()
         return client
     except Exception as exc:
+        if is_production():
+            logger.error("shared_redis_failed_fatal", error=str(exc))
+            raise SystemExit(1) from exc
         logger.warning("shared_redis_unavailable", error=str(exc))
         return None
 
@@ -182,15 +192,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     shared_redis = await _open_shared_redis(redis_url)
     rate_limiter.attach_redis(shared_redis)
     cost_tracker.attach_redis(shared_redis)
-    if (
-        is_production()
-        and cost_tracker.daily_budget <= 0
-        and cost_tracker.user_daily_budget <= 0
-    ):
-        logger.warning(
-            "llm_budgets_unlimited_in_production",
-            hint="Set LLM_USER_DAILY_BUDGET_USD (e.g. 1.5) to cap spend",
-        )
+    cost_tracker.require_llm_budgets_configured()
     await job_queue.init_job_queue(redis_url)
     dispatcher.workflow_data["shared_redis"] = shared_redis
     try:

@@ -290,6 +290,25 @@ class CostTracker:
         else:
             logger.warning("cost_tracker_using_memory")
 
+    def require_llm_budgets_configured(self) -> None:
+        """Fail closed in production when both daily caps are unlimited (0).
+
+        ``0`` still means unlimited in development. Production must set at least
+        one of ``LLM_DAILY_BUDGET_USD`` / ``LLM_USER_DAILY_BUDGET_USD``.
+        """
+        from app.infra.access import is_production
+
+        unlimited = self.daily_budget <= 0 and self.user_daily_budget <= 0
+        if not unlimited:
+            return
+        if is_production():
+            logger.error(
+                "llm_budgets_required_in_production",
+                hint="Set LLM_USER_DAILY_BUDGET_USD (e.g. 1.5) or LLM_DAILY_BUDGET_USD",
+            )
+            raise SystemExit(1)
+        logger.info("llm_budgets_unlimited", mode="development")
+
     @staticmethod
     def _day_key() -> str:
         return datetime.now(UTC).strftime("%Y%m%d")
@@ -600,7 +619,20 @@ class CostTracker:
                 raw = await self._redis.get(key)
                 return float(raw) if raw is not None else 0.0
             except Exception as exc:
-                logger.warning("cost_tracker_redis_get_failed", error=str(exc))
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "cost_tracker_redis_get_failed",
+                        error=str(exc),
+                        fallback="deny",
+                    )
+                    raise
+                logger.warning(
+                    "cost_tracker_redis_get_failed",
+                    error=str(exc),
+                    fallback="memory",
+                )
         return float(self._memory.get(key, 0.0))
 
     async def _incr(self, key: str, amount: float, *, ttl_seconds: int) -> None:
@@ -612,7 +644,20 @@ class CostTracker:
                 await pipe.execute()
                 return
             except Exception as exc:
-                logger.warning("cost_tracker_redis_incr_failed", error=str(exc))
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "cost_tracker_redis_incr_failed",
+                        error=str(exc),
+                        fallback="deny",
+                    )
+                    raise
+                logger.warning(
+                    "cost_tracker_redis_incr_failed",
+                    error=str(exc),
+                    fallback="memory",
+                )
         async with self._lock:
             self._memory[key] = self._memory.get(key, 0.0) + amount
         # Soft expiry for memory mode: drop keys older than ~3 days by day stamp.

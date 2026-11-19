@@ -27,6 +27,7 @@ from app.bot.constants import (
     MSG_PROFILE,
     MSG_TIMEOUT,
     MSG_UNAVAILABLE,
+    MSG_UPLOAD_PROCESS_FAILED,
     STREAM_EDIT_INTERVAL,
     TELEGRAM_TEXT_LIMIT,
     Any,
@@ -1290,16 +1291,20 @@ async def _process_s3_upload_session(
             chunks=len(chunks),
         )
     except (S3StorageError, MediaProcessingError, AssistAIError) as exc:
-        message = getattr(exc, "message", None) or str(exc)
-        logger.exception("s3_upload_process_failed", upload_id=session.upload_id)
-        await bot.send_message(chat_id, f"Не удалось обработать файл: {message}")
+        detail = getattr(exc, "message", None) or str(exc)
+        logger.exception(
+            "s3_upload_process_failed",
+            upload_id=session.upload_id,
+            error=detail[:500],
+        )
+        await bot.send_message(chat_id, MSG_UPLOAD_PROCESS_FAILED)
         session.status = "failed"
-        session.error = message[:500]
+        session.error = detail[:500]
         await store.update(session)
     except Exception as exc:
         logger.exception("s3_upload_process_failed", upload_id=session.upload_id)
         sentry_sdk.capture_exception(exc)
-        await bot.send_message(chat_id, "Не удалось обработать загруженный файл.")
+        await bot.send_message(chat_id, MSG_UPLOAD_PROCESS_FAILED)
         session.status = "failed"
         session.error = "internal"
         await store.update(session)

@@ -231,6 +231,10 @@ class AssistAIConfig(BaseModel):
             providers = registry.providers
             routes = registry.routes
             image_fallback = registry.image_fallback
+        default_text_model = (
+            os.getenv("PROXYAPI_TEXT_MODEL", "deepseek/deepseek-v4.1-flash").strip()
+            or "deepseek/deepseek-v4.1-flash"
+        )
         return cls(
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
             base_url=base_url,
@@ -242,6 +246,7 @@ class AssistAIConfig(BaseModel):
             polza_poll_interval=_positive_float("POLZA_POLL_INTERVAL", 4.0),
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", ""),
             exchangerate_api_key=os.getenv("EXCHANGERATE_API_KEY", ""),
+            default_text_model=default_text_model,
             default_transcribe_model=os.getenv(
                 "PROXYAPI_TRANSCRIBE_MODEL", "openai/whisper-large-v3"
             ),

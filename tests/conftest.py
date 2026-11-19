@@ -43,6 +43,8 @@ def _isolate_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Локальный ``.env`` разработчика не должен менять маршруты в тестах."""
     for name in _PROVIDER_ENV:
         monkeypatch.delenv(name, raising=False)
+    # Production fail-closed paths (Redis eval, budgets) must not inherit .env.
+    monkeypatch.setenv("ENVIRONMENT", "development")
 
 
 @pytest.fixture(autouse=True)
