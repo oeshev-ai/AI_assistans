@@ -73,3 +73,54 @@ async def test_recovers_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     clock["t"] += 11.0
     assert await breaker.call(ok) == "ok"
     assert breaker.state == CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_half_open_allows_only_one_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    breaker = AsyncCircuitBreaker(
+        name="probe",
+        failure_threshold=1,
+        recovery_timeout=10.0,
+    )
+    clock = {"t": 100.0}
+    monkeypatch.setattr("app.infra.circuit_breaker.time.monotonic", lambda: clock["t"])
+
+    async def boom() -> None:
+        raise RuntimeError("down")
+
+    with pytest.raises(RuntimeError):
+        await breaker.call(boom)
+    assert breaker.state == CircuitState.OPEN
+    clock["t"] += 11.0
+
+    await breaker.ensure_allows_call()
+    assert breaker.state == CircuitState.HALF_OPEN
+    with pytest.raises(CircuitBreakerError):
+        await breaker.ensure_allows_call()
+    await breaker._on_success()
+    assert breaker.state == CircuitState.CLOSED
+
+
+def test_counts_toward_circuit_skips_client_errors() -> None:
+    from app.llm.errors import AssistAIError, counts_toward_circuit
+
+    assert (
+        counts_toward_circuit(
+            AssistAIError("bad", status_code=400, error_code="BAD_REQUEST")
+        )
+        is False
+    )
+    assert (
+        counts_toward_circuit(
+            AssistAIError("lim", status_code=429, error_code="TOO_MANY_REQUESTS")
+        )
+        is False
+    )
+    assert (
+        counts_toward_circuit(
+            AssistAIError("down", status_code=503, error_code="SERVICE_UNAVAILABLE")
+        )
+        is True
+    )

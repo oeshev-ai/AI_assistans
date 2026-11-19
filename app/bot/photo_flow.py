@@ -10,7 +10,11 @@ import structlog
 from app.bot import models as M
 from app.bot import runtime as R
 from app.bot.photo_router import PhotoDecision, decide
-from app.infra.cost_tracker import BudgetExceededError, cost_tracker, set_billing_user
+from app.infra.cost_tracker import (
+    BudgetExceededError,
+    cost_tracker,
+    set_billing_user,
+)
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
 from app.llm.assist_ai import AssistAIError, ImageModelScope, image_model_family
@@ -173,6 +177,8 @@ async def route_album(
     except AssistAIError as exc:
         await message.answer(exc.message)
         return
+    finally:
+        await cost_tracker.release_reservation(user_id)
     await _execute(turn, media, profile, loaded, decision, topic_id)
 
 
@@ -236,7 +242,7 @@ async def _execute(
         await R._reset_flow(turn.state)
         return
     if decision.intent == "generate":
-        await _generate(turn, media, profile, decision, topic_id)
+        await _generate(turn, media, profile, loaded, decision, topic_id)
         return
     await _edit(turn, media, profile, loaded, decision, topic_id)
 
@@ -390,6 +396,7 @@ async def _edit(
             reply,
         )
     finally:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
         await turn.pending.pop(media.chat_id, media.assistant_id)
@@ -400,6 +407,7 @@ async def _generate(
     turn: Any,
     media: PendingMedia,
     profile: Any,
+    loaded: list[UserMedia],
     decision: PhotoDecision,
     topic_id: str,
 ) -> None:
@@ -415,9 +423,24 @@ async def _generate(
     if not security.validate_prompt_length(instruction):
         await message.answer("⚠️ Запрос слишком длинный.")
         return
-    model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
+    generate_model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
     size = M._stored_image_size(profile)
+    # Reference photos must reach the image API; text-only generate drops them.
+    edit_model = turn.assistant.config.default_image_edit_model
+    files = [(item.data, item.filename, item.mime_type) for item in loaded]
+    labels = [str(index + 1) for index in range(len(loaded))]
+    prompt = security.sanitize_prompt(instruction)
+    if files:
+        prompt = (
+            f"{prompt}\n"
+            + " ".join(
+                f"Image {index + 1} is a reference photo."
+                for index in range(len(files))
+            )
+        )
+    edit_size = _edit_size_for_model(size, generate_model, edit_model)
     status = await _status(turn, "Рисую изображение…")
+    token = set_user_media(loaded)
     try:
         try:
             await cost_tracker.check_budget(
@@ -428,13 +451,24 @@ async def _generate(
             return
         import app.infra.job_queue as job_queue
 
+        model = edit_model if files else generate_model
         with ImageModelScope(model, size), MediaTurnScope():
-            result = await job_queue.generate_image(
-                turn.assistant,
-                security.sanitize_prompt(instruction),
-                model=model,
-                size=size,
-            )
+            if files:
+                result = await job_queue.edit_images(
+                    turn.assistant,
+                    files,
+                    prompt,
+                    model=edit_model,
+                    labels=labels,
+                    size=edit_size,
+                )
+            else:
+                result = await job_queue.generate_image(
+                    turn.assistant,
+                    prompt,
+                    model=generate_model,
+                    size=size,
+                )
         for index, image in enumerate(result):
             await R._send_generated_image(message, image, index)
         fallback = "Готово. Это новое изображение по вашему фото."
@@ -470,6 +504,8 @@ async def _generate(
     except AssistAIError as exc:
         await message.answer(exc.message)
     finally:
+        await cost_tracker.release_reservation(user_id)
+        reset_user_media(token)
         await _drop_status(turn, status)
         await turn.pending.pop(media.chat_id, media.assistant_id)
         await R._reset_flow(turn.state)

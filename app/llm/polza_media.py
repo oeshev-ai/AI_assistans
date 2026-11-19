@@ -391,6 +391,21 @@ def _network_error(exc: httpx.RequestError, operation: str) -> AssistAIError:
     return AssistAIError(_USER_MESSAGES["NETWORK_ERROR"], error_code="NETWORK_ERROR")
 
 
+def _capped_timeout(
+    base: httpx.Timeout | None, remaining: float
+) -> httpx.Timeout:
+    """HTTP timeout that never exceeds the poll wall-clock budget."""
+    budget = max(0.05, remaining)
+    connect = min(10.0, budget)
+    read = budget
+    if base is not None:
+        if base.connect is not None:
+            connect = min(float(base.connect), budget)
+        if base.read is not None:
+            read = min(float(base.read), budget)
+    return httpx.Timeout(read, connect=connect)
+
+
 async def _poll(
     client: httpx.AsyncClient,
     provider: ProviderConfig,
@@ -400,24 +415,42 @@ async def _poll(
     total_wait: float,
     timeout: httpx.Timeout | None,
 ) -> dict[str, Any]:
-    """Опрос ``GET /v1/media/{id}`` до терминального статуса или ``total_wait``."""
+    """Опрос ``GET /v1/media/{id}`` до терминального статуса или ``total_wait``.
+
+    ``total_wait`` is a hard budget: poll sleeps accumulate toward it (so mocked
+    sleeps cannot busy-loop), and each GET is also capped by the wall-clock
+    remainder so a long HTTP timeout cannot overrun the deadline.
+    """
     url = f"{provider.base_url}{_MEDIA_PATH}/{quote(media_id, safe='')}"
     interval = max(0.0, poll_interval)
-    started = time.monotonic()
-    waited = 0.0
+    budget = max(0.0, total_wait)
+    deadline = time.monotonic() + budget
+    slept = 0.0
     errors = 0
     while True:
-        if max(time.monotonic() - started, waited) >= total_wait:
+        remaining_wall = deadline - time.monotonic()
+        remaining_sleep = budget - slept
+        if remaining_sleep <= 0 or remaining_wall <= 0:
             logger.error(
-                "polza_media_poll_exhausted", media_id=media_id, waited=total_wait
+                "polza_media_poll_exhausted",
+                media_id=media_id,
+                waited=total_wait,
             )
             raise AssistAIError(
                 _USER_MESSAGES["POLL_TIMEOUT"], error_code="POLL_TIMEOUT"
             )
-        await _sleep(interval)
-        waited += interval
+        sleep_for = (
+            min(interval, remaining_sleep, remaining_wall) if interval > 0 else 0.0
+        )
+        if sleep_for > 0:
+            await _sleep(sleep_for)
+            slept += sleep_for
+        remaining_wall = max(0.0, deadline - time.monotonic())
+        # One GET after each wait slice; cap HTTP to leftover wall (floor 50ms).
         try:
-            response = await client.get(url, timeout=timeout)
+            response = await client.get(
+                url, timeout=_capped_timeout(timeout, max(remaining_wall, 0.05))
+            )
             _raise_for_response(response, provider.id)
             body = response.json()
         except httpx.RequestError as exc:

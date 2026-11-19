@@ -17,16 +17,22 @@ HealthProbe = Callable[[], Awaitable[None]]
 AppSetup = Callable[[web.Application], None]
 
 
+async def liveness_check(_request: web.Request) -> web.Response:
+    """Process-up probe. Never calls Redis or providers (safe for liveness)."""
+    return web.json_response({"status": "alive", "timestamp": time.time()}, status=200)
+
+
 async def health_check(
     request: web.Request,
     redis_client: Any | None,
     proxy_probe: HealthProbe | None,
     provider_probes: Mapping[str, HealthProbe] | None = None,
 ) -> web.Response:
-    """Return component status for Redis, ProxyAPI and extra LLM providers.
+    """Readiness: Redis, ProxyAPI and extra LLM providers.
 
     ``components.proxy_api`` is kept for compatibility; ``components.providers``
     lists every provider (``proxyapi`` mirrors ``proxy_api``).
+    Use ``GET /live`` for liveness and ``GET /ready`` (or ``/health``) for readiness.
     """
     health: dict[str, Any] = {
         "status": "healthy",
@@ -90,7 +96,10 @@ async def start_health_server(
     bind: str | None = None,
     provider_probes: Mapping[str, HealthProbe] | None = None,
 ) -> web.AppRunner:
-    """Start an aiohttp app exposing ``GET /health``.
+    """Start an aiohttp app with live/ready health endpoints.
+
+    - ``GET /live`` — liveness (process up, no upstream probes)
+    - ``GET /ready`` and ``GET /health`` — readiness (Redis + providers)
 
     Default bind is ``127.0.0.1`` (override with ``HEALTH_BIND``, use
     ``0.0.0.0`` inside Docker so published ports work).
@@ -98,14 +107,18 @@ async def start_health_server(
     import os
 
     # Запас под multipart + большие медиа (прокси-upload через наш домен).
-    max_mb = max(1, int(os.getenv("UPLOAD_MAX_MB", "512") or "512"))
+    from app.infra.envparse import env_int
+
+    max_mb = max(1, env_int("UPLOAD_MAX_MB", 512))
     app = web.Application(client_max_size=(max_mb + 8) * 1024 * 1024)
     app["upload_enabled"] = False
 
-    async def _handler(request: web.Request) -> web.Response:
+    async def _ready(request: web.Request) -> web.Response:
         return await health_check(request, redis_client, proxy_probe, provider_probes)
 
-    app.router.add_get("/health", _handler)
+    app.router.add_get("/live", liveness_check)
+    app.router.add_get("/ready", _ready)
+    app.router.add_get("/health", _ready)
     if setup_app is not None:
         setup_app(app)
     runner = web.AppRunner(app, access_log=None)

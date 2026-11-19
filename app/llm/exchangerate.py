@@ -1,6 +1,6 @@
 """Асинхронный клиент конвертации валют.
 
-Запросы уходят только на ``http://api.exchangerate.host/convert``
+Запросы уходят только на ``https://api.exchangerate.host/convert``
 и всегда содержат параметр ``access_key``.
 """
 
@@ -20,7 +20,7 @@ from app.infra.metrics import track_api_call
 logger = structlog.get_logger("ExchangerateAPI")
 
 # Единственный разрешённый адрес. Другие API и пути не используются.
-CONVERT_URL = "http://api.exchangerate.host/convert"
+CONVERT_URL = "https://api.exchangerate.host/convert"
 
 MSG_INVALID_ACCESS_KEY = (
     "⚙️ Ошибка конфигурации API. Проверьте параметр access_key в .env файле."

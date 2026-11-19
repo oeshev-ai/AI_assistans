@@ -1,3 +1,9 @@
+# APP_IMAGE: GHCR tag published by Deploy workflow (docker compose pull).
+# Local default tags the build as ai-assistans:local so build+up still work.
+x-app: &app
+  image: ${APP_IMAGE:-ai-assistans:local}
+  build: .
+
 services:
   redis:
     image: redis:7-alpine
@@ -30,7 +36,7 @@ services:
       retries: 5
 
   bot:
-    build: .
+    <<: *app
     restart: unless-stopped
     env_file:
       - .env
@@ -57,7 +63,7 @@ services:
 
   # Optional: docker compose --profile arq up -d  (also set ARQ_ENABLED=1 in .env)
   worker:
-    build: .
+    <<: *app
     restart: unless-stopped
     env_file:
       - .env

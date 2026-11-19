@@ -9,6 +9,8 @@ from typing import Any
 
 import structlog
 
+from app.infra.envparse import env_int
+
 logger = structlog.get_logger("s3_storage")
 
 
@@ -46,10 +48,8 @@ class S3Config:
             bucket=bucket,
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
-            signed_url_expires_in=max(
-                60, int(os.getenv("SIGNED_URL_EXPIRES_IN", "1800") or "1800")
-            ),
-            max_upload_mb=max(1, int(os.getenv("UPLOAD_MAX_MB", "512") or "512")),
+            signed_url_expires_in=max(60, env_int("SIGNED_URL_EXPIRES_IN", 1800)),
+            max_upload_mb=max(1, env_int("UPLOAD_MAX_MB", 512)),
         )
 
 
@@ -131,19 +131,45 @@ class S3Storage:
         except Exception as exc:
             raise S3StorageError(f"Объект не найден в бакете: {object_key}") from exc
 
-    async def download_bytes(self, object_key: str) -> bytes:
+    async def download_bytes(
+        self, object_key: str, *, max_bytes: int | None = None
+    ) -> bytes:
+        """Download object body, optionally refusing payloads above ``max_bytes``."""
+        limit = max_bytes
+        if limit is None:
+            limit = self.config.max_upload_mb * 1024 * 1024
+
         def _get() -> bytes:
             response = self._client.get_object(
                 Bucket=self.config.bucket, Key=object_key
             )
+            content_length = response.get("ContentLength")
             body = response["Body"]
             try:
-                return body.read()
+                if content_length is not None and int(content_length) > limit:
+                    raise S3StorageError(
+                        f"Объект больше лимита ({limit} байт): {object_key}"
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = body.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise S3StorageError(
+                            f"Объект больше лимита ({limit} байт): {object_key}"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
             finally:
                 body.close()
 
         try:
             return await asyncio.to_thread(_get)
+        except S3StorageError:
+            raise
         except Exception as exc:
             logger.exception("s3_download_failed", key=object_key)
             raise S3StorageError(f"Не удалось скачать объект: {exc}") from exc

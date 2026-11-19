@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self, cast
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -56,7 +58,12 @@ from app.infra.metrics import (
 )
 from app.infra.security import security
 from app.llm import polza_media
-from app.llm.errors import AssistAIError, fallback_reason, is_rate_limited
+from app.llm.errors import (
+    AssistAIError,
+    counts_toward_circuit,
+    fallback_reason,
+    is_rate_limited,
+)
 from app.llm.exchangerate import Conversion, ExchangeAPIError, get_exchange_rate
 from app.llm.models_config import resolve_image_model
 from app.llm.openweather import (
@@ -479,10 +486,9 @@ class AssistAIConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
-        normalized = value.strip().rstrip("/")
-        if not normalized.startswith(("http://", "https://")):
-            raise ValueError("base_url должен начинаться с http:// или https://")
-        return normalized
+        from app.llm.providers import require_secure_base_url
+
+        return require_secure_base_url(value)
 
     @field_validator("tts_provider", mode="before")
     @classmethod
@@ -1315,6 +1321,20 @@ _REQUEST_IMAGE_SIZE: ContextVar[str | None] = ContextVar(
 _REQUEST_IMAGES: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "request_generated_images", default=None
 )
+_GENERATION_IDS: ContextVar[list[str | None] | None] = ContextVar(
+    "assist_ai_generation_ids", default=None
+)
+
+
+def _set_generation_ids(ids: list[str | None]) -> None:
+    """Store image generation ids for the current asyncio task only."""
+    _GENERATION_IDS.set(list(ids))
+
+
+def _get_generation_ids() -> list[str | None]:
+    value = _GENERATION_IDS.get()
+    return list(value) if value else []
+
 
 # FLUX принимает ярус разрешения, а не пиксели вроде 1024x1024.
 _FLUX_SIZE_TIERS: tuple[tuple[int, str], ...] = (
@@ -1478,7 +1498,7 @@ class GenerateImageTool(BaseTool):
             logger.exception("generate_image: непредвиденная ошибка")
             return _error_json(_exception_text(exc))
 
-        generation_ids = getattr(self._client, "_generation_ids", [])
+        generation_ids = _get_generation_ids()
         packed = []
         for index, image in enumerate(images):
             item = {
@@ -1845,6 +1865,62 @@ def _speech_file(response_format: str) -> tuple[str, str]:
     return "answer.ogg", "audio/ogg"
 
 
+def _host_is_non_public(hostname: str) -> bool:
+    """True for loopback/private/link-local IPs and obvious local names."""
+    lowered = hostname.strip().casefold().rstrip(".")
+    if not lowered:
+        return True
+    if lowered in {"localhost", "metadata.google.internal"} or lowered.endswith(
+        ".local"
+    ):
+        return True
+    try:
+        ip = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def resolve_video_resource_url(
+    candidate: str | None,
+    *,
+    provider_base_url: str,
+    fallback: str,
+) -> tuple[str, bool]:
+    """Choose a video poll/content URL and whether to send the provider Bearer.
+
+    - Same host as ``provider_base_url`` → fetch with auth.
+    - Other **public HTTPS** hosts (CDN) → fetch without auth.
+    - Private/loopback/metadata hosts and plain HTTP to foreign hosts → ``fallback``.
+    """
+    if not isinstance(candidate, str) or not candidate.strip():
+        return fallback, True
+    raw = candidate.strip()
+    try:
+        parsed = urlparse(raw)
+        provider = urlparse(provider_base_url)
+    except ValueError:
+        return fallback, True
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return fallback, True
+    host = parsed.hostname.casefold()
+    provider_host = (provider.hostname or "").casefold()
+    if host == provider_host:
+        return raw, True
+    if _host_is_non_public(host):
+        return fallback, True
+    if parsed.scheme != "https":
+        return fallback, True
+    return raw, False
+
+
 class AssistAIClient:
     """Единый асинхронный клиент ProxyAPI: чат с инструментами и картинки.
 
@@ -1870,7 +1946,6 @@ class AssistAIClient:
         self._tools_registry: dict[str, BaseTool] = {}
         self._weather_client: OpenWeatherClient | None = None
         self._closed: bool = False
-        self._generation_ids: list[str | None] = []
         self._register_builtin_tools()
 
     def _build_registry(self) -> ProviderRegistry:
@@ -2437,8 +2512,7 @@ class AssistAIClient:
             )
         except AssistAIError as exc:
             # Только недоступность считается сбоем breaker-а; 4xx и 429 — нет.
-            reason = fallback_reason(exc)
-            if reason is not None and reason != "rate_limited":
+            if counts_toward_circuit(exc):
                 await breaker._on_failure(exc)
             raise
         await breaker._on_success()
@@ -2571,63 +2645,68 @@ class AssistAIClient:
             await cost_tracker.check_budget(estimated=image_cost)
         except BudgetExceededError as exc:
             raise AssistAIError(exc.message) from exc
-        payload = _image_generation_body(
-            selected_model,
-            sanitized_prompt,
-            size.strip(),
-            quality=self.config.image_quality,
-            complexity=self.config.image_complexity_generate,
-            send_complexity=self.config.send_complexity,
-        )
-        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
-        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
-        size_label = (
-            payload.get("size")
-            or payload.get("size_preset")
-            or payload.get("aspect_ratio")
-            or size.strip()
-        )
-        logger.info(
-            "generate_image",
-            model=selected_model,
-            size=size_label,
-            prompt_chars=len(sanitized_prompt),
-        )
-        polza_size = size.strip()
-        if image_model_family(selected_model) == "openai":
-            polza_size = _OPENAI_SIZE_ALIASES.get(polza_size, polza_size)
-
-        async def attempt(provider: ProviderConfig) -> dict[str, Any]:
-            if provider.kind == "polza_media":
-                return await self._polza_image(
-                    provider,
-                    model=selected_model,
-                    prompt=sanitized_prompt,
-                    size=polza_size,
-                )
-            return await self._post_image_json(
-                payload, timeout=timeout, provider=provider
+        try:
+            payload = _image_generation_body(
+                selected_model,
+                sanitized_prompt,
+                size.strip(),
+                quality=self.config.image_quality,
+                complexity=self.config.image_complexity_generate,
+                send_complexity=self.config.send_complexity,
             )
+            read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
+            timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+            size_label = (
+                payload.get("size")
+                or payload.get("size_preset")
+                or payload.get("aspect_ratio")
+                or size.strip()
+            )
+            logger.info(
+                "generate_image",
+                model=selected_model,
+                size=size_label,
+                prompt_chars=len(sanitized_prompt),
+            )
+            polza_size = size.strip()
+            if image_model_family(selected_model) == "openai":
+                polza_size = _OPENAI_SIZE_ALIASES.get(polza_size, polza_size)
 
-        data, used = await self._image_with_fallback(attempt)
+            async def attempt(provider: ProviderConfig) -> dict[str, Any]:
+                if provider.kind == "polza_media":
+                    return await self._polza_image(
+                        provider,
+                        model=selected_model,
+                        prompt=sanitized_prompt,
+                        size=polza_size,
+                    )
+                return await self._post_image_json(
+                    payload, timeout=timeout, provider=provider
+                )
 
-        records = _image_records(data)
-        self._generation_ids = [record.get("generation_id") for record in records]
-        images = [record["value"] for record in records]
+            data, used = await self._image_with_fallback(attempt)
 
-        if not images:
-            logger.error("generate_image: в ответе нет url и b64_json")
-            raise AssistAIError(f"{_provider_label(used)} не вернул изображение.")
+            records = _image_records(data)
+            _set_generation_ids(
+                [record.get("generation_id") for record in records]
+            )
+            images = [record["value"] for record in records]
 
-        logger.info("generate_image: получено изображений: %s", len(images))
-        await self._record_image_spend(
-            count=len(images),
-            model=selected_model,
-            size=str(size_label),
-            data=data,
-            provider=used,
-        )
-        return images
+            if not images:
+                logger.error("generate_image: в ответе нет url и b64_json")
+                raise AssistAIError(f"{_provider_label(used)} не вернул изображение.")
+
+            logger.info("generate_image: получено изображений: %s", len(images))
+            await self._record_image_spend(
+                count=len(images),
+                model=selected_model,
+                size=str(size_label),
+                data=data,
+                provider=used,
+            )
+            return images
+        finally:
+            await cost_tracker.release_reservation()
 
     async def edit_image(
         self,
@@ -2684,7 +2763,7 @@ class AssistAIClient:
         data, used = await self._image_with_fallback(attempt)
 
         records = _image_records(data)
-        self._generation_ids = [record.get("generation_id") for record in records]
+        _set_generation_ids([record.get("generation_id") for record in records])
         images = [record["value"] for record in records]
         if not images:
             raise AssistAIError(
@@ -2774,7 +2853,7 @@ class AssistAIClient:
 
         payload, used = await self._image_with_fallback(attempt)
         records = _image_records(payload)
-        self._generation_ids = [record.get("generation_id") for record in records]
+        _set_generation_ids([record.get("generation_id") for record in records])
         images = [record["value"] for record in records]
         if not images:
             raise AssistAIError(
@@ -2825,11 +2904,15 @@ class AssistAIClient:
         job_id = created.get("id")
         if not isinstance(job_id, str) or not job_id:
             raise AssistAIError("ProxyAPI не вернул id видео-задачи.")
-        polling_url = created.get("polling_url")
-        status_url = (
-            polling_url
-            if isinstance(polling_url, str) and polling_url.startswith("http")
-            else f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
+        status_fallback = (
+            f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
+        )
+        status_url, status_with_auth = resolve_video_resource_url(
+            created.get("polling_url")
+            if isinstance(created.get("polling_url"), str)
+            else None,
+            provider_base_url=video_provider.base_url,
+            fallback=status_fallback,
         )
 
         deadline = time.monotonic() + _VIDEO_POLL_MAX_SECONDS
@@ -2844,8 +2927,11 @@ class AssistAIClient:
                 )
             await asyncio.sleep(_VIDEO_POLL_INTERVAL)
             try:
-                response = await self._client_for(video_provider).get(
-                    status_url, timeout=httpx.Timeout(30.0, connect=self.config.timeout)
+                response = await self._video_get(
+                    video_provider,
+                    status_url,
+                    with_auth=status_with_auth,
+                    timeout=httpx.Timeout(30.0, connect=self.config.timeout),
                 )
                 response.raise_for_status()
                 body = response.json()
@@ -2857,22 +2943,29 @@ class AssistAIClient:
         else:
             raise AssistAIError("Таймаут ожидания генерации видео.")
 
-        content_url = (
+        content_fallback = (
             f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}/content"
         )
+        content_candidate = None
         unsigned = status_payload.get("unsigned_urls")
         if isinstance(unsigned, list) and unsigned:
             first = unsigned[0]
-            if isinstance(first, str) and first.startswith("http"):
-                content_url = first
+            if isinstance(first, str):
+                content_candidate = first
+        content_url, content_with_auth = resolve_video_resource_url(
+            content_candidate,
+            provider_base_url=video_provider.base_url,
+            fallback=content_fallback,
+        )
         try:
-            response = await self._client_for(video_provider).get(
+            response = await self._video_get(
+                video_provider,
                 content_url,
+                with_auth=content_with_auth,
                 timeout=httpx.Timeout(
                     max(self.config.timeout, _VIDEO_READ_TIMEOUT),
                     connect=self.config.timeout,
                 ),
-                headers={"Authorization": f"Bearer {video_provider.api_key}"},
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
@@ -2885,6 +2978,25 @@ class AssistAIClient:
         await cost_tracker.record(kind="video", amount_usd=VIDEO_USD)
         logger.info("generate_video_done", job_id=job_id, bytes=len(data))
         return VideoResult(data=data, filename="video.mp4", mime_type="video/mp4")
+
+    async def _video_get(
+        self,
+        provider: ProviderConfig,
+        url: str,
+        *,
+        with_auth: bool,
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        """GET video status/content; never send provider Bearer to foreign hosts."""
+        if with_auth:
+            return await self._client_for(provider).get(url, timeout=timeout)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            verify=_ssl_context(),
+            headers={"User-Agent": "AssistAIClient/1.0"},
+        ) as anon:
+            return await anon.get(url)
 
     async def transcribe_audio(
         self,
@@ -3165,7 +3277,8 @@ class AssistAIClient:
                 service="proxy_api", endpoint="chat_stream", status="error"
             ).inc()
             ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
-            await breaker._on_failure(exc)
+            if counts_toward_circuit(exc):
+                await breaker._on_failure(exc)
             raise
         except httpx.TimeoutException as exc:
             API_CALLS.labels(

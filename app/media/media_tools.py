@@ -9,6 +9,7 @@ from typing import Any, Literal, Self
 
 import structlog
 
+from app.infra.cost_tracker import BudgetExceededError, cost_tracker
 from app.llm.assist_ai import (
     AssistAIClient,
     AssistAIError,
@@ -16,6 +17,7 @@ from app.llm.assist_ai import (
     SpeechResult,
     _error_json,
     _exception_text,
+    _get_generation_ids,
     note_generation_id,
 )
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
@@ -254,7 +256,7 @@ class EditImageTool(BaseTool):
             return _error_json(_exception_text(exc))
 
         _LAST_EDIT_BASE.set(base)
-        for generation_id in getattr(self._client, "_generation_ids", []):
+        for generation_id in _get_generation_ids():
             note_generation_id(
                 generation_id if isinstance(generation_id, str) else None
             )
@@ -393,8 +395,16 @@ class GenerateVideoTool(BaseTool):
         prompt = kwargs.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return _error_json("Параметр prompt обязателен.")
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.rate_limiter import rate_limiter
         from app.infra.security import security
 
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.check_media_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "media")
+            return _error_json(
+                f"Слишком много медиа-запросов. Подождите {int(retry_after) or 60} секунд."
+            )
         prompt = security.sanitize_prompt(prompt.strip())
         model = kwargs.get("model")
         selected = model.strip() if isinstance(model, str) and model.strip() else None
@@ -481,6 +491,23 @@ class TranscribeMediaTool(BaseTool):
             return _error_json(
                 "Нет аудио или видео во вложении. Попросите пользователя прислать файл."
             )
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.rate_limiter import rate_limiter
+
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.check_media_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "media")
+            return _error_json(
+                f"Слишком много медиа-запросов. Подождите {int(retry_after) or 60} секунд."
+            )
+        # Rough duration from payload size (~4 KB/s compressed audio).
+        estimated = cost_tracker.estimate_stt_cost(
+            max(15.0, len(source.data) / 4000.0)
+        )
+        try:
+            await cost_tracker.check_budget(estimated=estimated)
+        except BudgetExceededError as exc:
+            return _error_json(exc.message)
         try:
             chunks = await prepare_audio_for_stt(
                 source.data,
@@ -497,6 +524,34 @@ class TranscribeMediaTool(BaseTool):
                 if text:
                     parts.append(text)
             transcript = "\n\n".join(parts).strip()
+            if not transcript:
+                return _error_json("Речь не распознана.")
+
+            await cost_tracker.record(kind="stt", amount_usd=estimated)
+            bucket = _outbound()
+            if bucket is not None:
+                bucket.add(
+                    OutboundMedia(
+                        kind="document",
+                        filename="transcript.txt",
+                        mime_type="text/plain",
+                        data=transcript.encode("utf-8"),
+                    )
+                )
+            preview = transcript[:240] + ("…" if len(transcript) > 240 else "")
+            return json.dumps(
+                {
+                    "status": "success",
+                    "chars": len(transcript),
+                    "chunks": len(chunks),
+                    "preview": preview,
+                    "note": (
+                        "Полный текст отправлен пользователю файлом transcript.txt. "
+                        "Не копируй расшифровку в ответ целиком — кратко подтверди."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         except MediaProcessingError as exc:
             return _error_json(exc.message)
         except AssistAIError as exc:
@@ -504,34 +559,8 @@ class TranscribeMediaTool(BaseTool):
         except Exception as exc:
             logger.exception("transcribe_media_failed")
             return _error_json(_exception_text(exc))
-
-        if not transcript:
-            return _error_json("Речь не распознана.")
-
-        bucket = _outbound()
-        if bucket is not None:
-            bucket.add(
-                OutboundMedia(
-                    kind="document",
-                    filename="transcript.txt",
-                    mime_type="text/plain",
-                    data=transcript.encode("utf-8"),
-                )
-            )
-        preview = transcript[:240] + ("…" if len(transcript) > 240 else "")
-        return json.dumps(
-            {
-                "status": "success",
-                "chars": len(transcript),
-                "chunks": len(chunks),
-                "preview": preview,
-                "note": (
-                    "Полный текст отправлен пользователю файлом transcript.txt. "
-                    "Не копируй расшифровку в ответ целиком — кратко подтверди."
-                ),
-            },
-            ensure_ascii=False,
-        )
+        finally:
+            await cost_tracker.release_reservation()
 
 
 class RequestLargeMediaUploadTool(BaseTool):
@@ -666,39 +695,56 @@ class SynthesizeSpeechTool(BaseTool):
         selected_voice = (
             voice.strip() if isinstance(voice, str) and voice.strip() else None
         )
+        cleaned = text.strip()
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.rate_limiter import rate_limiter
+
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.check_media_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "media")
+            return _error_json(
+                f"Слишком много медиа-запросов. Подождите {int(retry_after) or 60} секунд."
+            )
+        estimated = cost_tracker.estimate_tts_cost(cleaned)
+        try:
+            await cost_tracker.check_budget(estimated=estimated)
+        except BudgetExceededError as exc:
+            return _error_json(exc.message)
         try:
             speech: SpeechResult = await self._client.synthesize_speech(
-                text=text.strip(),
+                text=cleaned,
                 voice=selected_voice,
+            )
+            await cost_tracker.record(kind="tts", amount_usd=estimated)
+            bucket = _outbound()
+            if bucket is not None:
+                bucket.add(
+                    OutboundMedia(
+                        kind="audio",
+                        filename=speech.filename,
+                        mime_type=speech.mime_type,
+                        data=speech.audio,
+                    )
+                )
+            return json.dumps(
+                {
+                    "status": "success",
+                    "chars": len(cleaned),
+                    "filename": speech.filename,
+                    "note": (
+                        "Аудио уже отправляется пользователю. "
+                        "Кратко подтверди, что озвучка готова."
+                    ),
+                },
+                ensure_ascii=False,
             )
         except AssistAIError as exc:
             return _error_json(exc.message)
         except Exception as exc:
             logger.exception("synthesize_speech_tool_failed")
             return _error_json(_exception_text(exc))
-
-        bucket = _outbound()
-        if bucket is not None:
-            bucket.add(
-                OutboundMedia(
-                    kind="audio",
-                    filename=speech.filename,
-                    mime_type=speech.mime_type,
-                    data=speech.audio,
-                )
-            )
-        return json.dumps(
-            {
-                "status": "success",
-                "chars": len(text.strip()),
-                "filename": speech.filename,
-                "note": (
-                    "Аудио уже отправляется пользователю. "
-                    "Кратко подтверди, что озвучка готова."
-                ),
-            },
-            ensure_ascii=False,
-        )
+        finally:
+            await cost_tracker.release_reservation()
 
 
 def register_media_tools(client: AssistAIClient) -> None:

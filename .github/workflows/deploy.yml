@@ -47,8 +47,11 @@ jobs:
             ${{ steps.image.outputs.name }}:latest
             ${{ steps.image.outputs.name }}:${{ github.event.workflow_run.head_sha }}
 
-      # Доставка на свой сервер вместо GHCR: секрет SSH_PRIVATE_KEY,
-      # затем docker compose pull && docker compose up -d.
+      # Доставка на VPS: в .env на сервере задать
+      #   APP_IMAGE=ghcr.io/<owner>/<repo>:latest
+      # (тот же name, что steps.image выше), затем:
+      #   docker compose pull && docker compose up -d
+      # Нужны секрет SSH_PRIVATE_KEY и login в GHCR на хосте.
       # - name: Deploy over SSH
       #   uses: appleboy/ssh-action@v1
       #   with:

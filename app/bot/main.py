@@ -86,10 +86,14 @@ def _redact_sentry_value(value: Any) -> Any:
 
 
 def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
-    """Strip secrets and URL passwords from Sentry payloads before upload."""
+    """Strip secrets, URL passwords, and Telegram identity from Sentry payloads."""
     _ = hint
     if not isinstance(event, dict):
         return event
+    event.pop("user", None)
+    contexts = event.get("contexts")
+    if isinstance(contexts, dict):
+        contexts.pop("chat", None)
     return _redact_sentry_value(event)
 
 
@@ -210,8 +214,10 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["assistant"] = assistant
     dispatcher.workflow_data["pending_media"] = pending_media
 
-    metrics_port = int(os.getenv("METRICS_PORT", "8083"))
-    health_port = int(os.getenv("HEALTH_PORT", "8082"))
+    from app.infra.envparse import env_int
+
+    metrics_port = env_int("METRICS_PORT", 8083)
+    health_port = env_int("HEALTH_PORT", 8082)
     start_metrics_server(port=metrics_port)
 
     upload_store = UploadSessionStore(shared_redis)
@@ -288,6 +294,11 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     """Закрывает клиент LLM, темы и профили, если startup успел их создать."""
     health_runner = dispatcher.workflow_data.get("health_runner")
     if health_runner is not None:
+        app = getattr(health_runner, "app", None)
+        if app is not None:
+            from app.media.upload_server import drain_upload_tasks
+
+            await drain_upload_tasks(app)
         await health_runner.cleanup()
     await job_queue.close_job_queue()
     assistant = dispatcher.workflow_data.get("assistant")

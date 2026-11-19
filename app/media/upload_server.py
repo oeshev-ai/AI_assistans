@@ -26,6 +26,9 @@ logger = structlog.get_logger("upload_server")
 UploadCompleteHandler = Callable[[UploadSession], Awaitable[None]]
 
 _COOKIE_NAME = "upload_token"
+UPLOAD_TASKS_KEY: web.AppKey[set[asyncio.Task[Any]]] = web.AppKey(
+    "upload_tasks", set[asyncio.Task[Any]]
+)
 
 
 class UploadObjectStorage(Protocol):
@@ -279,6 +282,28 @@ def _page_html(upload_id: str, max_mb: int) -> str:
 """
 
 
+def track_upload_task(app: web.Application, task: asyncio.Task[Any]) -> None:
+    """Keep background upload jobs so shutdown can cancel/await them."""
+    tasks: set[asyncio.Task[Any]] = app.setdefault(UPLOAD_TASKS_KEY, set())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def drain_upload_tasks(
+    app: web.Application, *, timeout: float = 30.0
+) -> None:
+    """Cancel in-flight upload completion tasks during process shutdown."""
+    tasks: set[asyncio.Task[Any]] = set(app.get(UPLOAD_TASKS_KEY) or ())
+    if not tasks:
+        return
+    logger.info("upload_tasks_draining", count=len(tasks))
+    for task in tasks:
+        task.cancel()
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        logger.warning("upload_tasks_drain_timeout", pending=len(pending))
+
+
 def setup_upload_routes(
     app: web.Application,
     *,
@@ -288,6 +313,7 @@ def setup_upload_routes(
 ) -> None:
     """Регистрирует страницу и API загрузки на существующем aiohttp app."""
 
+    app.setdefault(UPLOAD_TASKS_KEY, set())
     allowed_mimes = _allowed_mime_types()
     max_bytes = storage.config.max_upload_mb * 1024 * 1024
 
@@ -474,7 +500,7 @@ def setup_upload_routes(
                 claimed.error = "processing_failed"
                 await store.update(claimed)
 
-        asyncio.create_task(_run())
+        track_upload_task(app, asyncio.create_task(_run()))
         return web.json_response({"ok": True, "status": "processing"})
 
     async def upload_file(request: web.Request) -> web.Response:
@@ -555,6 +581,19 @@ def setup_upload_routes(
                 await _release_claim()
                 return web.json_response({"error": "Пустой файл"}, status=400)
 
+            from app.media.file_magic import mime_compatible
+
+            with Path(tmp_path).open("rb") as probe:
+                head = probe.read(64)
+            if not mime_compatible(
+                filename=file_name, claimed_mime=effective_type, head=head
+            ):
+                await _release_claim()
+                return web.json_response(
+                    {"error": "Содержимое файла не соответствует типу"},
+                    status=400,
+                )
+
             key = object_key_for(session, file_name)
             await storage.upload_file(
                 object_key=key,
@@ -580,7 +619,7 @@ def setup_upload_routes(
                     session.error = "processing_failed"
                     await store.update(session)
 
-            asyncio.create_task(_run())
+            track_upload_task(app, asyncio.create_task(_run()))
             return web.json_response(
                 {
                     "ok": True,

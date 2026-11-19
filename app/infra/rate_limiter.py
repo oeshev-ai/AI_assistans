@@ -16,6 +16,8 @@ TEXT_LIMIT = 10
 TEXT_WINDOW_SECONDS = 60.0
 IMAGE_LIMIT = 5
 IMAGE_WINDOW_SECONDS = 3600.0
+MEDIA_LIMIT = 10
+MEDIA_WINDOW_SECONDS = 3600.0
 
 # Atomic sliding-window consume: prune → count → zadd (or deny).
 _ALLOW_LUA = """
@@ -42,6 +44,7 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self._text_hits: dict[int, deque[float]] = defaultdict(deque)
         self._image_hits: dict[int, deque[float]] = defaultdict(deque)
+        self._media_hits: dict[int, deque[float]] = defaultdict(deque)
 
     def attach_redis(self, redis_client: Any | None) -> None:
         """Use Redis for durable counters when available."""
@@ -69,10 +72,23 @@ class RateLimiter:
             window=IMAGE_WINDOW_SECONDS,
         )
 
+    async def check_media_limit(self, user_id: int) -> bool:
+        """Return True and consume a slot if under the STT/TTS/video limit."""
+        return await self._allow(
+            user_id,
+            operation="media",
+            limit=MEDIA_LIMIT,
+            window=MEDIA_WINDOW_SECONDS,
+        )
+
     async def get_retry_after(self, user_id: int, operation: str) -> float:
         """Seconds until the oldest hit leaves the window (0 if capacity free)."""
-        window = TEXT_WINDOW_SECONDS if operation == "text" else IMAGE_WINDOW_SECONDS
-        limit = TEXT_LIMIT if operation == "text" else IMAGE_LIMIT
+        if operation == "text":
+            window, limit = TEXT_WINDOW_SECONDS, TEXT_LIMIT
+        elif operation == "media":
+            window, limit = MEDIA_WINDOW_SECONDS, MEDIA_LIMIT
+        else:
+            window, limit = IMAGE_WINDOW_SECONDS, IMAGE_LIMIT
         now = time.time()
 
         if self._redis is not None:
@@ -88,9 +104,13 @@ class RateLimiter:
                 logger.warning("rate_limiter_redis_retry_after_failed", error=str(exc))
 
         async with self._lock:
+            self._sweep_expired(now)
             hits = self._hits(user_id, operation)
             self._prune(hits, now, window)
-            if len(hits) < limit or not hits:
+            if not hits:
+                self._drop_hits(user_id, operation)
+                return 0.0
+            if len(hits) < limit:
                 return 0.0
             return max(0.0, hits[0] + window - now)
 
@@ -143,6 +163,7 @@ class RateLimiter:
     ) -> bool:
         now = time.time()
         async with self._lock:
+            self._sweep_expired(now)
             hits = self._hits(user_id, operation)
             self._prune(hits, now, window)
             if len(hits) >= limit:
@@ -153,7 +174,33 @@ class RateLimiter:
     def _hits(self, user_id: int, operation: str) -> deque[float]:
         if operation == "text":
             return self._text_hits[user_id]
+        if operation == "media":
+            return self._media_hits[user_id]
         return self._image_hits[user_id]
+
+    def _drop_hits(self, user_id: int, operation: str) -> None:
+        if operation == "text":
+            store = self._text_hits
+        elif operation == "media":
+            store = self._media_hits
+        else:
+            store = self._image_hits
+        store.pop(user_id, None)
+
+    def _sweep_expired(self, now: float) -> None:
+        """Drop memory keys whose windows are fully expired."""
+        for user_id, hits in list(self._text_hits.items()):
+            self._prune(hits, now, TEXT_WINDOW_SECONDS)
+            if not hits:
+                self._text_hits.pop(user_id, None)
+        for user_id, hits in list(self._image_hits.items()):
+            self._prune(hits, now, IMAGE_WINDOW_SECONDS)
+            if not hits:
+                self._image_hits.pop(user_id, None)
+        for user_id, hits in list(self._media_hits.items()):
+            self._prune(hits, now, MEDIA_WINDOW_SECONDS)
+            if not hits:
+                self._media_hits.pop(user_id, None)
 
     @staticmethod
     def _prune(hits: deque[float], now: float, window: float) -> None:

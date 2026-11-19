@@ -70,6 +70,15 @@ async def test_pending_then_polling_then_completed(
     assert result.cost_rub == pytest.approx(2.37166294)
 
 
+def test_capped_timeout_respects_remaining_budget() -> None:
+    from app.llm.polza_media import _capped_timeout
+
+    base = httpx.Timeout(60.0, connect=10.0)
+    capped = _capped_timeout(base, 2.5)
+    assert float(capped.read) <= 2.5
+    assert float(capped.connect) <= 2.5
+
+
 @pytest.mark.asyncio
 async def test_poll_exhaustion_raises_poll_timeout(
     polza_fixture: Callable[[str], dict[str, Any]], sleeps: list[float]

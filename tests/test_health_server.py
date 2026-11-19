@@ -6,7 +6,35 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.infra.health_server import health_check
+from app.infra.health_server import health_check, liveness_check
+
+
+@pytest.mark.asyncio
+async def test_liveness_ok_while_readiness_degraded() -> None:
+    class FakeRedis:
+        async def ping(self) -> bool:
+            raise RuntimeError("redis down")
+
+    async def proxy_fail() -> None:
+        raise ConnectionError("upstream down")
+
+    app = web.Application()
+
+    async def ready(request: web.Request) -> web.Response:
+        return await health_check(request, FakeRedis(), proxy_fail)
+
+    app.router.add_get("/live", liveness_check)
+    app.router.add_get("/ready", ready)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        live = await client.get("/live")
+        ready_resp = await client.get("/ready")
+        assert live.status == 200
+        assert (await live.json())["status"] == "alive"
+        assert ready_resp.status == 503
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

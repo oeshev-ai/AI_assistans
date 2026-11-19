@@ -737,6 +737,8 @@ async def _send_voice_reply(
         logger.exception("Непредвиденная ошибка TTS")
         await message.answer("⚠️ Не удалось озвучить ответ.")
         return
+    finally:
+        await cost_tracker.release_reservation(user_id)
     audio = BufferedInputFile(speech.audio, filename=speech.filename)
     # MP3 (ElevenLabs) — как audio; OGG — как voice-bubble.
     if speech.mime_type == "audio/mpeg" or speech.filename.casefold().endswith(".mp3"):
@@ -775,8 +777,7 @@ async def _process_user_message(
     bind_request_context(user_id=user_id, chat_id=chat_id)
     set_billing_user(user_id)
     note_active_user(user_id)
-    sentry_sdk.set_user({"id": str(user_id)})
-    sentry_sdk.set_context("chat", {"id": chat_id, "type": message.chat.type})
+    # Intentionally omit Telegram user/chat IDs from Sentry (send_default_pii=False).
     media_token = set_user_media(user_media or [])
     upload_ctx_token = set_upload_request_context(
         UploadRequestContext(chat_id=chat_id, user_id=user_id)
@@ -807,10 +808,12 @@ async def _process_user_message(
             chat_id, profile.id, user_text, topic_id, topic_storage, profile
         )
     except AssistantStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_upload_request_context(upload_ctx_token)
         await _reply_profile_error(message)
         return
     except TopicStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_upload_request_context(upload_ctx_token)
         await _reply_history_error(message)
         return
@@ -920,6 +923,7 @@ async def _process_user_message(
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_INTERNAL, state)
     finally:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
         observe_message(input_kind, time.perf_counter() - started)
@@ -1085,7 +1089,18 @@ async def _process_s3_upload_session(
     )
     data: bytes | None = None
     try:
-        data = await storage.download_bytes(object_key)
+        max_bytes = storage.config.max_upload_mb * 1024 * 1024
+        data = await storage.download_bytes(object_key, max_bytes=max_bytes)
+        from app.media.file_magic import mime_compatible
+
+        if not mime_compatible(filename=filename, claimed_mime=mime_type, head=data[:64]):
+            await bot.send_message(
+                chat_id, "Файл отклонён: содержимое не соответствует типу."
+            )
+            session.status = "failed"
+            session.error = "mime_mismatch"
+            await store.update(session)
+            return
         kind = _infer_upload_media_kind(
             mime_type=mime_type,
             filename=filename,
@@ -1251,6 +1266,16 @@ async def _process_vision_message(
 ) -> None:
     """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
     chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else chat_id
+    set_billing_user(user_id)
+    try:
+        await cost_tracker.check_budget(
+            user_id,
+            cost_tracker.estimate_chat_cost(input_chars=1200, output_chars=500),
+        )
+    except BudgetExceededError as exc:
+        await message.answer(exc.message)
+        return
     media_token = set_user_media(user_media or [])
     try:
         profile = await _active_profile(chat_id, assistant_storage)
@@ -1265,10 +1290,12 @@ async def _process_vision_message(
             profile,
         )
     except AssistantStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         await _reply_profile_error(message)
         return
     except TopicStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         await _reply_history_error(message)
         return
@@ -1377,6 +1404,7 @@ async def _process_vision_message(
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
     finally:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         _release_outgoing(keep)
 
@@ -1928,6 +1956,8 @@ async def _generate_and_send(
         logger.exception("Непредвиденная ошибка генерации изображения")
         await _delete_bot_message(progress)
         await message.answer(MSG_INTERNAL, reply_markup=reply_markup)
+    finally:
+        await cost_tracker.release_reservation(user_id)
 
 
 async def _open_settings(

@@ -64,6 +64,8 @@ cp .env.example .env   # минимум: TELEGRAM_BOT_TOKEN, PROXYAPI_API_KEY
 docker compose up -d --build
 ```
 
+На VPS после публикации в GHCR: в `.env` задать `APP_IMAGE=ghcr.io/<owner>/<repo>:latest`, затем `docker compose pull && docker compose up -d` (без `--build`).
+
 По умолчанию поднимаются `redis` + `bot`; image/TTS/STT выполняются **в процессе бота** (`ARQ_ENABLED=0`). Очередь arq — опционально:
 
 ```bash
@@ -75,6 +77,8 @@ docker compose --profile arq up -d --build
 Локально без Docker: `python -m venv .venv`, активировать, `pip install -r requirements.txt`, заполнить `.env`, `python -m app.bot` (для истории удобен `docker compose up -d redis`).
 
 Тесты: `pytest tests/ -v`.
+
+Документы: [privacy/retention](app/docs/privacy-and-retention.md), [ops runbook](app/docs/ops-runbook.md), [Polza media](app/docs/polza-media-contract.md).
 
 ## Результат
 

@@ -59,6 +59,32 @@ async def test_reserve_then_record_does_not_double_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_reservation_clears_failed_hold() -> None:
+    tracker = CostTracker()
+    tracker.daily_budget = 1.0
+    tracker.user_daily_budget = 0.5
+    await tracker.check_budget(9, estimated=0.2)
+    released = await tracker.release_reservation(9)
+    day = tracker._day_key()
+    assert released == pytest.approx(0.2)
+    assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.0)
+    assert await tracker._get(f"cost:user:9:day:{day}") == pytest.approx(0.0)
+    await tracker.check_budget(9, estimated=0.4)
+
+
+@pytest.mark.asyncio
+async def test_release_after_record_is_noop() -> None:
+    tracker = CostTracker()
+    tracker.daily_budget = 1.0
+    tracker.user_daily_budget = 0
+    await tracker.check_budget(1, estimated=0.2)
+    await tracker.record(kind="chat", amount_usd=0.11, user_id=1)
+    assert await tracker.release_reservation(1) == 0.0
+    day = tracker._day_key()
+    assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.11)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_budget_reservations_cap(fakeredis_client) -> None:
     import asyncio
 

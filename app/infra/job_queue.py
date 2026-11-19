@@ -74,6 +74,14 @@ def is_queue_enabled() -> bool:
     return _enabled and _pool is not None
 
 
+def _billing_user_id(explicit: int | None = None) -> int | None:
+    if explicit is not None:
+        return explicit
+    from app.infra.cost_tracker import get_billing_user
+
+    return get_billing_user()
+
+
 async def generate_image(
     assistant: Any,
     prompt: str,
@@ -81,8 +89,10 @@ async def generate_image(
     size: str,
     *,
     timeout: float = 180.0,
+    billing_user_id: int | None = None,
 ) -> list[str]:
     """Generate an image via arq worker or inline client."""
+    user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled():
         assert _pool is not None
         job = await _pool.enqueue_job(
@@ -90,6 +100,7 @@ async def generate_image(
             prompt,
             model,
             size,
+            user_id,
         )
         if job is None:
             logger.warning("arq_enqueue_skipped_inline", task="generate_image_task")
@@ -109,8 +120,10 @@ async def edit_images(
     labels: list[str] | None = None,
     size: str | None = None,
     timeout: float = 180.0,
+    billing_user_id: int | None = None,
 ) -> list[str]:
     """Правит фото через arq (байты в Redis) или сразу в процессе."""
+    user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled() and _pool is not None:
         key = f"arq:edit:{uuid.uuid4().hex}"
         payload = [
@@ -130,22 +143,35 @@ async def edit_images(
                 model,
                 labels,
                 size,
+                user_id,
             )
-            if job is None:
-                await _pool.delete(key)
-                logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
-                return await assistant.edit_images(
-                    files, prompt, model=model, labels=labels, size=size
-                )
-            logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
-            result = await job.result(timeout=timeout)
-            return list(result)
         except Exception as exc:
-            logger.warning("arq_edit_failed_inline", error=str(exc))
+            logger.warning("arq_edit_enqueue_failed", error=str(exc))
             try:
                 await _pool.delete(key)
             except Exception:
                 pass
+            return await assistant.edit_images(
+                files, prompt, model=model, labels=labels, size=size
+            )
+        if job is None:
+            await _pool.delete(key)
+            logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
+            return await assistant.edit_images(
+                files, prompt, model=model, labels=labels, size=size
+            )
+        logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
+        try:
+            result = await job.result(timeout=timeout)
+            return list(result)
+        except Exception as exc:
+            # Job was accepted; do not re-run inline (non-idempotent / paid).
+            logger.warning("arq_edit_failed", error=str(exc), job_id=job.job_id)
+            try:
+                await _pool.delete(key)
+            except Exception:
+                pass
+            raise
     return await assistant.edit_images(
         files, prompt, model=model, labels=labels, size=size
     )
@@ -160,8 +186,10 @@ async def synthesize_speech(
     response_format: str | None = None,
     role: str | None = None,
     timeout: float = 120.0,
+    billing_user_id: int | None = None,
 ) -> Any:
     """Run TTS via arq or inline. Returns ``SpeechResult``-like object."""
+    user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled():
         assert _pool is not None
         job = await _pool.enqueue_job(
@@ -171,6 +199,7 @@ async def synthesize_speech(
             voice,
             response_format,
             role,
+            user_id,
         )
         if job is None:
             return await assistant.synthesize_speech(
@@ -208,8 +237,10 @@ async def transcribe_audio(
     model: str | None = None,
     language: str | None = None,
     timeout: float = 120.0,
+    billing_user_id: int | None = None,
 ) -> str:
     """Run STT via arq (bytes staged in Redis) or inline."""
+    user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled() and _pool is not None:
         key = f"arq:stt:{uuid.uuid4().hex}"
         try:
@@ -220,25 +251,41 @@ async def transcribe_audio(
                 filename,
                 model,
                 language,
+                user_id,
             )
-            if job is None:
-                await _pool.delete(key)
-                return await assistant.transcribe_audio(
-                    audio_bytes,
-                    filename=filename,
-                    model=model,
-                    language=language,
-                )
-            logger.info(
-                "arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id
-            )
-            return str(await job.result(timeout=timeout))
         except Exception as exc:
-            logger.warning("arq_stt_failed_inline", error=str(exc))
+            logger.warning("arq_stt_enqueue_failed", error=str(exc))
             try:
                 await _pool.delete(key)
             except Exception:
                 pass
+            return await assistant.transcribe_audio(
+                audio_bytes,
+                filename=filename,
+                model=model,
+                language=language,
+            )
+        if job is None:
+            await _pool.delete(key)
+            return await assistant.transcribe_audio(
+                audio_bytes,
+                filename=filename,
+                model=model,
+                language=language,
+            )
+        logger.info(
+            "arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id
+        )
+        try:
+            return str(await job.result(timeout=timeout))
+        except Exception as exc:
+            # Job accepted — do not duplicate STT inline after timeout/failure.
+            logger.warning("arq_stt_failed", error=str(exc), job_id=job.job_id)
+            try:
+                await _pool.delete(key)
+            except Exception:
+                pass
+            raise
     return await assistant.transcribe_audio(
         audio_bytes,
         filename=filename,

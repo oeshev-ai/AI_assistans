@@ -4,8 +4,29 @@ from __future__ import annotations
 
 import os
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_LOCAL_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def require_secure_base_url(value: str) -> str:
+    """Normalize provider base URL; ban cleartext remote URLs in production."""
+    normalized = value.strip().rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        raise ValueError("base_url должен начинаться с http:// или https://")
+    if normalized.startswith("http://"):
+        host = (urlparse(normalized).hostname or "").casefold()
+        if host not in _LOCAL_HTTP_HOSTS:
+            from app.infra.access import is_production
+
+            if is_production():
+                raise ValueError(
+                    "base_url должен использовать https:// в production "
+                    "(http:// разрешён только для localhost)"
+                )
+    return normalized
 
 
 class ProviderConfig(BaseModel):
@@ -27,10 +48,7 @@ class ProviderConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
-        normalized = value.strip().rstrip("/")
-        if not normalized.startswith(("http://", "https://")):
-            raise ValueError("base_url должен начинаться с http:// или https://")
-        return normalized
+        return require_secure_base_url(value)
 
     @field_validator("capabilities", mode="before")
     @classmethod

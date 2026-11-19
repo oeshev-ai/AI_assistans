@@ -93,3 +93,13 @@ def fallback_reason(exc: AssistAIError) -> str | None:
     if status >= 500:
         return "http_5xx"
     return None
+
+
+def counts_toward_circuit(exc: AssistAIError) -> bool:
+    """True if the error should open/trip a provider circuit breaker.
+
+    Client 4xx and rate limits do not indicate provider outage; only
+    availability-class failures (5xx, timeouts, network, balance, etc.).
+    """
+    reason = fallback_reason(exc)
+    return reason is not None and reason != "rate_limited"

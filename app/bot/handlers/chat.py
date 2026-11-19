@@ -189,6 +189,8 @@ async def handle_voice(
         await R._edit_stream(status, MSG_INTERNAL, "")
         await R._append_chrome(state, [status.message_id])
         return
+    finally:
+        await cost_tracker.release_reservation(user_id)
     logger.info(
         "Распознано, chat_id=%s duration=%s size=%s chars=%s",
         chat_id,

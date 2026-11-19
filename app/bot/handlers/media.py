@@ -197,18 +197,13 @@ async def handle_photo(
     state: FSMContext,
     pending_media: PendingMediaStorage,
 ) -> None:
-    """Кладёт фото в буфер альбома. Разбор намерения — после паузы или сразу."""
+    """Кладёт фото в буфер альбома. Разбор намерения — после паузы или сразу.
+
+    Text rate limit is consumed once in ``route_album`` on flush, not per photo.
+    """
     if not message.photo:
         return
     if await state.get_state() is not None:
-        return
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    if not await rate_limiter.check_text_limit(user_id):
-        retry_after = await rate_limiter.get_retry_after(user_id, "text")
-        await message.answer(
-            f"⏳ Слишком много запросов. Подождите {int(retry_after) or 60} секунд."
-        )
-        logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
         return
     photo = incoming_from_message(message)
     if photo is None:

@@ -55,6 +55,7 @@ class AsyncCircuitBreaker:
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._opened_at = 0.0
+        self._half_open_permits = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -62,12 +63,17 @@ class AsyncCircuitBreaker:
         return self._state
 
     async def ensure_allows_call(self) -> None:
-        """Raise ``CircuitBreakerError`` if the circuit is currently open."""
+        """Raise ``CircuitBreakerError`` if the circuit is open or probe taken."""
         async with self._lock:
             self._maybe_half_open()
             if self._state == CircuitState.OPEN:
                 logger.error("circuit_open", circuit=self.name)
                 raise CircuitBreakerError(f"Circuit '{self.name}' is open")
+            if self._state == CircuitState.HALF_OPEN:
+                if self._half_open_permits <= 0:
+                    logger.error("circuit_open", circuit=self.name, reason="probe_busy")
+                    raise CircuitBreakerError(f"Circuit '{self.name}' is open")
+                self._half_open_permits -= 1
 
     async def call(
         self, func: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
@@ -88,6 +94,7 @@ class AsyncCircuitBreaker:
             return
         if time.monotonic() - self._opened_at >= self.recovery_timeout:
             self._state = CircuitState.HALF_OPEN
+            self._half_open_permits = 1
             logger.info("circuit_half_open", circuit=self.name)
 
     async def _on_success(self) -> None:
@@ -95,6 +102,7 @@ class AsyncCircuitBreaker:
             if self._state != CircuitState.CLOSED:
                 logger.info("circuit_closed", circuit=self.name)
             self._failure_count = 0
+            self._half_open_permits = 0
             self._state = CircuitState.CLOSED
 
     async def _on_failure(self, exc: BaseException) -> None:
@@ -113,6 +121,7 @@ class AsyncCircuitBreaker:
             ):
                 self._state = CircuitState.OPEN
                 self._opened_at = time.monotonic()
+                self._half_open_permits = 0
                 logger.error("circuit_opened", circuit=self.name)
 
 

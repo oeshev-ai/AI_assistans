@@ -419,6 +419,38 @@ class CostTracker:
             spent = await self._get(day_key)
             LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
 
+    async def release_reservation(self, user_id: int | None = None) -> float:
+        """Drop a pending ``check_budget`` hold without charging spend.
+
+        Safe to call when nothing is reserved (no-op). Call from ``finally``
+        after any path that may exit without ``record``.
+        """
+        if user_id is None:
+            user_id = get_billing_user()
+        reserved = _reserved_usd.get()
+        if reserved <= 0:
+            return 0.0
+        _reserved_usd.set(0.0)
+        day = self._day_key()
+        ttl = 3 * 86400
+        if self.daily_budget > 0:
+            await self._incr(f"cost:day:{day}", -reserved, ttl_seconds=ttl)
+        if user_id is not None and self.user_daily_budget > 0:
+            await self._incr(
+                f"cost:user:{user_id}:day:{day}",
+                -reserved,
+                ttl_seconds=ttl,
+            )
+        if self.daily_budget > 0:
+            spent = await self._get(f"cost:day:{day}")
+            LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
+        logger.info(
+            "llm_reservation_released",
+            amount_usd=round(reserved, 6),
+            user_id=user_id,
+        )
+        return reserved
+
     async def record(
         self,
         *,
