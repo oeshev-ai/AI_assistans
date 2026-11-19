@@ -759,6 +759,20 @@ async def _send_voice_reply(
             logger.warning("Не удалось отправить озвучку: %s", nested)
 
 
+_chat_turn_locks: dict[int, asyncio.Lock] = {}
+_chat_turn_locks_guard = asyncio.Lock()
+
+
+async def _chat_turn_lock(chat_id: int) -> asyncio.Lock:
+    """Serialize concurrent turns in one chat to protect history RMW."""
+    async with _chat_turn_locks_guard:
+        lock = _chat_turn_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _chat_turn_locks[chat_id] = lock
+        return lock
+
+
 async def _process_user_message(
     message: Message,
     assistant: AssistAIClient,
@@ -771,6 +785,34 @@ async def _process_user_message(
     user_media: list[UserMedia] | None = None,
 ) -> None:
     """Общий pipeline текста и распознанного голоса в активной теме."""
+    chat_id = message.chat.id
+    turn_lock = await _chat_turn_lock(chat_id)
+    async with turn_lock:
+        await _process_user_message_locked(
+            message,
+            assistant,
+            topic_storage,
+            assistant_storage,
+            state,
+            user_text=user_text,
+            input_kind=input_kind,
+            status=status,
+            user_media=user_media,
+        )
+
+
+async def _process_user_message_locked(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+    user_text: str,
+    input_kind: InputKind = "text",
+    status: Message | None = None,
+    user_media: list[UserMedia] | None = None,
+) -> None:
+    """History-mutating body of ``_process_user_message`` (caller holds chat lock)."""
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     started = time.perf_counter()
@@ -1060,6 +1102,25 @@ def _infer_upload_media_kind(*, mime_type: str, filename: str, preferred: str) -
     return "audio"
 
 
+_upload_process_sem: asyncio.Semaphore | None = None
+
+
+def _upload_process_semaphore() -> asyncio.Semaphore:
+    """Limit concurrent large-upload STT jobs to bound RAM pressure."""
+    global _upload_process_sem
+    if _upload_process_sem is None:
+        from app.infra.envparse import env_int
+
+        _upload_process_sem = asyncio.Semaphore(max(1, env_int("UPLOAD_MAX_CONCURRENT", 2)))
+    return _upload_process_sem
+
+
+def _estimate_upload_stt_cost(*, file_size: int | None, max_upload_mb: int) -> float:
+    """Rough STT estimate from payload size (~4 KB/s), matching media_tools."""
+    size_hint = file_size if file_size and file_size > 0 else max_upload_mb * 1024 * 1024
+    return cost_tracker.estimate_stt_cost(max(15.0, size_hint / 4000.0))
+
+
 async def _process_s3_upload_session(
     *,
     bot: Bot,
@@ -1072,6 +1133,7 @@ async def _process_s3_upload_session(
 ) -> None:
     """Скачивает объект из бакета и делает STT → transcript.txt в чат."""
     chat_id = session.chat_id
+    user_id = session.user_id
     object_key = session.object_key
     filename = session.filename or "media.bin"
     mime_type = session.mime_type or "application/octet-stream"
@@ -1084,11 +1146,44 @@ async def _process_s3_upload_session(
         await store.update(session)
         return
 
-    status_msg = await bot.send_message(
-        chat_id, f"Файл «{filename}» получен. Расшифровываю…"
-    )
+    from app.infra.rate_limiter import rate_limiter
+
+    sem = _upload_process_semaphore()
+    await sem.acquire()
     data: bytes | None = None
+    status_msg: Message | None = None
+    reserved = False
     try:
+        set_billing_user(user_id)
+        if not await rate_limiter.check_media_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "media")
+            await bot.send_message(
+                chat_id,
+                f"⏳ Слишком много медиа-запросов. Подождите "
+                f"{int(retry_after) or 60} секунд и загрузите файл снова.",
+            )
+            session.status = "failed"
+            session.error = "rate_limited"
+            await store.update(session)
+            return
+
+        estimated = _estimate_upload_stt_cost(
+            file_size=session.file_size,
+            max_upload_mb=storage.config.max_upload_mb,
+        )
+        try:
+            await cost_tracker.check_budget(user_id, estimated)
+            reserved = True
+        except BudgetExceededError as exc:
+            await bot.send_message(chat_id, exc.message)
+            session.status = "failed"
+            session.error = "budget_exceeded"
+            await store.update(session)
+            return
+
+        status_msg = await bot.send_message(
+            chat_id, f"Файл «{filename}» получен. Расшифровываю…"
+        )
         max_bytes = storage.config.max_upload_mb * 1024 * 1024
         data = await storage.download_bytes(object_key, max_bytes=max_bytes)
         from app.media.file_magic import mime_compatible
@@ -1113,6 +1208,7 @@ async def _process_s3_upload_session(
             filename=filename,
             is_video=kind == "video",
         )
+        data = None  # free full object before paid STT round-trips
         parts: list[str] = []
         for audio_bytes, chunk_name in chunks:
             text = await job_queue.transcribe_audio(
@@ -1120,10 +1216,17 @@ async def _process_s3_upload_session(
                 audio_bytes,
                 filename=chunk_name,
                 language=None,
+                billing_user_id=user_id,
             )
             if text:
                 parts.append(text)
         transcript = "\n\n".join(parts).strip()
+        await cost_tracker.record(
+            kind="stt",
+            amount_usd=estimated,
+            user_id=user_id,
+        )
+        reserved = False
         await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
         session.prompt_message_ids = None
         await store.update(session)
@@ -1141,10 +1244,11 @@ async def _process_s3_upload_session(
             ),
             caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
         )
-        try:
-            await status_msg.delete()
-        except Exception:
-            logger.debug("upload_status_delete_failed", chat_id=chat_id)
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                logger.debug("upload_status_delete_failed", chat_id=chat_id)
 
         # Короткая запись в историю активной темы.
         try:
@@ -1201,6 +1305,9 @@ async def _process_s3_upload_session(
         await store.update(session)
     finally:
         data = None
+        if reserved:
+            await cost_tracker.release_reservation(user_id)
+        sem.release()
         try:
             await storage.delete_object(object_key)
         except Exception:
@@ -1267,6 +1374,35 @@ async def _process_vision_message(
     user_media: list[UserMedia] | None = None,
 ) -> None:
     """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
+    chat_id = message.chat.id
+    turn_lock = await _chat_turn_lock(chat_id)
+    async with turn_lock:
+        await _process_vision_message_locked(
+            message,
+            assistant,
+            topic_storage,
+            assistant_storage,
+            state,
+            multimodal_content=multimodal_content,
+            history_placeholder=history_placeholder,
+            status_text=status_text,
+            user_media=user_media,
+        )
+
+
+async def _process_vision_message_locked(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+    *,
+    multimodal_content: list[dict[str, Any]],
+    history_placeholder: str,
+    status_text: str = "Анализирую изображение…",
+    user_media: list[UserMedia] | None = None,
+) -> None:
+    """History-mutating body of ``_process_vision_message`` (caller holds chat lock)."""
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     set_billing_user(user_id)

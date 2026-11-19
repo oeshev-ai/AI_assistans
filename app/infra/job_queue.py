@@ -82,17 +82,42 @@ def _billing_user_id(explicit: int | None = None) -> int | None:
     return get_billing_user()
 
 
+def image_result_timeout(explicit: float | None = None) -> float:
+    """Wait for queued image jobs at least as long as Polza poll budget.
+
+    Default used to be 180s while ``POLZA_TOTAL_WAIT`` is 240s, so the bot could
+    give up before a paid worker result arrived.
+    """
+    if explicit is not None:
+        return explicit
+    from app.infra.envparse import env_float
+
+    polza_wait = env_float("POLZA_TOTAL_WAIT", 240.0)
+    arq_timeout = env_float("ARQ_JOB_TIMEOUT", 300.0)
+    needed = max(180.0, polza_wait + 30.0)
+    if arq_timeout > 0 and arq_timeout < needed:
+        logger.warning(
+            "arq_image_timeout_below_polza_wait",
+            arq_job_timeout=arq_timeout,
+            polza_total_wait=polza_wait,
+            needed=needed,
+        )
+        return arq_timeout
+    return needed
+
+
 async def generate_image(
     assistant: Any,
     prompt: str,
     model: str | None,
     size: str,
     *,
-    timeout: float = 180.0,
+    timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> list[str]:
     """Generate an image via arq worker or inline client."""
     user_id = _billing_user_id(billing_user_id)
+    wait = image_result_timeout(timeout)
     if is_queue_enabled():
         assert _pool is not None
         job = await _pool.enqueue_job(
@@ -106,7 +131,7 @@ async def generate_image(
             logger.warning("arq_enqueue_skipped_inline", task="generate_image_task")
             return await assistant.generate_image(prompt=prompt, model=model, size=size)
         logger.info("arq_job_enqueued", task="generate_image_task", job_id=job.job_id)
-        result = await job.result(timeout=timeout)
+        result = await job.result(timeout=wait)
         return list(result)
     return await assistant.generate_image(prompt=prompt, model=model, size=size)
 
@@ -119,11 +144,12 @@ async def edit_images(
     model: str | None = None,
     labels: list[str] | None = None,
     size: str | None = None,
-    timeout: float = 180.0,
+    timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> list[str]:
     """Правит фото через arq (байты в Redis) или сразу в процессе."""
     user_id = _billing_user_id(billing_user_id)
+    wait = image_result_timeout(timeout)
     if is_queue_enabled() and _pool is not None:
         key = f"arq:edit:{uuid.uuid4().hex}"
         payload = [
@@ -162,7 +188,7 @@ async def edit_images(
             )
         logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
         try:
-            result = await job.result(timeout=timeout)
+            result = await job.result(timeout=wait)
             return list(result)
         except Exception as exc:
             # Job was accepted; do not re-run inline (non-idempotent / paid).

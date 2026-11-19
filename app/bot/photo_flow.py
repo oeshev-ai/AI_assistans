@@ -121,11 +121,12 @@ async def consume_pending_text(
         profile = await R._active_profile(message.chat.id, assistant_storage)
     except Exception:
         return False
-    media = await pending.get(message.chat.id, profile.id)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    media = await pending.get(message.chat.id, profile.id, user_id)
     if media is None or not media.items:
         return False
     if text.casefold() in _CANCEL:
-        await pending.pop(message.chat.id, profile.id)
+        await pending.pop(message.chat.id, profile.id, user_id)
         await message.answer("Отменено.")
         await R._reset_flow(state)
         return True
@@ -224,7 +225,7 @@ async def _execute(
         await _unclear(turn, media, decision)
         return
     if decision.intent == "chat":
-        await turn.pending.pop(media.chat_id, media.assistant_id)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         text = media.caption.strip() or (decision.instruction_ru or "")
         if text:
             await R._process_user_message(
@@ -239,7 +240,7 @@ async def _execute(
         return
     if decision.intent in {"analyze", "ocr", "compare"}:
         await _analyze(turn, media, loaded, decision)
-        await turn.pending.pop(media.chat_id, media.assistant_id)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await R._reset_flow(turn.state)
         return
     if decision.intent == "generate":
@@ -250,7 +251,7 @@ async def _execute(
 
 async def _unclear(turn: Any, media: PendingMedia, decision: PhotoDecision) -> None:
     if media.clarify_rounds >= max_clarify_rounds():
-        await turn.pending.pop(media.chat_id, media.assistant_id)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await turn.message.answer("Опишите, что сделать, одним сообщением.")
         await R._reset_flow(turn.state)
         return
@@ -258,7 +259,7 @@ async def _unclear(turn: Any, media: PendingMedia, decision: PhotoDecision) -> N
         "Опишите, что сделать с фото одним сообщением."
     )
     await turn.message.answer(question)
-    await turn.pending.bump_round(media.chat_id, media.assistant_id, question)
+    await turn.pending.bump_round(media.chat_id, media.assistant_id, media.user_id, question)
 
 
 async def _analyze(
@@ -397,7 +398,7 @@ async def _edit(
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
-        await turn.pending.pop(media.chat_id, media.assistant_id)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await R._reset_flow(turn.state)
 
 
@@ -497,7 +498,7 @@ async def _generate(
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
-        await turn.pending.pop(media.chat_id, media.assistant_id)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await R._reset_flow(turn.state)
 
 

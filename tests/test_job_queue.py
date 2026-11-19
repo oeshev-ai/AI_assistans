@@ -55,6 +55,23 @@ def test_redis_settings_empty_password_is_none() -> None:
     assert settings.host == "redis"
 
 
+def test_image_result_timeout_covers_polza_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
+    assert job_queue.image_result_timeout() == pytest.approx(270.0)
+    assert job_queue.image_result_timeout(120.0) == pytest.approx(120.0)
+
+
+def test_image_result_timeout_caps_at_arq_job_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "200")
+    assert job_queue.image_result_timeout() == pytest.approx(200.0)
+
+
 @pytest.mark.asyncio
 async def test_synthesize_speech_inline() -> None:
     await job_queue.close_job_queue()

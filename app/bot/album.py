@@ -12,6 +12,8 @@ import structlog
 
 logger = structlog.get_logger("album")
 
+AlbumKey = tuple[int, int, str]  # chat_id, user_id, media_group_id
+
 
 def album_debounce_seconds() -> float:
     raw = os.getenv("ALBUM_DEBOUNCE_SECONDS", "1.2").strip()
@@ -104,8 +106,12 @@ ReadyCallback = Callable[[AlbumBuild, Any], Awaitable[None]]
 class AlbumHub:
     """Копит media_group_id и сбрасывает пачку после паузы.
 
-    Одиночное фото обрабатывается сразу и отменяет открытый буфер чата.
-    Текст во время паузы сбрасывает буфер и становится инструкцией.
+    Одиночное фото обрабатывается сразу и отменяет открытый буфер
+    того же пользователя в чате. Текст во время паузы сбрасывает
+    буфер пользователя и становится инструкцией.
+
+    Ключ включает ``user_id``, чтобы в группах чужой текст/фото не
+    трогали чужой альбом.
 
     Буфер process-local: при нескольких репликах бота альбом может
     разъехаться по процессам. Держите один экземпляр ``bot`` (без
@@ -114,17 +120,25 @@ class AlbumHub:
 
     def __init__(self, debounce: float | None = None) -> None:
         self.debounce = album_debounce_seconds() if debounce is None else debounce
-        self._buf: dict[tuple[int, str], list[IncomingPhoto]] = {}
-        self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
-        self._latest: dict[tuple[int, str], Any] = {}
+        self._buf: dict[AlbumKey, list[IncomingPhoto]] = {}
+        self._tasks: dict[AlbumKey, asyncio.Task[None]] = {}
+        self._latest: dict[AlbumKey, Any] = {}
         self._lock = asyncio.Lock()
 
-    def _keys_for(self, chat_id: int) -> list[tuple[int, str]]:
-        return [key for key in self._buf if key[0] == chat_id]
+    def _keys_for(self, chat_id: int, user_id: int | None = None) -> list[AlbumKey]:
+        return [
+            key
+            for key in self._buf
+            if key[0] == chat_id and (user_id is None or key[1] == user_id)
+        ]
 
-    def _cancel_chat_unlocked(self, chat_id: int) -> bool:
-        """Сброс буфера. Вызывать только под ``self._lock``."""
-        keys = self._keys_for(chat_id)
+    def has_pending(self, chat_id: int, user_id: int) -> bool:
+        """True if this user has an open album debounce buffer in the chat."""
+        return any(key[0] == chat_id and key[1] == user_id for key in self._buf)
+
+    def _cancel_user_unlocked(self, chat_id: int, user_id: int) -> bool:
+        """Сброс буфера пользователя. Вызывать только под ``self._lock``."""
+        keys = self._keys_for(chat_id, user_id)
         if not keys:
             return False
         for key in keys:
@@ -135,14 +149,26 @@ class AlbumHub:
                 task.cancel()
         return True
 
-    async def cancel_chat(self, chat_id: int) -> bool:
+    async def cancel_chat(self, chat_id: int, user_id: int | None = None) -> bool:
         """Сбрасывает открытый буфер, не вызывая обработчик."""
         async with self._lock:
-            return self._cancel_chat_unlocked(chat_id)
+            if user_id is None:
+                keys = self._keys_for(chat_id)
+                if not keys:
+                    return False
+                for key in keys:
+                    self._buf.pop(key, None)
+                    self._latest.pop(key, None)
+                    task = self._tasks.pop(key, None)
+                    if task is not None and not task.done():
+                        task.cancel()
+                return True
+            return self._cancel_user_unlocked(chat_id, user_id)
 
     async def add(
         self,
         chat_id: int,
+        user_id: int,
         group_id: str | None,
         photo: IncomingPhoto,
         services: Any,
@@ -150,20 +176,20 @@ class AlbumHub:
     ) -> None:
         if group_id is None:
             async with self._lock:
-                self._cancel_chat_unlocked(chat_id)
+                self._cancel_user_unlocked(chat_id, user_id)
             built = assemble_album([photo])
             await on_ready(built, services)
             return
         async with self._lock:
-            for key in self._keys_for(chat_id):
-                if key[1] == group_id:
+            for key in self._keys_for(chat_id, user_id):
+                if key[2] == group_id:
                     continue
                 self._buf.pop(key, None)
                 self._latest.pop(key, None)
                 task = self._tasks.pop(key, None)
                 if task is not None and not task.done():
                     task.cancel()
-            key = (chat_id, group_id)
+            key = (chat_id, user_id, group_id)
             self._buf.setdefault(key, []).append(photo)
             self._latest[key] = services
             previous = self._tasks.get(key)
@@ -172,11 +198,15 @@ class AlbumHub:
             self._tasks[key] = asyncio.create_task(self._fire(key, on_ready))
 
     async def flush_text(
-        self, chat_id: int, text: str, on_ready: ReadyCallback
+        self,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        on_ready: ReadyCallback,
     ) -> bool:
-        """Если буфер открыт, закрывает его и отдаёт ``text`` как инструкцию."""
+        """Если буфер пользователя открыт, закрывает его и отдаёт ``text`` как инструкцию."""
         async with self._lock:
-            keys = self._keys_for(chat_id)
+            keys = self._keys_for(chat_id, user_id)
             if not keys:
                 return False
             batches: list[tuple[list[IncomingPhoto], Any]] = []
@@ -196,7 +226,7 @@ class AlbumHub:
             delivered = True
         return delivered
 
-    async def _fire(self, key: tuple[int, str], on_ready: ReadyCallback) -> None:
+    async def _fire(self, key: AlbumKey, on_ready: ReadyCallback) -> None:
         try:
             await asyncio.sleep(self.debounce)
         except asyncio.CancelledError:
@@ -211,13 +241,14 @@ class AlbumHub:
         logger.info(
             "album_flushed",
             chat_id=key[0],
+            user_id=key[1],
             count=len(built.photos),
             trimmed=built.notice is not None,
         )
         try:
             await on_ready(built, services)
         except Exception:
-            logger.exception("album_flush_failed", chat_id=key[0])
+            logger.exception("album_flush_failed", chat_id=key[0], user_id=key[1])
 
 
 _hub: AlbumHub | None = None

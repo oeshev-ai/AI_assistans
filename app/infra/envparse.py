@@ -29,3 +29,21 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("env_float_invalid", name=name, value=raw, default=default)
         return default
+
+
+def ensure_https_url(url: str, *, name: str, default: str) -> str:
+    """Return ``url`` or ``default``; in production reject non-HTTPS endpoints."""
+    cleaned = (url or "").strip() or default
+    if cleaned.lower().startswith("https://"):
+        return cleaned
+    from app.infra.access import is_production
+
+    if is_production():
+        logger.error("https_url_required_in_production", name=name, value=cleaned)
+        raise SystemExit(1)
+    logger.warning(
+        "insecure_url_allowed_outside_production",
+        name=name,
+        value=cleaned,
+    )
+    return cleaned

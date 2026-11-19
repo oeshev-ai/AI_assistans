@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 import structlog
 
-from app.infra.cost_tracker import cost_tracker
+from app.infra.cost_tracker import cost_tracker, isolated_budget_reservation
 from app.llm.errors import AssistAIError
 from app.llm.tooling import ToolRegistry
 from app.llm.transport import _CHAT_PATH, ProviderTransportMixin
@@ -25,6 +25,12 @@ def _as_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+async def _execute_tool_isolated(tools: ToolRegistry, call: dict[str, Any]) -> str:
+    """Run one tool without inheriting the parent turn's budget reservation."""
+    async with isolated_budget_reservation():
+        return await tools.execute(call)
 
 
 def _reasoning_piece(delta: dict[str, Any]) -> str:
@@ -250,8 +256,8 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 len(messages),
             )
             data = await self._post_json(_CHAT_PATH, payload)
-            await self._record_chat_usage(data, messages)
             message, finish_reason = self._extract_choice(data)
+            await self._record_chat_usage(data, messages, assistant_message=message)
             raw_tool_calls = message.get("tool_calls") or []
             tool_calls = [
                 self._tools.normalize_tool_call(call)
@@ -270,7 +276,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 logger.info("Модель запросила инструменты: %s", names)
                 messages.append(self._tools.assistant_tool_message(message, tool_calls))
                 results = await asyncio.gather(
-                    *(self._tools.execute(call) for call in tool_calls)
+                    *(_execute_tool_isolated(self._tools, call) for call in tool_calls)
                 )
                 for call, result in zip(tool_calls, results, strict=True):
                     messages.append(
@@ -423,8 +429,17 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                         reasoning_text, content_text, tool_calls
                     )
                 )
+                # Charge the tool-calling round; final answer is billed separately.
+                await self._record_chat_estimate(
+                    messages,
+                    content_text
+                    or " ".join(
+                        str(call["function"].get("arguments") or "")
+                        for call in tool_calls
+                    ),
+                )
                 results = await asyncio.gather(
-                    *(self._tools.execute(call) for call in tool_calls)
+                    *(_execute_tool_isolated(self._tools, call) for call in tool_calls)
                 )
                 for call, result in zip(tool_calls, results, strict=True):
                     name = str(call["function"]["name"])
@@ -465,7 +480,11 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         )
 
     async def _record_chat_usage(
-        self, data: dict[str, Any], messages: list[dict[str, Any]]
+        self,
+        data: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        assistant_message: dict[str, Any] | None = None,
     ) -> None:
         """Record spend from provider ``usage`` or a chars heuristic."""
         usage = data.get("usage") if isinstance(data, dict) else None
@@ -479,11 +498,20 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             if isinstance(raw_out, int):
                 completion_tokens = raw_out
         input_chars = sum(len(_as_text(m.get("content"))) for m in messages)
+        output_chars = 0
+        if completion_tokens is None and isinstance(assistant_message, dict):
+            output_chars = len(_as_text(assistant_message.get("content")))
+            for call in assistant_message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict):
+                    output_chars += len(str(function.get("arguments") or ""))
         amount = cost_tracker.estimate_chat_cost(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             input_chars=0 if prompt_tokens is not None else input_chars,
-            output_chars=0,
+            output_chars=0 if completion_tokens is not None else output_chars,
         )
         model_name = data.get("model") if isinstance(data, dict) else None
         await cost_tracker.record(

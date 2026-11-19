@@ -502,10 +502,15 @@ class RedisAssistantStorage(AssistantStorage):
 async def create_assistant_storage(config: RedisConfig) -> AssistantStorage:
     """Возвращает Redis, если ``REDIS_URL`` задан и сервер отвечает.
 
-    Пустой URL или недоступный Redis дают память процесса: бот стартует
-    и без общих профилей.
+    Пустой URL или недоступный Redis дают память процесса вне production.
+    В production — fail-closed (как FSM), без тихой деградации.
     """
+    from app.infra.access import is_production
+
     if not config.redis_url:
+        if is_production():
+            logger.error("assistant_redis_required_in_production")
+            raise SystemExit(1)
         logger.info(
             "REDIS_URL не задан, профили ассистентов хранятся в памяти процесса"
         )
@@ -515,11 +520,14 @@ async def create_assistant_storage(config: RedisConfig) -> AssistantStorage:
     try:
         await storage.ping()
     except AssistantStorageError as exc:
+        await storage.close()
+        if is_production():
+            logger.error("assistant_redis_failed_fatal", error=exc.message)
+            raise SystemExit(1) from exc
         logger.warning(
             "Redis недоступен, профили ассистентов переключены на память процесса: %s",
             exc.message,
         )
-        await storage.close()
         return InMemoryAssistantStorage()
     logger.info(
         "Профили ассистентов хранятся в Redis, ttl_days=%s", _ASSISTANT_TTL_DAYS

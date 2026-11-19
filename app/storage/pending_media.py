@@ -1,7 +1,8 @@
 """Отложенные фото: только file_id, без байтов.
 
-Ключ ``chat:{chat_id}:asst:{assistant_id}:pending_photo``. TTL по умолчанию 900 с.
-Пустой ``REDIS_URL`` или недоступный Redis — память процесса с тем же TTL.
+Ключ ``chat:{chat_id}:user:{user_id}:asst:{assistant_id}:pending_photo``.
+TTL по умолчанию 900 с. Пустой ``REDIS_URL`` или недоступный Redis —
+память процесса (в production при заданном Redis — fail-closed).
 """
 
 from __future__ import annotations
@@ -11,15 +12,16 @@ import json
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import structlog
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 logger = structlog.get_logger("pending_media")
 
-_KEY = "chat:{chat_id}:asst:{assistant_id}:pending_photo"
+_KEY = "chat:{chat_id}:user:{user_id}:asst:{assistant_id}:pending_photo"
 
 
 def pending_ttl_seconds() -> int:
@@ -56,6 +58,7 @@ class PendingMedia:
     """Альбом, который ждёт действие пользователя или ход модели."""
 
     chat_id: int
+    user_id: int
     assistant_id: str
     items: list[PendingMediaItem]
     caption: str = ""
@@ -70,6 +73,7 @@ class PendingMedia:
     def to_json(self) -> str:
         payload = {
             "chat_id": self.chat_id,
+            "user_id": self.user_id,
             "assistant_id": self.assistant_id,
             "caption": self.caption,
             "topic_id": self.topic_id,
@@ -120,6 +124,7 @@ class PendingMedia:
         question = data.get("last_question")
         return cls(
             chat_id=int(data.get("chat_id") or 0),
+            user_id=int(data.get("user_id") or 0),
             assistant_id=str(data.get("assistant_id") or ""),
             items=items,
             caption=str(data.get("caption") or ""),
@@ -141,56 +146,81 @@ class PendingMediaStorage(ABC):
         """Сохраняет альбом и обновляет TTL."""
 
     @abstractmethod
-    async def get(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
+    async def get(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
         """Возвращает альбом или None, если его нет или TTL истёк."""
 
     @abstractmethod
-    async def clear(self, chat_id: int, assistant_id: str) -> None:
+    async def clear(self, chat_id: int, assistant_id: str, user_id: int) -> None:
         """Удаляет альбом."""
 
-    async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
+    async def pop(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
         """Atomically read-and-delete альбом (override in Redis/memory)."""
-        media = await self.get(chat_id, assistant_id)
+        media = await self.get(chat_id, assistant_id, user_id)
         if media is not None:
-            await self.clear(chat_id, assistant_id)
+            await self.clear(chat_id, assistant_id, user_id)
         return media
 
     async def set_base_override(
-        self, chat_id: int, assistant_id: str, base_override: int | None
+        self,
+        chat_id: int,
+        assistant_id: str,
+        user_id: int,
+        base_override: int | None,
     ) -> PendingMedia | None:
-        """Меняет выбранную основу, не продлевая смысл сверх текущего TTL."""
-        media = await self.get(chat_id, assistant_id)
-        if media is None:
-            return None
-        media.base_override = base_override
-        await self.put(media)
-        return media
+        """Меняет выбранную основу, не продлевая TTL."""
+
+        def _apply(media: PendingMedia) -> None:
+            media.base_override = base_override
+
+        return await self._mutate(chat_id, assistant_id, user_id, _apply)
 
     async def bump_round(
-        self, chat_id: int, assistant_id: str, question: str | None = None
+        self,
+        chat_id: int,
+        assistant_id: str,
+        user_id: int,
+        question: str | None = None,
     ) -> PendingMedia | None:
         """Увеличивает счётчик уточнений и запоминает последний вопрос."""
-        media = await self.get(chat_id, assistant_id)
-        if media is None:
-            return None
-        media.clarify_rounds += 1
-        media.last_question = question
-        await self.put(media)
-        logger.info(
-            "clarify_round",
-            chat_id=chat_id,
-            assistant_id=assistant_id,
-            round=media.clarify_rounds,
-        )
-        return media
 
-    async def mark_role_retry(self, chat_id: int, assistant_id: str) -> None:
+        def _apply(media: PendingMedia) -> None:
+            media.clarify_rounds += 1
+            media.last_question = question
+
+        updated = await self._mutate(chat_id, assistant_id, user_id, _apply)
+        if updated is not None:
+            logger.info(
+                "clarify_round",
+                chat_id=chat_id,
+                user_id=user_id,
+                assistant_id=assistant_id,
+                round=updated.clarify_rounds,
+            )
+        return updated
+
+    async def mark_role_retry(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> None:
         """Отмечает, что кнопки выбора основы уже показаны один раз."""
-        media = await self.get(chat_id, assistant_id)
-        if media is None:
-            return
-        media.role_retry_used = True
-        await self.put(media)
+
+        def _apply(media: PendingMedia) -> None:
+            media.role_retry_used = True
+
+        await self._mutate(chat_id, assistant_id, user_id, _apply)
+
+    @abstractmethod
+    async def _mutate(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        user_id: int,
+        mutator: Callable[[PendingMedia], None],
+    ) -> PendingMedia | None:
+        """Apply ``mutator`` in place without resetting TTL."""
 
     @abstractmethod
     async def close(self) -> None:
@@ -202,25 +232,27 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
 
     def __init__(self, ttl_seconds: float | None = None) -> None:
         self._ttl = ttl_seconds if ttl_seconds is not None else pending_ttl_seconds()
-        self._items: dict[tuple[int, str], tuple[PendingMedia, float]] = {}
+        self._items: dict[tuple[int, int, str], tuple[PendingMedia, float]] = {}
         self._closed = False
         self._lock = asyncio.Lock()
 
-    def _key(self, chat_id: int, assistant_id: str) -> tuple[int, str]:
-        return chat_id, assistant_id
+    def _key(self, chat_id: int, user_id: int, assistant_id: str) -> tuple[int, int, str]:
+        return chat_id, user_id, assistant_id
 
     async def put(self, media: PendingMedia) -> None:
         if self._closed:
             raise PendingMediaError("Хранилище отложенных фото закрыто.")
         deadline = time.monotonic() + self._ttl
         async with self._lock:
-            self._items[self._key(media.chat_id, media.assistant_id)] = (
+            self._items[self._key(media.chat_id, media.user_id, media.assistant_id)] = (
                 media,
                 deadline,
             )
 
-    async def get(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
-        key = self._key(chat_id, assistant_id)
+    async def get(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
+        key = self._key(chat_id, user_id, assistant_id)
         async with self._lock:
             found = self._items.get(key)
             if found is None:
@@ -231,17 +263,20 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
                 logger.info(
                     "pending_expired",
                     chat_id=chat_id,
+                    user_id=user_id,
                     assistant_id=assistant_id,
                 )
                 return None
             return media
 
-    async def clear(self, chat_id: int, assistant_id: str) -> None:
+    async def clear(self, chat_id: int, assistant_id: str, user_id: int) -> None:
         async with self._lock:
-            self._items.pop(self._key(chat_id, assistant_id), None)
+            self._items.pop(self._key(chat_id, user_id, assistant_id), None)
 
-    async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
-        key = self._key(chat_id, assistant_id)
+    async def pop(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
+        key = self._key(chat_id, user_id, assistant_id)
         async with self._lock:
             found = self._items.pop(key, None)
             if found is None:
@@ -251,9 +286,36 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
                 logger.info(
                     "pending_expired",
                     chat_id=chat_id,
+                    user_id=user_id,
                     assistant_id=assistant_id,
                 )
                 return None
+            return media
+
+    async def _mutate(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        user_id: int,
+        mutator: Callable[[PendingMedia], None],
+    ) -> PendingMedia | None:
+        key = self._key(chat_id, user_id, assistant_id)
+        async with self._lock:
+            found = self._items.get(key)
+            if found is None:
+                return None
+            media, deadline = found
+            if time.monotonic() > deadline:
+                self._items.pop(key, None)
+                logger.info(
+                    "pending_expired",
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    assistant_id=assistant_id,
+                )
+                return None
+            mutator(media)
+            self._items[key] = (media, deadline)
             return media
 
     async def close(self) -> None:
@@ -277,8 +339,10 @@ class RedisPendingMediaStorage(PendingMediaStorage):
         self._owns_client = owns_client
         self._closed = False
 
-    def _redis_key(self, chat_id: int, assistant_id: str) -> str:
-        return _KEY.format(chat_id=chat_id, assistant_id=assistant_id)
+    def _redis_key(self, chat_id: int, user_id: int, assistant_id: str) -> str:
+        return _KEY.format(
+            chat_id=chat_id, user_id=user_id, assistant_id=assistant_id
+        )
 
     async def ping(self) -> None:
         try:
@@ -291,16 +355,18 @@ class RedisPendingMediaStorage(PendingMediaStorage):
             raise PendingMediaError("Хранилище отложенных фото закрыто.")
         try:
             await self._redis.set(
-                self._redis_key(media.chat_id, media.assistant_id),
+                self._redis_key(media.chat_id, media.user_id, media.assistant_id),
                 media.to_json(),
                 ex=max(int(self._ttl), 1),
             )
         except RedisError as exc:
             raise PendingMediaError("Не удалось сохранить отложенные фото.") from exc
 
-    async def get(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
+    async def get(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
         try:
-            raw = await self._redis.get(self._redis_key(chat_id, assistant_id))
+            raw = await self._redis.get(self._redis_key(chat_id, user_id, assistant_id))
         except RedisError as exc:
             raise PendingMediaError("Не удалось прочитать отложенные фото.") from exc
         if not raw:
@@ -311,14 +377,16 @@ class RedisPendingMediaStorage(PendingMediaStorage):
         except (json.JSONDecodeError, PendingMediaError) as exc:
             raise PendingMediaError("Повреждённые отложенные фото.") from exc
 
-    async def clear(self, chat_id: int, assistant_id: str) -> None:
+    async def clear(self, chat_id: int, assistant_id: str, user_id: int) -> None:
         try:
-            await self._redis.delete(self._redis_key(chat_id, assistant_id))
+            await self._redis.delete(self._redis_key(chat_id, user_id, assistant_id))
         except RedisError as exc:
             raise PendingMediaError("Не удалось удалить отложенные фото.") from exc
 
-    async def pop(self, chat_id: int, assistant_id: str) -> PendingMedia | None:
-        key = self._redis_key(chat_id, assistant_id)
+    async def pop(
+        self, chat_id: int, assistant_id: str, user_id: int
+    ) -> PendingMedia | None:
+        key = self._redis_key(chat_id, user_id, assistant_id)
         try:
             # GETDEL is atomic (Redis 6.2+); fakeredis and redis:7 support it.
             raw = await self._redis.getdel(key)
@@ -331,6 +399,45 @@ class RedisPendingMediaStorage(PendingMediaStorage):
             return PendingMedia.from_json(text)
         except (json.JSONDecodeError, PendingMediaError) as exc:
             raise PendingMediaError("Повреждённые отложенные фото.") from exc
+
+    async def _mutate(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        user_id: int,
+        mutator: Callable[[PendingMedia], None],
+    ) -> PendingMedia | None:
+        if self._closed:
+            raise PendingMediaError("Хранилище отложенных фото закрыто.")
+        key = self._redis_key(chat_id, user_id, assistant_id)
+        for _ in range(5):
+            try:
+                async with self._redis.pipeline(True) as pipe:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        await pipe.reset()
+                        return None
+                    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+                    try:
+                        media = PendingMedia.from_json(text)
+                    except (json.JSONDecodeError, PendingMediaError) as exc:
+                        await pipe.reset()
+                        raise PendingMediaError(
+                            "Повреждённые отложенные фото."
+                        ) from exc
+                    mutator(media)
+                    pipe.multi()
+                    pipe.set(key, media.to_json(), keepttl=True)
+                    await pipe.execute()
+                    return media
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise PendingMediaError(
+                    "Не удалось обновить отложенные фото."
+                ) from exc
+        raise PendingMediaError("Не удалось обновить отложенные фото (конфликт).")
 
     async def close(self) -> None:
         if self._closed:
@@ -346,9 +453,18 @@ class RedisPendingMediaStorage(PendingMediaStorage):
 async def create_pending_media_storage(
     redis_url: str | None = None,
 ) -> PendingMediaStorage:
-    """Redis, если URL задан и сервер отвечает, иначе память процесса."""
+    """Redis, если URL задан и сервер отвечает, иначе память процесса.
+
+    В production при заданном ``REDIS_URL`` недоступный Redis — fatal
+    (как FSM), без тихой деградации в память процесса.
+    """
+    from app.infra.access import is_production
+
     url = (redis_url if redis_url is not None else os.getenv("REDIS_URL", "")).strip()
     if not url:
+        if is_production():
+            logger.error("pending_media_redis_required_in_production")
+            raise SystemExit(1)
         logger.info("pending_media_memory", reason="empty_redis_url")
         return InMemoryPendingMediaStorage()
     client: Redis = Redis.from_url(url, decode_responses=True)
@@ -356,8 +472,11 @@ async def create_pending_media_storage(
     try:
         await storage.ping()
     except PendingMediaError as exc:
-        logger.warning("pending_media_memory", reason=exc.message)
         await storage.close()
+        if is_production():
+            logger.error("pending_media_redis_failed_fatal", reason=exc.message)
+            raise SystemExit(1) from exc
+        logger.warning("pending_media_memory", reason=exc.message)
         return InMemoryPendingMediaStorage()
     logger.info("pending_media_redis", ttl=storage._ttl)
     return storage

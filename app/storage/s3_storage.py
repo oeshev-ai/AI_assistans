@@ -39,11 +39,15 @@ class S3Config:
         secret_access_key = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
         if not bucket or not access_key_id or not secret_access_key:
             return None
+        from app.infra.envparse import ensure_https_url
+
+        endpoint = ensure_https_url(
+            os.getenv("YC_S3_ENDPOINT", "").strip(),
+            name="YC_S3_ENDPOINT",
+            default="https://storage.yandexcloud.net",
+        )
         return cls(
-            endpoint=os.getenv(
-                "YC_S3_ENDPOINT", "https://storage.yandexcloud.net"
-            ).strip()
-            or "https://storage.yandexcloud.net",
+            endpoint=endpoint,
             region=os.getenv("YC_REGION", "ru-central1").strip() or "ru-central1",
             bucket=bucket,
             access_key_id=access_key_id,

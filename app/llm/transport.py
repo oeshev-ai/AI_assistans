@@ -387,6 +387,12 @@ class ProviderTransportMixin:
         Сетевые и HTTP-ошибки становятся ``AssistAIError``.
         """
         target = provider or self._endpoint(operation)
+
+        def _counts(exc: BaseException) -> bool:
+            if isinstance(exc, AssistAIError):
+                return counts_toward_circuit(exc)
+            return True
+
         try:
             return await safe_api_call(
                 get_breaker(target.id),
@@ -398,6 +404,7 @@ class ProviderTransportMixin:
                 user_message=(
                     "⚠️ LLM сервис временно недоступен. Попробуйте через минуту."
                 ),
+                failure_filter=_counts,
             )
         except APIUnavailableError as exc:
             logger.error("llm_unavailable", path=path, error=exc.message)

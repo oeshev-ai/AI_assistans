@@ -933,61 +933,79 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise ValueError("image_bytes не может быть пустым.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt не может быть пустым.")
+        if not security.validate_prompt_length(prompt):
+            raise ValueError("Prompt слишком длинный")
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
         edit_size = self._resolve_edit_size(None, image_bytes)
-        image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
-        sanitized = security.sanitize_prompt(prompt.strip())
-        body = _image_generation_body(
-            selected_model,
-            sanitized,
-            edit_size,
+        image_cost = cost_tracker.estimate_image_cost(
+            1,
+            model=selected_model,
             quality=self.config.image_quality,
-            complexity=self.config.image_complexity_edit,
-            send_complexity=self.config.send_complexity,
-        )
-        form = {key: str(value) for key, value in body.items() if key != "n"}
-        files = {
-            "image": (filename, image_bytes, mime_type or "application/octet-stream")
-        }
-        logger.info(
-            "edit_image",
-            model=selected_model,
-            bytes=len(image_bytes),
-            prompt_chars=len(prompt),
-        )
-        polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
-
-        async def attempt(provider: ProviderConfig) -> dict[str, Any]:
-            if provider.kind == "polza_media":
-                return await self._polza_image(
-                    provider,
-                    model=selected_model,
-                    prompt=sanitized,
-                    size=polza_size,
-                    images=[image_bytes],
-                )
-            return await self._post_image_edit(form, files, provider)
-
-        data, used = await self._image_with_fallback(attempt)
-
-        records = _image_records(data)
-        _set_generation_ids([record.get("generation_id") for record in records])
-        images = [record["value"] for record in records]
-        if not images:
-            raise AssistAIError(
-                f"{_provider_label(used)} не вернул отредактированное изображение."
-            )
-        await self._record_image_spend(
-            count=len(images),
-            model=selected_model,
             size=edit_size,
-            data=data,
-            provider=used,
+            provider=self._endpoint("image"),
+            rub_per_usd=self.config.rub_per_usd,
         )
-        return images
+        await cost_tracker.check_budget(estimated=image_cost)
+        try:
+            image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
+            sanitized = security.sanitize_prompt(prompt.strip())
+            body = _image_generation_body(
+                selected_model,
+                sanitized,
+                edit_size,
+                quality=self.config.image_quality,
+                complexity=self.config.image_complexity_edit,
+                send_complexity=self.config.send_complexity,
+            )
+            form = {key: str(value) for key, value in body.items() if key != "n"}
+            files = {
+                "image": (
+                    filename,
+                    image_bytes,
+                    mime_type or "application/octet-stream",
+                )
+            }
+            logger.info(
+                "edit_image",
+                model=selected_model,
+                bytes=len(image_bytes),
+                prompt_chars=len(sanitized),
+            )
+            polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
+
+            async def attempt(provider: ProviderConfig) -> dict[str, Any]:
+                if provider.kind == "polza_media":
+                    return await self._polza_image(
+                        provider,
+                        model=selected_model,
+                        prompt=sanitized,
+                        size=polza_size,
+                        images=[image_bytes],
+                    )
+                return await self._post_image_edit(form, files, provider)
+
+            data, used = await self._image_with_fallback(attempt)
+
+            records = _image_records(data)
+            _set_generation_ids([record.get("generation_id") for record in records])
+            images = [record["value"] for record in records]
+            if not images:
+                raise AssistAIError(
+                    f"{_provider_label(used)} не вернул отредактированное изображение."
+                )
+            await self._record_image_spend(
+                count=len(images),
+                model=selected_model,
+                size=edit_size,
+                data=data,
+                provider=used,
+            )
+            return images
+        finally:
+            await cost_tracker.release_reservation()
 
     async def edit_images(
         self,
@@ -1007,6 +1025,8 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise ValueError("files не может быть пустым.")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt не может быть пустым.")
+        if not security.validate_prompt_length(prompt):
+            raise ValueError("Prompt слишком длинный")
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 

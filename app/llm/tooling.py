@@ -18,8 +18,14 @@ def error_json(message: str) -> str:
 
 
 def exception_text(exc: Exception) -> str:
-    text = str(exc).strip()
-    return text or exc.__class__.__name__
+    """Safe short error for model/tool JSON — strip paths and URLs."""
+    text = str(exc).strip() or exc.__class__.__name__
+    # Avoid leaking local paths / internal URLs back into the model context.
+    if "://" in text or "\\" in text or text.count("/") >= 3:
+        return f"{exc.__class__.__name__}: internal error"
+    if len(text) > 240:
+        return text[:237] + "..."
+    return text
 
 
 # Совместимость со старыми импортами ``_error_json`` / ``_exception_text``.

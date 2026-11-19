@@ -48,8 +48,13 @@ async def on_upload_cancel(
     bot = query.bot
     if not isinstance(store, UploadSessionStore) or bot is None:
         return
+    user_id = query.from_user.id if query.from_user else chat_id
     session = await store.get(upload_id)
-    if session is None or session.chat_id != chat_id:
+    if (
+        session is None
+        or session.chat_id != chat_id
+        or session.user_id != user_id
+    ):
         if isinstance(query.message, Message):
             try:
                 await query.message.edit_reply_markup(reply_markup=None)
@@ -213,9 +218,11 @@ async def handle_photo(
             f"Файл слишком большой. Максимум — {MAX_IMAGE_SIZE_MB} МБ."
         )
         return
+    user_id = message.from_user.id if message.from_user else message.chat.id
     logger.info(
         "photo_received",
         chat_id=message.chat.id,
+        user_id=user_id,
         message_id=message.message_id,
         grouped=bool(message.media_group_id),
     )
@@ -229,6 +236,7 @@ async def handle_photo(
     )
     await get_album_hub().add(
         message.chat.id,
+        user_id,
         message.media_group_id,
         photo,
         turn,

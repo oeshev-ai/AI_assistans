@@ -76,6 +76,26 @@ async def test_edit_blocks_before_http_when_budget_exceeded(
 
 
 @pytest.mark.asyncio
+async def test_edit_image_blocks_before_http_when_budget_exceeded(
+    assist_client: AssistAIClient, respx_mock: MockRouter
+) -> None:
+    route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
+        return_value=httpx.Response(200, json={"data": [{"url": "https://cdn/e.png"}]})
+    )
+    set_billing_user(8)
+    cost_tracker.user_daily_budget = 0.001
+    await cost_tracker.record(kind="image", amount_usd=0.001, user_id=8)
+
+    with pytest.raises(BudgetExceededError):
+        await assist_client.edit_image(
+            _png(),
+            "убери фон",
+            model="openai/gpt-image-2.6-flare",
+        )
+    assert len(route.calls) == 0
+
+
+@pytest.mark.asyncio
 async def test_generate_single_reservation_near_budget_edge(
     assist_client: AssistAIClient, respx_mock: MockRouter
 ) -> None:

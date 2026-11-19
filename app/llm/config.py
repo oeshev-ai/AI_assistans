@@ -174,9 +174,18 @@ class AssistAIConfig(BaseModel):
         load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         load_dotenv()
         provider_raw = os.getenv("TTS_PROVIDER", "proxyapi").strip().casefold()
-        provider: Literal["speechkit", "proxyapi"] = (
-            "speechkit" if provider_raw == "speechkit" else "proxyapi"
-        )
+        provider: Literal["speechkit", "proxyapi"]
+        if provider_raw == "speechkit":
+            provider = "speechkit"
+        elif provider_raw in {"", "proxyapi"}:
+            provider = "proxyapi"
+        else:
+            logger.warning(
+                "tts_provider_invalid",
+                value=provider_raw,
+                fallback="proxyapi",
+            )
+            provider = "proxyapi"
         speechkit_key = os.getenv("YC_SPEECHKIT_API_KEY", "").strip()
         speechkit_voice = os.getenv("SPEECHKIT_VOICE", "marina").strip() or "marina"
         speechkit_role = os.getenv("SPEECHKIT_ROLE", "friendly").strip()
@@ -186,12 +195,12 @@ class AssistAIConfig(BaseModel):
             )
         except ValueError:
             speechkit_speed = 1.0
-        speechkit_url = (
-            os.getenv(
-                "SPEECHKIT_URL",
-                "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis",
-            ).strip()
-            or "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
+        from app.infra.envparse import ensure_https_url
+
+        speechkit_url = ensure_https_url(
+            os.getenv("SPEECHKIT_URL", "").strip(),
+            name="SPEECHKIT_URL",
+            default="https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis",
         )
         if provider == "speechkit":
             default_tts_voice = speechkit_voice
@@ -200,8 +209,12 @@ class AssistAIConfig(BaseModel):
 
             default_tts_model = SPEECHKIT_MODEL_ID
         else:
+            from app.llm.media_api import normalize_tts_format
+
             default_tts_voice = os.getenv("PROXYAPI_TTS_VOICE", "alloy")
-            default_tts_format = os.getenv("PROXYAPI_TTS_FORMAT", "opus")
+            default_tts_format = normalize_tts_format(
+                os.getenv("PROXYAPI_TTS_FORMAT", "opus")
+            )
             default_tts_model = os.getenv(
                 "PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"
             )

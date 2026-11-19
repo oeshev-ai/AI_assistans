@@ -7,6 +7,8 @@ import json
 import math
 import os
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from prometheus_client import Counter, Gauge
+
+from app.infra.envparse import env_float
 
 if TYPE_CHECKING:
     from app.llm.providers import ProviderConfig
@@ -64,6 +68,24 @@ def get_billing_user() -> int | None:
     return _billing_user_id.get()
 
 
+@asynccontextmanager
+async def isolated_budget_reservation() -> AsyncIterator[None]:
+    """Isolate nested ``check_budget``/``record`` from the parent turn hold.
+
+    Parallel ``asyncio.gather`` tool tasks inherit a copy of the parent
+    ``ContextVar`` reservation. Without isolation each child ``record`` would
+    release the parent's Redis hold and undercount spend.
+    """
+    token = _reserved_usd.set(0.0)
+    try:
+        yield
+    finally:
+        try:
+            await cost_tracker.release_reservation()
+        finally:
+            _reserved_usd.reset(token)
+
+
 LLM_SPEND_USD = Counter(
     "llm_spend_usd_total",
     "Estimated LLM spend in USD",
@@ -85,14 +107,14 @@ LLM_BUDGET_REMAINING = Gauge(
 )
 
 # Approximate ProxyAPI / OpenAI-class rates (USD).
-CHAT_INPUT_PER_1K = float(os.getenv("COST_CHAT_INPUT_PER_1K", "0.00015"))
-CHAT_OUTPUT_PER_1K = float(os.getenv("COST_CHAT_OUTPUT_PER_1K", "0.0006"))
-IMAGE_USD = float(os.getenv("COST_IMAGE_USD", "0.04"))
+CHAT_INPUT_PER_1K = env_float("COST_CHAT_INPUT_PER_1K", 0.00015)
+CHAT_OUTPUT_PER_1K = env_float("COST_CHAT_OUTPUT_PER_1K", 0.0006)
+IMAGE_USD = env_float("COST_IMAGE_USD", 0.04)
 # TODO calibration: заглушка, равная COST_IMAGE_USD. Реальное значение брать из
 # дашборда после ~10 генераций: Δ₽ / количество / RUB_PER_USD.
-IMAGE_FLUX_USD = float(os.getenv("COST_IMAGE_FLUX_USD", str(IMAGE_USD)))
+IMAGE_FLUX_USD = env_float("COST_IMAGE_FLUX_USD", IMAGE_USD)
 # Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
-RUB_PER_USD = float(os.getenv("RUB_PER_USD", "304") or 304)
+RUB_PER_USD = env_float("RUB_PER_USD", 304.0)
 
 
 def _parse_flat_map(raw: str | None) -> dict[str, float]:
@@ -129,10 +151,10 @@ def flat_image_usd(model: str | None) -> float:
     return IMAGE_FLUX_USD
 
 
-IMAGE_OUT_USD_PER_1M = float(os.getenv("IMAGE_OUT_USD_PER_1M", "30"))
-IMAGE_IN_USD_PER_1M = float(os.getenv("IMAGE_IN_USD_PER_1M", "8"))
-TEXT_IN_USD_PER_1M = float(os.getenv("TEXT_IN_USD_PER_1M", "5"))
-TEXT_OUT_USD_PER_1M = float(os.getenv("TEXT_OUT_USD_PER_1M", "10"))
+IMAGE_OUT_USD_PER_1M = env_float("IMAGE_OUT_USD_PER_1M", 30.0)
+IMAGE_IN_USD_PER_1M = env_float("IMAGE_IN_USD_PER_1M", 8.0)
+TEXT_IN_USD_PER_1M = env_float("TEXT_IN_USD_PER_1M", 5.0)
+TEXT_OUT_USD_PER_1M = env_float("TEXT_OUT_USD_PER_1M", 10.0)
 # Выходные токены GPT Image. Измерено: 1024²/low=824, 1024×1536 и 1536×1024/high=1353.
 # Остальные пары — оценка калькулятора, не проверяли. Ориентация токены не меняет.
 _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
@@ -148,9 +170,9 @@ _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
     ("1024x1536", "max"): 5488,  # оценка
 }
 IMAGE_INPUT_TOKEN_CAP = 1536  # наблюдение: 12 MP → 1452 (44×33); берём верхнюю границу
-VIDEO_USD = float(os.getenv("COST_VIDEO_USD", "0.20"))
-STT_PER_MINUTE = float(os.getenv("COST_STT_PER_MINUTE", "0.006"))
-TTS_PER_1K_CHARS = float(os.getenv("COST_TTS_PER_1K_CHARS", "0.015"))
+VIDEO_USD = env_float("COST_VIDEO_USD", 0.20)
+STT_PER_MINUTE = env_float("COST_STT_PER_MINUTE", 0.006)
+TTS_PER_1K_CHARS = env_float("COST_TTS_PER_1K_CHARS", 0.015)
 
 
 def _openai_image_model(model: str) -> bool:
@@ -258,8 +280,8 @@ class CostTracker:
         self._redis: Any | None = None
         self._memory: dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self.daily_budget = float(os.getenv("LLM_DAILY_BUDGET_USD", "0") or 0)
-        self.user_daily_budget = float(os.getenv("LLM_USER_DAILY_BUDGET_USD", "0") or 0)
+        self.daily_budget = env_float("LLM_DAILY_BUDGET_USD", 0.0)
+        self.user_daily_budget = env_float("LLM_USER_DAILY_BUDGET_USD", 0.0)
 
     def attach_redis(self, redis_client: Any | None) -> None:
         self._redis = redis_client

@@ -41,7 +41,9 @@ class PhotoTurn:
     pending: PendingMediaStorage
 
 
-async def deliver_album(built: AlbumBuild, turn: PhotoTurn) -> None:
+async def deliver_album(
+    built: AlbumBuild, turn: PhotoTurn, *, charge_text_limit: bool = True
+) -> None:
     """Дальше по намерению: экран, описание или правка."""
     message = turn.message
     if built.error:
@@ -56,8 +58,10 @@ async def deliver_album(built: AlbumBuild, turn: PhotoTurn) -> None:
     except Exception:
         await R._reply_profile_error(message)
         return
+    user_id = message.from_user.id if message.from_user else message.chat.id
     media = PendingMedia(
         chat_id=message.chat.id,
+        user_id=user_id,
         assistant_id=profile.id,
         items=[
             PendingMediaItem(
@@ -74,16 +78,7 @@ async def deliver_album(built: AlbumBuild, turn: PhotoTurn) -> None:
     await turn.pending.put(media)
     from app.bot.photo_flow import route_album
 
-    await route_album(turn, media)
-
-
-async def _show_action(
-    message: Message, state: FSMContext, media: PendingMedia
-) -> None:
-    await state.set_state(PhotoSG.action)
-    await state.update_data(flow_photo_id=media.assistant_id)
-    text, markup = screens._photo_action_view(len(media.items), media.base_override)
-    await R._upsert_screen(message, state, _SCREEN_PHOTO, text, markup)
+    await route_album(turn, media, charge_text_limit=charge_text_limit)
 
 
 async def _load(
@@ -94,7 +89,12 @@ async def _load(
     except Exception:
         await R._reply_profile_error(turn.message)
         return None
-    media = await turn.pending.get(turn.message.chat.id, profile.id)
+    user_id = (
+        turn.message.from_user.id
+        if turn.message.from_user
+        else turn.message.chat.id
+    )
+    media = await turn.pending.get(turn.message.chat.id, profile.id, user_id)
     if media is None or not media.items:
         await turn.message.answer("Фото устарели. Пришлите их ещё раз.")
         await R._reset_flow(turn.state)
@@ -198,7 +198,12 @@ async def on_photo_cancel(
     if isinstance(message, Message):
         try:
             profile = await R._active_profile(message.chat.id, assistant_storage)
-            await pending_media.clear(message.chat.id, profile.id)
+            user_id = (
+                callback.from_user.id
+                if callback.from_user
+                else message.chat.id
+            )
+            await pending_media.clear(message.chat.id, profile.id, user_id)
         except Exception:
             logger.info("photo_cancel_without_profile")
         await message.answer("Отменено.")
@@ -220,7 +225,8 @@ async def on_photo_base_next(
     except Exception:
         await R._reply_profile_error(message)
         return
-    media = await pending_media.get(message.chat.id, profile.id)
+    user_id = callback.from_user.id if callback.from_user else message.chat.id
+    media = await pending_media.get(message.chat.id, profile.id, user_id)
     if media is None or not media.items:
         await message.answer("Фото устарели. Пришлите их ещё раз.")
         return
@@ -229,7 +235,9 @@ async def on_photo_base_next(
     nxt: int | None = 0 if current is None else current + 1
     if nxt is not None and nxt >= count:
         nxt = None
-    updated = await pending_media.set_base_override(message.chat.id, profile.id, nxt)
+    updated = await pending_media.set_base_override(
+        message.chat.id, profile.id, user_id, nxt
+    )
     shown = updated or media
     text, markup = screens._photo_action_view(count, shown.base_override)
     await R._upsert_screen(message, state, _SCREEN_PHOTO, text, markup)
@@ -259,8 +267,9 @@ async def on_photo_base_set(
     if loaded is None:
         return
     _media, assistant_id = loaded
+    user_id = callback.from_user.id if callback.from_user else message.chat.id
     updated = await pending_media.set_base_override(
-        message.chat.id, assistant_id, index
+        message.chat.id, assistant_id, user_id, index
     )
     if updated is None:
         await message.answer("Фото устарели. Пришлите их ещё раз.")

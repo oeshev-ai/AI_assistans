@@ -187,10 +187,24 @@ async def safe_api_call(
     func: Callable[..., Awaitable[Any]],
     *args: Any,
     user_message: str = "Сервис временно недоступен",
+    failure_filter: Callable[[BaseException], bool] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Call ``func`` through ``breaker`` and map open-circuit to a user error."""
+    """Call ``func`` through ``breaker`` and map open-circuit to a user error.
+
+    ``failure_filter`` — если задан, сбой учитывается в breaker только когда
+    фильтр возвращает True (например, пропускать клиентские 4xx LLM).
+    """
     try:
-        return await breaker.call(func, *args, **kwargs)
+        await breaker.ensure_allows_call()
+        try:
+            result = await func(*args, **kwargs)
+        except breaker.expected_exception as exc:
+            if failure_filter is None or failure_filter(exc):
+                await breaker._on_failure(exc)
+            raise
+        else:
+            await breaker._on_success()
+            return result
     except CircuitBreakerError as exc:
         raise APIUnavailableError(user_message) from exc

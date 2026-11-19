@@ -8,7 +8,7 @@ import socket
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 import structlog
@@ -65,12 +65,29 @@ def _audio_mime(filename: str) -> str:
     }.get(lowered, "application/octet-stream")
 
 
+_TTS_FORMATS: dict[str, tuple[str, str]] = {
+    "opus": ("answer.ogg", "audio/ogg"),
+    "ogg": ("answer.ogg", "audio/ogg"),
+    "mp3": ("answer.mp3", "audio/mpeg"),
+    "wav": ("answer.wav", "audio/wav"),
+    "aac": ("answer.aac", "audio/aac"),
+    "flac": ("answer.flac", "audio/flac"),
+    "pcm": ("answer.pcm", "audio/pcm"),
+}
+
+
+def normalize_tts_format(response_format: str | None, *, default: str = "opus") -> str:
+    """Return a known TTS format or ``default``."""
+    raw = (response_format or default).strip().casefold() or default
+    if raw in _TTS_FORMATS:
+        return raw
+    return default if default in _TTS_FORMATS else "opus"
+
+
 def _speech_file(response_format: str) -> tuple[str, str]:
     """Имя файла и MIME для ответа TTS."""
-    fmt = response_format.strip().casefold()
-    if fmt == "mp3":
-        return "answer.mp3", "audio/mpeg"
-    return "answer.ogg", "audio/ogg"
+    fmt = normalize_tts_format(response_format)
+    return _TTS_FORMATS[fmt]
 
 
 def _ip_is_non_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -100,16 +117,17 @@ def _host_is_non_public(hostname: str) -> bool:
     return _ip_is_non_public(ip)
 
 
-def _hostname_resolves_to_non_public(hostname: str) -> bool:
-    """True if DNS yields any non-public address (DNS-rebinding guard).
+def _public_resolved_ips(hostname: str) -> tuple[str, ...]:
+    """Public A/AAAA records only; empty if resolve fails or any IP is private.
 
-    Unresolvable names return False so offline tests / unknown CDN hosts still
-    work; literal private hosts are already rejected by ``_host_is_non_public``.
+    Rejecting mixed public+private answers closes a common DNS-rebinding pattern.
     """
     try:
         infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except OSError:
-        return False
+        return ()
+    ips: list[str] = []
+    seen: set[str] = set()
     for info in infos:
         raw_ip = info[4][0]
         try:
@@ -117,8 +135,12 @@ def _hostname_resolves_to_non_public(hostname: str) -> bool:
         except ValueError:
             continue
         if _ip_is_non_public(ip):
-            return True
-    return False
+            return ()
+        text = str(ip)
+        if text not in seen:
+            seen.add(text)
+            ips.append(text)
+    return tuple(ips)
 
 
 def resolve_video_resource_url(
@@ -126,36 +148,60 @@ def resolve_video_resource_url(
     *,
     provider_base_url: str,
     fallback: str,
-) -> tuple[str, bool]:
-    """Choose a video poll/content URL and whether to send the provider Bearer.
+) -> tuple[str, bool, tuple[str, ...]]:
+    """Choose a video poll/content URL, auth flag, and pinned public IPs.
 
-    - Same host as ``provider_base_url`` **and HTTPS** → fetch with auth.
-    - Other **public HTTPS** hosts (CDN) → fetch without auth.
-    - HTTP (including same-host), private/loopback/metadata, or DNS that
-      resolves to a non-public address → ``fallback``.
+    - Same host as ``provider_base_url`` **and HTTPS** → fetch with auth (no pin).
+    - Other **public HTTPS** hosts (CDN) → fetch without auth, pinned to resolved
+      public IPs so a later DNS rebind cannot steer the TCP connect private.
+    - HTTP (including same-host), private/loopback/metadata, or unsafe DNS →
+      ``fallback``.
     """
     if not isinstance(candidate, str) or not candidate.strip():
-        return fallback, True
+        return fallback, True, ()
     raw = candidate.strip()
     try:
         parsed = urlparse(raw)
         provider = urlparse(provider_base_url)
     except ValueError:
-        return fallback, True
+        return fallback, True, ()
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return fallback, True
+        return fallback, True, ()
     host = parsed.hostname.casefold()
     provider_host = (provider.hostname or "").casefold()
     if host == provider_host:
         # Bearer must not travel over plaintext, even to the provider host.
         if parsed.scheme != "https":
-            return fallback, True
-        return raw, True
-    if _host_is_non_public(host) or _hostname_resolves_to_non_public(host):
-        return fallback, True
+            return fallback, True, ()
+        return raw, True, ()
+    if _host_is_non_public(host):
+        return fallback, True, ()
+    pinned = _public_resolved_ips(host)
+    if not pinned:
+        return fallback, True, ()
     if parsed.scheme != "https":
-        return fallback, True
-    return raw, False
+        return fallback, True, ()
+    return raw, False, pinned
+
+
+def _url_with_pinned_ip(url: str, ip: str) -> str:
+    """Rewrite ``url`` netloc to ``ip`` (keep path/query); Host/SNI stay original."""
+    parsed = urlparse(url)
+    host_for_url = f"[{ip}]" if ":" in ip else ip
+    if parsed.port:
+        netloc = f"{host_for_url}:{parsed.port}"
+    else:
+        netloc = host_for_url
+    return urlunparse(
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 class MediaApiMixin(ProviderTransportMixin):
@@ -207,7 +253,7 @@ class MediaApiMixin(ProviderTransportMixin):
             status_fallback = (
                 f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
             )
-            status_url, status_with_auth = resolve_video_resource_url(
+            status_url, status_with_auth, status_pins = resolve_video_resource_url(
                 created.get("polling_url")
                 if isinstance(created.get("polling_url"), str)
                 else None,
@@ -231,6 +277,7 @@ class MediaApiMixin(ProviderTransportMixin):
                         video_provider,
                         status_url,
                         with_auth=status_with_auth,
+                        pinned_ips=status_pins,
                         timeout=httpx.Timeout(30.0, connect=self.config.timeout),
                     )
                     response.raise_for_status()
@@ -254,7 +301,7 @@ class MediaApiMixin(ProviderTransportMixin):
                 first = unsigned[0]
                 if isinstance(first, str):
                     content_candidate = first
-            content_url, content_with_auth = resolve_video_resource_url(
+            content_url, content_with_auth, content_pins = resolve_video_resource_url(
                 content_candidate,
                 provider_base_url=video_provider.base_url,
                 fallback=content_fallback,
@@ -264,6 +311,7 @@ class MediaApiMixin(ProviderTransportMixin):
                     video_provider,
                     content_url,
                     with_auth=content_with_auth,
+                    pinned_ips=content_pins,
                     timeout=httpx.Timeout(
                         max(self.config.timeout, _VIDEO_READ_TIMEOUT),
                         connect=self.config.timeout,
@@ -289,17 +337,31 @@ class MediaApiMixin(ProviderTransportMixin):
         *,
         with_auth: bool,
         timeout: httpx.Timeout,
+        pinned_ips: tuple[str, ...] = (),
     ) -> httpx.Response:
-        """GET video status/content; never send provider Bearer to foreign hosts."""
+        """GET video status/content; never send provider Bearer to foreign hosts.
+
+        Foreign CDN fetches connect to a pinned public IP with Host/SNI of the
+        original hostname so a DNS rebind after validation cannot redirect TCP.
+        """
         if with_auth:
             return await self._client_for(provider).get(url, timeout=timeout)
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip()
+        request_url = url
+        headers = {"User-Agent": "AssistAIClient/1.0"}
+        extensions: dict[str, Any] = {}
+        if pinned_ips and hostname:
+            request_url = _url_with_pinned_ip(url, pinned_ips[0])
+            headers["Host"] = hostname
+            extensions["sni_hostname"] = hostname
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             verify=_ssl_context(),
-            headers={"User-Agent": "AssistAIClient/1.0"},
+            headers=headers,
         ) as anon:
-            return await anon.get(url)
+            return await anon.get(request_url, extensions=extensions or None)
 
     async def transcribe_audio(
         self,
@@ -432,7 +494,9 @@ class MediaApiMixin(ProviderTransportMixin):
             return await self._synthesize_speech_speechkit(text, voice=voice, role=role)
 
         selected_voice = voice or self.config.default_tts_voice
-        selected_format = response_format or self.config.default_tts_format
+        selected_format = normalize_tts_format(
+            response_format or self.config.default_tts_format
+        )
         if is_elevenlabs_tts_model(selected_model):
             selected_format = "mp3"
             if selected_voice not in ELEVENLABS_TTS_VOICES:
