@@ -39,12 +39,24 @@ load_dotenv()
 from app.infra.circuit_breaker import (
     APIUnavailableError,
     CircuitBreakerError,
-    llm_breaker,
+    get_breaker,
     safe_api_call,
 )
-from app.infra.cost_tracker import BudgetExceededError, cost_tracker
-from app.infra.metrics import API_CALLS, ERRORS, LATENCY, track_api_call
+from app.infra.cost_tracker import (
+    BudgetExceededError,
+    cost_tracker,
+    get_billing_user,
+)
+from app.infra.metrics import (
+    API_CALLS,
+    ERRORS,
+    LATENCY,
+    note_provider_fallback,
+    track_api_call,
+)
 from app.infra.security import security
+from app.llm import polza_media
+from app.llm.errors import AssistAIError, fallback_reason, is_rate_limited
 from app.llm.exchangerate import Conversion, ExchangeAPIError, get_exchange_rate
 from app.llm.models_config import resolve_image_model
 from app.llm.openweather import (
@@ -54,6 +66,11 @@ from app.llm.openweather import (
     OpenWeatherAPIError,
     OpenWeatherClient,
     OWMConfig,
+)
+from app.llm.providers import (
+    PROXYAPI_CAPABILITIES,
+    ProviderConfig,
+    ProviderRegistry,
 )
 
 # URL с access_key не должен попадать в лог при уровне INFO.
@@ -76,6 +93,30 @@ _SPEECH_READ_TIMEOUT = 120.0
 _VIDEO_READ_TIMEOUT = 300.0
 _VIDEO_POLL_INTERVAL = 5.0
 _VIDEO_POLL_MAX_SECONDS = 600.0
+# 429: не более двух повторов; без Retry-After пауза 1, затем 2 с.
+_RATE_LIMIT_RETRIES = 2
+_MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _provider_label(provider: ProviderConfig) -> str:
+    """Имя провайдера в сообщениях об ошибках (для ProxyAPI — прежний текст)."""
+    return "ProxyAPI" if provider.id == "proxyapi" else provider.id
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Секунды из ``Retry-After`` (HTTP-date не разбираем)."""
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -303,19 +344,6 @@ class ChatDelta:
     text: str
 
 
-class AssistAIError(Exception):
-    """Ошибка запроса к ProxyAPI или исчерпанный лимит вызовов инструментов.
-
-    Сбой самого инструмента сюда не попадает: он возвращается модели
-    как JSON ``{"error": "..."}``.
-    """
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-
-
 def _bounded_float(name: str, default: float) -> float:
     """Читает float из окружения и ограничивает его диапазоном 0..1."""
     raw = os.getenv(name, "").strip()
@@ -375,6 +403,18 @@ def _positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _positive_float(name: str, default: float) -> float:
+    """Читает положительный float. Пустое или битое значение оставляет дефолт."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class AssistAIConfig(BaseModel):
     """Конфигурация клиента. Ключи не попадают в ``repr``.
 
@@ -419,6 +459,14 @@ class AssistAIConfig(BaseModel):
     photo_router_model: str = "deepseek/deepseek-v4.1-flash"
     router_confidence: float = Field(default=0.55, ge=0, le=1)
     router_max_tokens: int = Field(default=600, ge=1)
+    # Мультипровайдерность. Пустые providers/routes = только ProxyAPI из
+    # base_url/proxyapi_key (поведение до G2).
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    routes: dict[str, str] = Field(default_factory=dict)
+    image_provider_fallback: str = ""
+    rub_per_usd: float = Field(default=304.0, gt=0)
+    polza_total_wait: float = Field(default=240.0, gt=0)
+    polza_poll_interval: float = Field(default=4.0, gt=0)
 
     @field_validator("default_image_model", "default_image_edit_model", mode="after")
     @classmethod
@@ -481,8 +529,28 @@ class AssistAIConfig(BaseModel):
             default_tts_model = os.getenv(
                 "PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"
             )
+        proxy_key = os.getenv("PROXYAPI_API_KEY", "").strip()
+        base_url = (
+            os.getenv("PROXYAPI_BASE_URL", "").strip() or "https://api.proxyapi.ru/v1"
+        )
+        providers: dict[str, ProviderConfig] = {}
+        routes: dict[str, str] = {}
+        image_fallback = ""
+        if proxy_key:
+            # Без ключа ProxyAPI реестр не строим: ошибку отдаст валидация ключа.
+            registry = ProviderRegistry.from_env(proxyapi_key=proxy_key)
+            providers = registry.providers
+            routes = registry.routes
+            image_fallback = registry.image_fallback
         return cls(
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
+            base_url=base_url,
+            providers=providers,
+            routes=routes,
+            image_provider_fallback=image_fallback,
+            rub_per_usd=_positive_float("RUB_PER_USD", 304.0),
+            polza_total_wait=_positive_float("POLZA_TOTAL_WAIT", 240.0),
+            polza_poll_interval=_positive_float("POLZA_POLL_INTERVAL", 4.0),
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", ""),
             exchangerate_api_key=os.getenv("EXCHANGERATE_API_KEY", ""),
             default_transcribe_model=os.getenv(
@@ -1472,11 +1540,14 @@ def image_model_family(model: str) -> ImageModelFamily:
     return "openai"
 
 
-def supports_multi_image(model_id: str) -> bool:
+def supports_multi_image(model_id: str, provider: ProviderConfig | None = None) -> bool:
     """True, если edits принимает несколько файлов.
 
     По карточкам каталога несколько ``image`` принимает семейство OpenAI
     (``openai/gpt-image-*``). Остальные семейства и неизвестные id — одно фото.
+    На Polza (``/v1/media``) контракт проверен только для этого же семейства;
+    лимит ``images`` — ``POLZA_MAX_REFERENCE_IMAGES`` (см. ``max_edit_images``).
+    ``provider=None`` и ProxyAPI — прежнее поведение.
     """
     cleaned = model_id.strip()
     if not cleaned.casefold().startswith("openai/"):
@@ -1484,10 +1555,19 @@ def supports_multi_image(model_id: str) -> bool:
     return image_model_family(cleaned) == "openai"
 
 
+def max_edit_images(provider: ProviderConfig | None = None) -> int | None:
+    """Лимит референсов у провайдера. ``None`` — без явного лимита (ProxyAPI)."""
+    if provider is not None and provider.kind == "polza_media":
+        return polza_media.POLZA_MAX_REFERENCE_IMAGES
+    return None
+
+
 def prepare_edit_files(
     files: list[tuple[bytes, str, str]],
     model_id: str,
     labels: list[str] | None = None,
+    *,
+    provider: ProviderConfig | None = None,
 ) -> list[tuple[bytes, str, str]]:
     """Оставляет файлы по отдельности или собирает одно полотно.
 
@@ -1495,7 +1575,13 @@ def prepare_edit_files(
     при ``ALLOW_COMPOSITE_FALLBACK=1`` склеивает кадры рядом, иначе ошибка.
     Референс при этом не отбрасывается молча.
     """
-    if len(files) <= 1 or supports_multi_image(model_id):
+    if len(files) <= 1 or supports_multi_image(model_id, provider):
+        limit = max_edit_images(provider)
+        if limit is not None and len(files) > limit:
+            raise AssistAIError(
+                f"Слишком много изображений: максимум {limit}.",
+                error_code="BAD_REQUEST",
+            )
         return list(files)
     if os.getenv("ALLOW_COMPOSITE_FALLBACK", "0").strip() == "1":
         return [_composite_edit_canvas(files, labels)]
@@ -1774,21 +1860,81 @@ class AssistAIClient:
 
     def __init__(self, config: AssistAIConfig | None = None) -> None:
         self.config: AssistAIConfig = config or AssistAIConfig.from_env()
-        self._http: httpx.AsyncClient = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.config.timeout),
-            follow_redirects=False,
-            verify=_ssl_context(),
-            headers={
-                "Authorization": f"Bearer {self.config.proxyapi_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "AssistAIClient/1.0",
-            },
+        self._registry: ProviderRegistry = self._build_registry()
+        # ``_http`` остаётся клиентом ProxyAPI; клиенты остальных провайдеров
+        # создаются лениво в ``_client_for`` и закрываются в ``close``.
+        self._http: httpx.AsyncClient = self._new_http_client(
+            self._registry.get("proxyapi")
         )
+        self._extra_clients: dict[str, httpx.AsyncClient] = {}
         self._tools_registry: dict[str, BaseTool] = {}
         self._weather_client: OpenWeatherClient | None = None
         self._closed: bool = False
         self._generation_ids: list[str | None] = []
         self._register_builtin_tools()
+
+    def _build_registry(self) -> ProviderRegistry:
+        """Реестр провайдеров. ProxyAPI всегда берётся из ``base_url``/``proxyapi_key``."""
+        providers = dict(self.config.providers)
+        providers["proxyapi"] = ProviderConfig(
+            id="proxyapi",
+            kind="openai",
+            base_url=self.config.base_url,
+            api_key=self.config.proxyapi_key,
+            capabilities=PROXYAPI_CAPABILITIES,
+        )
+        routes = {op: "proxyapi" for op in ("text", "image", "audio", "video")}
+        routes.update(self.config.routes)
+        registry = ProviderRegistry(
+            providers,
+            routes,
+            image_fallback=self.config.image_provider_fallback,
+        )
+        required = {
+            "text": "chat",
+            "image": "images",
+            "audio": "audio",
+            "video": "video",
+        }
+        for operation, capability in required.items():
+            provider = registry.get(registry.routes[operation])
+            if capability not in provider.capabilities:
+                raise ValueError(
+                    f"Провайдер '{provider.id}' не поддерживает операцию "
+                    f"'{operation}' ({capability})."
+                )
+        return registry
+
+    def _new_http_client(self, provider: ProviderConfig) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.timeout),
+            follow_redirects=False,
+            verify=_ssl_context(),
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "AssistAIClient/1.0",
+            },
+        )
+
+    def _endpoint(self, operation: str) -> ProviderConfig:
+        """Основной провайдер операции: ``text``/``chat``, ``image``, ``audio``, ``video``."""
+        primary, _fallback = self._registry.resolve_route(operation)
+        return primary
+
+    def _client_for(self, provider: ProviderConfig) -> httpx.AsyncClient:
+        """JSON-клиент провайдера. ProxyAPI — ``self._http``, остальные — лениво."""
+        if provider.id == "proxyapi":
+            return self._http
+        client = self._extra_clients.get(provider.id)
+        if client is None:
+            client = self._new_http_client(provider)
+            self._extra_clients[provider.id] = client
+        return client
+
+    def provider_ids(self) -> list[str]:
+        """Зарегистрированные провайдеры (для health)."""
+        return sorted(self._registry.providers)
 
     def _register_builtin_tools(self) -> None:
         if self.config.openweather_api_key:
@@ -1843,6 +1989,9 @@ class AssistAIClient:
             return
         self._closed = True
         await self._http.aclose()
+        for extra in self._extra_clients.values():
+            await extra.aclose()
+        self._extra_clients.clear()
         if self._weather_client is not None:
             await self._weather_client.close()
             self._weather_client = None
@@ -2151,11 +2300,17 @@ class AssistAIClient:
         return downscale_for_edit(data, mime, self.config.image_input_max_edge)
 
     async def _post_image_json(
-        self, payload: dict[str, Any], timeout: httpx.Timeout
+        self,
+        payload: dict[str, Any],
+        timeout: httpx.Timeout,
+        provider: ProviderConfig | None = None,
     ) -> dict[str, Any]:
         """POST генерации. Один повтор без quality/complexity, если провайдер их отверг."""
+        target = provider or self._endpoint("image")
         try:
-            return await self._post_json(_IMAGES_PATH, payload, timeout=timeout)
+            return await self._post_json(
+                _IMAGES_PATH, payload, timeout=timeout, provider=target
+            )
         except AssistAIError as exc:
             if not _image_params_rejected(exc, payload):
                 raise
@@ -2165,7 +2320,10 @@ class AssistAIClient:
                 status_code=exc.status_code,
             )
             return await self._post_json(
-                _IMAGES_PATH, _without_image_params(payload), timeout=timeout
+                _IMAGES_PATH,
+                _without_image_params(payload),
+                timeout=timeout,
+                provider=target,
             )
 
     async def _post_image_edit(
@@ -2173,10 +2331,12 @@ class AssistAIClient:
         form: dict[str, str],
         files: dict[str, tuple[str, bytes, str]]
         | list[tuple[str, tuple[str, bytes, str]]],
+        provider: ProviderConfig | None = None,
     ) -> dict[str, Any]:
         """Multipart ``/images/edits`` с одним повтором без quality/complexity."""
+        target = provider or self._endpoint("image")
         try:
-            return await self._post_edit_once(form, files)
+            return await self._post_edit_once(form, files, target)
         except AssistAIError as exc:
             if not _image_params_rejected(exc, form):
                 raise
@@ -2185,15 +2345,20 @@ class AssistAIClient:
                 model=form.get("model"),
                 status_code=exc.status_code,
             )
-            return await self._post_edit_once(_without_image_params(form), files)
+            return await self._post_edit_once(
+                _without_image_params(form), files, target
+            )
 
     async def _post_edit_once(
         self,
         form: dict[str, str],
         files: dict[str, tuple[str, bytes, str]]
         | list[tuple[str, tuple[str, bytes, str]]],
+        provider: ProviderConfig | None = None,
     ) -> dict[str, Any]:
-        url = f"{self.config.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
+        target = provider or self._endpoint("image")
+        label = _provider_label(target)
+        url = f"{target.base_url.rstrip('/')}/{_IMAGES_EDIT_PATH}"
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         try:
@@ -2202,7 +2367,7 @@ class AssistAIClient:
                 follow_redirects=False,
                 verify=_ssl_context(),
                 headers={
-                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "Authorization": f"Bearer {target.api_key}",
                     "User-Agent": "AssistAIClient/1.0",
                 },
             ) as client:
@@ -2211,24 +2376,149 @@ class AssistAIClient:
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
             raise AssistAIError(
-                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                f"{label} вернул HTTP {exc.response.status_code}: {detail}",
                 status_code=exc.response.status_code,
+                retry_after=_retry_after_seconds(exc.response),
             ) from exc
         except httpx.TimeoutException as exc:
             raise AssistAIError(
-                f"Превышено время ожидания ответа ProxyAPI ({_IMAGES_EDIT_PATH})."
+                f"Превышено время ожидания ответа {label} ({_IMAGES_EDIT_PATH}).",
+                error_code="TIMEOUT",
             ) from exc
         except httpx.RequestError as exc:
             raise AssistAIError(
-                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+                f"Сетевая ошибка при обращении к {label}: {exc}",
+                error_code="NETWORK_ERROR",
             ) from exc
         try:
             data = response.json()
         except ValueError as exc:
-            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+            raise AssistAIError(f"{label} вернул ответ не в формате JSON.") from exc
         if not isinstance(data, dict):
-            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+            raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
         return data
+
+    async def _polza_image(
+        self,
+        provider: ProviderConfig,
+        *,
+        model: str,
+        prompt: str,
+        size: str,
+        images: list[bytes] | None = None,
+    ) -> dict[str, Any]:
+        """Генерация или правка через Polza ``/v1/media`` под breaker провайдера."""
+        breaker = get_breaker(provider.id)
+        try:
+            await breaker.ensure_allows_call()
+        except CircuitBreakerError as exc:
+            raise AssistAIError(
+                "⚠️ Сервис генерации изображений временно недоступен. "
+                "Попробуйте через минуту.",
+                error_code="CIRCUIT_OPEN",
+            ) from exc
+        fields = polza_media.polza_size_fields(size)
+        read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
+        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+        try:
+            result = await polza_media.generate(
+                self._client_for(provider),
+                provider,
+                model=model,
+                prompt=prompt,
+                aspect_ratio=fields.get("aspect_ratio"),
+                size=fields.get("size"),
+                quality=self.config.image_quality,
+                images=images,
+                user=polza_media.hash_user_id(get_billing_user()),
+                poll_interval=self.config.polza_poll_interval,
+                total_wait=self.config.polza_total_wait,
+                timeout=timeout,
+            )
+        except AssistAIError as exc:
+            # Только недоступность считается сбоем breaker-а; 4xx и 429 — нет.
+            reason = fallback_reason(exc)
+            if reason is not None and reason != "rate_limited":
+                await breaker._on_failure(exc)
+            raise
+        await breaker._on_success()
+        return result.as_images_response()
+
+    async def _attempt_image(
+        self,
+        provider: ProviderConfig,
+        attempt: Callable[[ProviderConfig], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Один провайдер: до двух повторов на 429 (``Retry-After`` или 1/2 с)."""
+        retries = 0
+        while True:
+            try:
+                return await attempt(provider)
+            except AssistAIError as exc:
+                if not is_rate_limited(exc) or retries >= _RATE_LIMIT_RETRIES:
+                    raise
+                delay = (
+                    exc.retry_after
+                    if exc.retry_after is not None
+                    else float(2**retries)
+                )
+                delay = min(max(delay, 0.0), _MAX_RETRY_AFTER_SECONDS)
+                retries += 1
+                logger.warning(
+                    "provider_rate_limited",
+                    provider=provider.id,
+                    retry=retries,
+                    delay=delay,
+                )
+                await _sleep(delay)
+
+    async def _image_with_fallback(
+        self,
+        attempt: Callable[[ProviderConfig], Awaitable[dict[str, Any]]],
+    ) -> tuple[dict[str, Any], ProviderConfig]:
+        """Картинка у основного провайдера; один fallback только при недоступности."""
+        primary, fallback = self._registry.resolve_route("image")
+        try:
+            return await self._attempt_image(primary, attempt), primary
+        except AssistAIError as exc:
+            reason = fallback_reason(exc)
+            if reason == "insufficient_balance":
+                logger.error("provider_balance_exhausted", provider=primary.id)
+            if fallback is None or reason is None:
+                raise
+            logger.warning(
+                "provider_fallback",
+                **{"from": primary.id, "to": fallback.id, "reason": reason},
+            )
+            note_provider_fallback(primary.id, fallback.id, reason)
+            return await self._attempt_image(fallback, attempt), fallback
+
+    async def _record_image_spend(
+        self,
+        *,
+        count: int,
+        model: str,
+        size: str,
+        data: dict[str, Any],
+        provider: ProviderConfig,
+    ) -> None:
+        estimate = cost_tracker.estimate_image_cost_detailed(
+            count,
+            model=model,
+            quality=self.config.image_quality,
+            size=size,
+            usage=_usage_dict(data),
+            provider=provider,
+            rub_per_usd=self.config.rub_per_usd,
+        )
+        await cost_tracker.record(
+            kind="image",
+            amount_usd=estimate.amount_usd,
+            provider=provider.id,
+            model=model,
+            source=estimate.source,
+            cost_rub=estimate.cost_rub,
+        )
 
     async def generate_image(
         self,
@@ -2238,7 +2528,9 @@ class AssistAIClient:
     ) -> list[str]:
         """Генерирует изображение и возвращает URL или строки base64.
 
-        Запрос уходит на ``{base_url}/images/generations``. Если элемент ответа
+        Запрос уходит основному провайдеру картинок: ProxyAPI
+        ``{base_url}/images/generations`` или Polza ``/v1/media``
+        (``IMAGE_PROVIDER``). Если элемент ответа
         содержит ``url``, в список попадает он. Иначе, при наличии ``b64_json``,
         возвращается сама строка base64 без префикса data-URL.
 
@@ -2272,6 +2564,8 @@ class AssistAIClient:
             model=selected_model,
             quality=self.config.image_quality,
             size=size,
+            provider=self._endpoint("image"),
+            rub_per_usd=self.config.rub_per_usd,
         )
         try:
             await cost_tracker.check_budget(estimated=image_cost)
@@ -2299,7 +2593,23 @@ class AssistAIClient:
             size=size_label,
             prompt_chars=len(sanitized_prompt),
         )
-        data = await self._post_image_json(payload, timeout=timeout)
+        polza_size = size.strip()
+        if image_model_family(selected_model) == "openai":
+            polza_size = _OPENAI_SIZE_ALIASES.get(polza_size, polza_size)
+
+        async def attempt(provider: ProviderConfig) -> dict[str, Any]:
+            if provider.kind == "polza_media":
+                return await self._polza_image(
+                    provider,
+                    model=selected_model,
+                    prompt=sanitized_prompt,
+                    size=polza_size,
+                )
+            return await self._post_image_json(
+                payload, timeout=timeout, provider=provider
+            )
+
+        data, used = await self._image_with_fallback(attempt)
 
         records = _image_records(data)
         self._generation_ids = [record.get("generation_id") for record in records]
@@ -2307,18 +2617,15 @@ class AssistAIClient:
 
         if not images:
             logger.error("generate_image: в ответе нет url и b64_json")
-            raise AssistAIError("ProxyAPI не вернул изображение.")
+            raise AssistAIError(f"{_provider_label(used)} не вернул изображение.")
 
         logger.info("generate_image: получено изображений: %s", len(images))
-        await cost_tracker.record(
-            kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(
-                len(images),
-                model=selected_model,
-                quality=self.config.image_quality,
-                size=str(size_label),
-                usage=_usage_dict(data),
-            ),
+        await self._record_image_spend(
+            count=len(images),
+            model=selected_model,
+            size=str(size_label),
+            data=data,
+            provider=used,
         )
         return images
 
@@ -2331,7 +2638,7 @@ class AssistAIClient:
         mime_type: str = "image/png",
         model: str | None = None,
     ) -> list[str]:
-        """Редактирует изображение через ``/images/edits`` (multipart)."""
+        """Редактирует изображение через ``/images/edits`` (multipart) или Polza media."""
         if not image_bytes:
             raise ValueError("image_bytes не может быть пустым.")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -2342,9 +2649,10 @@ class AssistAIClient:
         selected_model = model or self.config.default_image_edit_model
         edit_size = self._resolve_edit_size(None, image_bytes)
         image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
+        sanitized = security.sanitize_prompt(prompt.strip())
         body = _image_generation_body(
             selected_model,
-            security.sanitize_prompt(prompt.strip()),
+            sanitized,
             edit_size,
             quality=self.config.image_quality,
             complexity=self.config.image_complexity_edit,
@@ -2360,22 +2668,34 @@ class AssistAIClient:
             bytes=len(image_bytes),
             prompt_chars=len(prompt),
         )
-        data = await self._post_image_edit(form, files)
+        polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
+
+        async def attempt(provider: ProviderConfig) -> dict[str, Any]:
+            if provider.kind == "polza_media":
+                return await self._polza_image(
+                    provider,
+                    model=selected_model,
+                    prompt=sanitized,
+                    size=polza_size,
+                    images=[image_bytes],
+                )
+            return await self._post_image_edit(form, files, provider)
+
+        data, used = await self._image_with_fallback(attempt)
 
         records = _image_records(data)
         self._generation_ids = [record.get("generation_id") for record in records]
         images = [record["value"] for record in records]
         if not images:
-            raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
-        await cost_tracker.record(
-            kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(
-                len(images),
-                model=selected_model,
-                quality=self.config.image_quality,
-                size=edit_size,
-                usage=_usage_dict(data),
-            ),
+            raise AssistAIError(
+                f"{_provider_label(used)} не вернул отредактированное изображение."
+            )
+        await self._record_image_spend(
+            count=len(images),
+            model=selected_model,
+            size=edit_size,
+            data=data,
+            provider=used,
         )
         return images
 
@@ -2388,7 +2708,7 @@ class AssistAIClient:
         labels: list[str] | None = None,
         size: str | None = None,
     ) -> list[str]:
-        """Правит несколько фото через multipart ``/images/edits``.
+        """Правит несколько фото через multipart ``/images/edits`` или Polza media.
 
         Первый файл — основа. Поле формы — ``image[]``. Размер уходит в полях
         семейства модели, как у ``generate_image``.
@@ -2406,50 +2726,66 @@ class AssistAIClient:
         for raw, name, mime in files:
             scaled_data, scaled_mime = self._downscale_edit_input(raw, mime)
             scaled.append((scaled_data, name, scaled_mime))
-        prepared = prepare_edit_files(scaled, selected_model, labels)
-        sanitized = security.sanitize_prompt(prompt.strip())
-        if labels:
-            numbered = ", ".join(labels)
-            sanitized = f"{sanitized}\nImage order: {numbered}."
-        if len(prepared) == 1 and len(files) > 1:
-            sanitized = (
-                f"{sanitized} The canvas is a side-by-side composite. "
-                "The left half is the base image."
+        polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
+
+        async def attempt(provider: ProviderConfig) -> dict[str, Any]:
+            # Лимит и склейка зависят от провайдера, поэтому готовим файлы здесь.
+            prepared = prepare_edit_files(
+                scaled, selected_model, labels, provider=provider
             )
-        body = _image_generation_body(
-            selected_model,
-            sanitized,
-            edit_size,
-            quality=self.config.image_quality,
-            complexity=self.config.image_complexity_edit,
-            send_complexity=self.config.send_complexity,
-        )
-        form = {key: str(value) for key, value in body.items() if key not in {"n"}}
-        multipart = [
-            ("image[]", (name, data, mime or "application/octet-stream"))
-            for data, name, mime in prepared
-        ]
-        logger.info(
-            "edit_image",
-            model=selected_model,
-            files=len(prepared),
-            prompt_chars=len(sanitized),
-        )
-        payload = await self._post_image_edit(form, multipart)
+            sanitized = security.sanitize_prompt(prompt.strip())
+            if labels:
+                numbered = ", ".join(labels)
+                sanitized = f"{sanitized}\nImage order: {numbered}."
+            if len(prepared) == 1 and len(files) > 1:
+                sanitized = (
+                    f"{sanitized} The canvas is a side-by-side composite. "
+                    "The left half is the base image."
+                )
+            logger.info(
+                "edit_image",
+                model=selected_model,
+                files=len(prepared),
+                prompt_chars=len(sanitized),
+                provider=provider.id,
+            )
+            if provider.kind == "polza_media":
+                return await self._polza_image(
+                    provider,
+                    model=selected_model,
+                    prompt=sanitized,
+                    size=polza_size,
+                    images=[data for data, _name, _mime in prepared],
+                )
+            body = _image_generation_body(
+                selected_model,
+                sanitized,
+                edit_size,
+                quality=self.config.image_quality,
+                complexity=self.config.image_complexity_edit,
+                send_complexity=self.config.send_complexity,
+            )
+            form = {key: str(value) for key, value in body.items() if key not in {"n"}}
+            multipart = [
+                ("image[]", (name, data, mime or "application/octet-stream"))
+                for data, name, mime in prepared
+            ]
+            return await self._post_image_edit(form, multipart, provider)
+
+        payload, used = await self._image_with_fallback(attempt)
         records = _image_records(payload)
         self._generation_ids = [record.get("generation_id") for record in records]
         images = [record["value"] for record in records]
         if not images:
-            raise AssistAIError("ProxyAPI не вернул отредактированное изображение.")
-        await cost_tracker.record(
-            kind="image",
-            amount_usd=cost_tracker.estimate_image_cost(
-                len(images),
-                model=selected_model,
-                quality=self.config.image_quality,
-                size=edit_size,
-                usage=_usage_dict(payload),
-            ),
+            raise AssistAIError(
+                f"{_provider_label(used)} не вернул отредактированное изображение."
+            )
+        await self._record_image_spend(
+            count=len(images),
+            model=selected_model,
+            size=edit_size,
+            data=payload,
+            provider=used,
         )
         return images
 
@@ -2482,7 +2818,10 @@ class AssistAIClient:
             connect=self.config.timeout,
         )
         logger.info("generate_video_create", model=selected_model, payload=payload)
-        created = await self._post_json(_VIDEOS_PATH, payload, timeout=create_timeout)
+        video_provider = self._endpoint("video")
+        created = await self._post_json(
+            _VIDEOS_PATH, payload, timeout=create_timeout, provider=video_provider
+        )
         job_id = created.get("id")
         if not isinstance(job_id, str) or not job_id:
             raise AssistAIError("ProxyAPI не вернул id видео-задачи.")
@@ -2490,7 +2829,7 @@ class AssistAIClient:
         status_url = (
             polling_url
             if isinstance(polling_url, str) and polling_url.startswith("http")
-            else f"{self.config.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
+            else f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
         )
 
         deadline = time.monotonic() + _VIDEO_POLL_MAX_SECONDS
@@ -2505,7 +2844,7 @@ class AssistAIClient:
                 )
             await asyncio.sleep(_VIDEO_POLL_INTERVAL)
             try:
-                response = await self._http.get(
+                response = await self._client_for(video_provider).get(
                     status_url, timeout=httpx.Timeout(30.0, connect=self.config.timeout)
                 )
                 response.raise_for_status()
@@ -2519,7 +2858,7 @@ class AssistAIClient:
             raise AssistAIError("Таймаут ожидания генерации видео.")
 
         content_url = (
-            f"{self.config.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}/content"
+            f"{video_provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}/content"
         )
         unsigned = status_payload.get("unsigned_urls")
         if isinstance(unsigned, list) and unsigned:
@@ -2527,13 +2866,13 @@ class AssistAIClient:
             if isinstance(first, str) and first.startswith("http"):
                 content_url = first
         try:
-            response = await self._http.get(
+            response = await self._client_for(video_provider).get(
                 content_url,
                 timeout=httpx.Timeout(
                     max(self.config.timeout, _VIDEO_READ_TIMEOUT),
                     connect=self.config.timeout,
                 ),
-                headers={"Authorization": f"Bearer {self.config.proxyapi_key}"},
+                headers={"Authorization": f"Bearer {video_provider.api_key}"},
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
@@ -2575,7 +2914,8 @@ class AssistAIClient:
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_transcribe_model
-        url = f"{self.config.base_url.rstrip('/')}/{_TRANSCRIBE_PATH}"
+        audio_provider = self._endpoint("audio")
+        url = f"{audio_provider.base_url.rstrip('/')}/{_TRANSCRIBE_PATH}"
         form: dict[str, str] = {"model": selected_model}
         if language:
             form["language"] = language
@@ -2597,7 +2937,7 @@ class AssistAIClient:
                 follow_redirects=False,
                 verify=_ssl_context(),
                 headers={
-                    "Authorization": f"Bearer {self.config.proxyapi_key}",
+                    "Authorization": f"Bearer {audio_provider.api_key}",
                     "User-Agent": "AssistAIClient/1.0",
                 },
             ) as client:
@@ -2688,7 +3028,8 @@ class AssistAIClient:
             "voice": selected_voice,
             "response_format": selected_format,
         }
-        url = f"{self.config.base_url.rstrip('/')}/{_SPEECH_PATH}"
+        speech_provider = self._endpoint("audio")
+        url = f"{speech_provider.base_url.rstrip('/')}/{_SPEECH_PATH}"
         read_timeout = max(self.config.timeout, _SPEECH_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info(
@@ -2699,7 +3040,9 @@ class AssistAIClient:
             len(text),
         )
         try:
-            response = await self._http.post(url, json=payload, timeout=timeout)
+            response = await self._client_for(speech_provider).post(
+                url, json=payload, timeout=timeout
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
@@ -2777,20 +3120,23 @@ class AssistAIClient:
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
+        provider = self._endpoint("text")
+        breaker = get_breaker(provider.id)
         try:
-            await llm_breaker.ensure_allows_call()
+            await breaker.ensure_allows_call()
         except CircuitBreakerError as exc:
             raise AssistAIError(
-                "⚠️ LLM сервис временно недоступен. Попробуйте через минуту."
+                "⚠️ LLM сервис временно недоступен. Попробуйте через минуту.",
+                error_code="CIRCUIT_OPEN",
             ) from exc
 
-        url = f"{self.config.base_url.rstrip('/')}/{_CHAT_PATH}"
+        url = f"{provider.base_url.rstrip('/')}/{_CHAT_PATH}"
         read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         logger.info("proxy_api_stream", url=url, path=_CHAT_PATH)
         t0 = time.perf_counter()
         try:
-            async with self._http.stream(
+            async with self._client_for(provider).stream(
                 "POST", url, json=payload, timeout=timeout
             ) as response:
                 await self._raise_for_stream_status(response, _CHAT_PATH)
@@ -2813,20 +3159,20 @@ class AssistAIClient:
             API_CALLS.labels(
                 service="proxy_api", endpoint="chat_stream", status="success"
             ).inc()
-            await llm_breaker._on_success()
+            await breaker._on_success()
         except AssistAIError as exc:
             API_CALLS.labels(
                 service="proxy_api", endpoint="chat_stream", status="error"
             ).inc()
             ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
-            await llm_breaker._on_failure(exc)
+            await breaker._on_failure(exc)
             raise
         except httpx.TimeoutException as exc:
             API_CALLS.labels(
                 service="proxy_api", endpoint="chat_stream", status="error"
             ).inc()
             ERRORS.labels(error_type="TimeoutException", module="proxy_api").inc()
-            await llm_breaker._on_failure(exc)
+            await breaker._on_failure(exc)
             logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
             raise AssistAIError(
                 f"Превышено время ожидания ответа ProxyAPI ({_CHAT_PATH})."
@@ -2836,7 +3182,7 @@ class AssistAIClient:
                 service="proxy_api", endpoint="chat_stream", status="error"
             ).inc()
             ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
-            await llm_breaker._on_failure(exc)
+            await breaker._on_failure(exc)
             logger.error("proxy_api_stream_network", path=_CHAT_PATH, error=str(exc))
             raise AssistAIError(
                 f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
@@ -2868,21 +3214,44 @@ class AssistAIClient:
             status_code=response.status_code,
         )
 
-    async def test_connection(self) -> None:
-        """Лёгкая проверка доступности ProxyAPI для health check.
+    async def probe_provider(self, provider_id: str) -> None:
+        """Лёгкая проверка доступности одного провайдера для health check.
 
-        Делает OPTIONS/короткий запрос к базе. Ошибка сети или HTTP 5xx
-        считается недоступностью; 401/404 при живом хосте — ок.
+        Короткий GET к базе. Ошибка сети или HTTP 5xx считается недоступностью;
+        401/404 при живом хосте — ок.
         """
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
-        url = self.config.base_url.rstrip("/") + "/"
+        provider = self._registry.get(provider_id)
+        base = provider.base_url.rstrip("/")
+        url = f"{base}/v1/models" if provider.kind == "polza_media" else f"{base}/"
+        label = _provider_label(provider)
         try:
-            response = await self._http.get(url, timeout=httpx.Timeout(5.0))
+            response = await self._client_for(provider).get(
+                url, timeout=httpx.Timeout(5.0)
+            )
         except httpx.HTTPError as exc:
-            raise AssistAIError(f"ProxyAPI недоступен: {exc}") from exc
+            raise AssistAIError(f"{label} недоступен: {exc}") from exc
         if response.status_code >= 500:
-            raise AssistAIError(f"ProxyAPI недоступен: HTTP {response.status_code}")
+            raise AssistAIError(f"{label} недоступен: HTTP {response.status_code}")
+
+    async def test_connection(self) -> None:
+        """Проверка всех зарегистрированных провайдеров.
+
+        Падает, если недоступен хотя бы один; в тексте ошибки — id провайдеров.
+        """
+        if self._closed:
+            raise AssistAIError("Клиент уже закрыт.")
+        failed: list[str] = []
+        details: list[str] = []
+        for provider_id in self.provider_ids():
+            try:
+                await self.probe_provider(provider_id)
+            except AssistAIError as exc:
+                failed.append(provider_id)
+                details.append(exc.message)
+        if failed:
+            raise AssistAIError("; ".join(details))
 
     async def _record_chat_usage(
         self, data: dict[str, Any], messages: list[dict[str, Any]]
@@ -2905,7 +3274,14 @@ class AssistAIClient:
             input_chars=0 if prompt_tokens is not None else input_chars,
             output_chars=0,
         )
-        await cost_tracker.record(kind="chat", amount_usd=amount)
+        model_name = data.get("model") if isinstance(data, dict) else None
+        await cost_tracker.record(
+            kind="chat",
+            amount_usd=amount,
+            provider=self._endpoint("text").id,
+            model=model_name if isinstance(model_name, str) else None,
+            source="usage" if prompt_tokens is not None else "flat",
+        )
 
     async def _record_chat_estimate(
         self, messages: list[dict[str, Any]], output_text: str
@@ -2916,7 +3292,12 @@ class AssistAIClient:
             input_chars=input_chars,
             output_chars=len(output_text),
         )
-        await cost_tracker.record(kind="chat", amount_usd=amount)
+        await cost_tracker.record(
+            kind="chat",
+            amount_usd=amount,
+            provider=self._endpoint("text").id,
+            source="flat",
+        )
 
     async def _post_json(
         self,
@@ -2924,22 +3305,29 @@ class AssistAIClient:
         payload: dict[str, Any],
         *,
         timeout: httpx.Timeout | None = None,
+        provider: ProviderConfig | None = None,
+        operation: str = "text",
     ) -> dict[str, Any]:
-        """POST JSON на ProxyAPI. Сетевые и HTTP-ошибки становятся ``AssistAIError``."""
+        """POST JSON провайдеру операции (по умолчанию — маршрут ``operation``).
+
+        Сетевые и HTTP-ошибки становятся ``AssistAIError``.
+        """
+        target = provider or self._endpoint(operation)
         try:
             return await safe_api_call(
-                llm_breaker,
+                get_breaker(target.id),
                 self._post_json_raw,
                 path,
                 payload,
                 timeout=timeout,
+                provider=target,
                 user_message=(
                     "⚠️ LLM сервис временно недоступен. Попробуйте через минуту."
                 ),
             )
         except APIUnavailableError as exc:
             logger.error("llm_unavailable", path=path, error=exc.message)
-            raise AssistAIError(exc.message) from exc
+            raise AssistAIError(exc.message, error_code="CIRCUIT_OPEN") from exc
 
     @track_api_call(service="proxy_api", endpoint="post_json")
     async def _post_json_raw(
@@ -2948,15 +3336,20 @@ class AssistAIClient:
         payload: dict[str, Any],
         *,
         timeout: httpx.Timeout | None = None,
+        provider: ProviderConfig | None = None,
     ) -> dict[str, Any]:
         """Фактический HTTP POST без circuit breaker (для метрик и breaker)."""
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
-        url = f"{self.config.base_url.rstrip('/')}/{path.lstrip('/')}"
+        target = provider or self._endpoint("text")
+        label = _provider_label(target)
+        url = f"{target.base_url.rstrip('/')}/{path.lstrip('/')}"
         logger.info("proxy_api_post", url=url, path=path)
         try:
-            response = await self._http.post(url, json=payload, timeout=timeout)
+            response = await self._client_for(target).post(
+                url, json=payload, timeout=timeout
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = _response_error_text(exc.response)
@@ -2967,28 +3360,31 @@ class AssistAIClient:
                 detail=detail,
             )
             raise AssistAIError(
-                f"ProxyAPI вернул HTTP {exc.response.status_code}: {detail}",
+                f"{label} вернул HTTP {exc.response.status_code}: {detail}",
                 status_code=exc.response.status_code,
+                retry_after=_retry_after_seconds(exc.response),
             ) from exc
         except httpx.TimeoutException as exc:
             logger.error("proxy_api_timeout", path=path)
             raise AssistAIError(
-                f"Превышено время ожидания ответа ProxyAPI ({path})."
+                f"Превышено время ожидания ответа {label} ({path}).",
+                error_code="TIMEOUT",
             ) from exc
         except httpx.RequestError as exc:
             logger.error("proxy_api_network_error", path=path, error=str(exc))
             raise AssistAIError(
-                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+                f"Сетевая ошибка при обращении к {label}: {exc}",
+                error_code="NETWORK_ERROR",
             ) from exc
 
         try:
             data = response.json()
         except ValueError as exc:
             logger.error("proxy_api_non_json", path=path)
-            raise AssistAIError("ProxyAPI вернул ответ не в формате JSON.") from exc
+            raise AssistAIError(f"{label} вернул ответ не в формате JSON.") from exc
 
         if not isinstance(data, dict):
-            raise AssistAIError("ProxyAPI вернул неожиданный формат ответа.")
+            raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
 
         error = data.get("error")
         if error:
@@ -2997,7 +3393,7 @@ class AssistAIClient:
             else:
                 message = str(error)
             logger.error("proxy_api_body_error", path=path, detail=message)
-            raise AssistAIError(f"ProxyAPI: {message}")
+            raise AssistAIError(f"{label}: {message}")
         return data
 
     @staticmethod

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from prometheus_client import Counter, Gauge
+
+if TYPE_CHECKING:
+    from app.llm.providers import ProviderConfig
 
 logger = structlog.get_logger("cost_tracker")
 
@@ -65,6 +70,15 @@ LLM_SPEND_USD = Counter(
     ["kind"],
 )
 
+# Новая метрика с разрезом по провайдеру/модели/источнику цены.
+# ``llm_spend_usd_total{kind}`` выше не меняется (дашборды и алерты).
+# source ∈ {cost_rub, usage, table, flat}.
+LLM_COST_USD = Counter(
+    "llm_cost_usd_total",
+    "Estimated LLM spend in USD by provider, model and cost source",
+    ["kind", "provider", "model", "source"],
+)
+
 LLM_BUDGET_REMAINING = Gauge(
     "llm_daily_budget_remaining_usd",
     "Remaining global daily LLM budget in USD",
@@ -74,7 +88,47 @@ LLM_BUDGET_REMAINING = Gauge(
 CHAT_INPUT_PER_1K = float(os.getenv("COST_CHAT_INPUT_PER_1K", "0.00015"))
 CHAT_OUTPUT_PER_1K = float(os.getenv("COST_CHAT_OUTPUT_PER_1K", "0.0006"))
 IMAGE_USD = float(os.getenv("COST_IMAGE_USD", "0.04"))
+# TODO calibration: заглушка, равная COST_IMAGE_USD. Реальное значение брать из
+# дашборда после ~10 генераций: Δ₽ / количество / RUB_PER_USD.
 IMAGE_FLUX_USD = float(os.getenv("COST_IMAGE_FLUX_USD", str(IMAGE_USD)))
+# Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
+RUB_PER_USD = float(os.getenv("RUB_PER_USD", "304") or 304)
+
+
+def _parse_flat_map(raw: str | None) -> dict[str, float]:
+    """``COST_IMAGE_FLAT_MAP``: JSON ``{"model-id": usd}``. Битый JSON → пустая карта."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        logger.warning("cost_image_flat_map_invalid")
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("cost_image_flat_map_invalid")
+        return {}
+    result: dict[str, float] = {}
+    for key, value in parsed.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value >= 0:
+            result[str(key).strip().casefold()] = float(value)
+    return result
+
+
+# TODO calibration: значения из дашборда, пока пусто — работает COST_IMAGE_FLUX_USD.
+IMAGE_FLAT_MAP: dict[str, float] = _parse_flat_map(os.getenv("COST_IMAGE_FLAT_MAP"))
+
+
+def flat_image_usd(model: str | None) -> float:
+    """Плоская ставка за картинку не-OpenAI модели: карта, затем ``COST_IMAGE_FLUX_USD``."""
+    if model:
+        found = IMAGE_FLAT_MAP.get(model.strip().casefold())
+        if found is not None:
+            return found
+    return IMAGE_FLUX_USD
+
+
 IMAGE_OUT_USD_PER_1M = float(os.getenv("IMAGE_OUT_USD_PER_1M", "30"))
 IMAGE_IN_USD_PER_1M = float(os.getenv("IMAGE_IN_USD_PER_1M", "8"))
 TEXT_IN_USD_PER_1M = float(os.getenv("TEXT_IN_USD_PER_1M", "5"))
@@ -180,6 +234,15 @@ def _image_cost_from_usage(usage: dict[str, Any] | None) -> float | None:
     return cost_from_usage(usage)
 
 
+@dataclass(frozen=True)
+class ImageCostEstimate:
+    """Оценка стоимости картинки: сумма, источник и исходные рубли (если были)."""
+
+    amount_usd: float
+    source: str
+    cost_rub: float | None = None
+
+
 class BudgetExceededError(Exception):
     """Raised when a call would exceed the configured daily budget."""
 
@@ -228,6 +291,50 @@ class CostTracker:
         )
 
     @staticmethod
+    def estimate_image_cost_detailed(
+        count: int = 1,
+        *,
+        model: str | None = None,
+        quality: str | None = None,
+        size: str | None = None,
+        usage: dict[str, Any] | None = None,
+        provider: ProviderConfig | None = None,
+        cost_rub: float | None = None,
+        rub_per_usd: float | None = None,
+    ) -> ImageCostEstimate:
+        """Стоимость и источник цены.
+
+        Порядок: 1) ``cost_rub`` / ``rub_per_usd`` (факт Polza); 2) токены ``usage``;
+        3) таблица quality; 4) плоская ставка. Для не-OpenAI моделей — плоская карта.
+        Оценки 2–4 умножаются на ``provider.cost_multiplier`` (для ProxyAPI 1.0,
+        для Polza — доля от прайса OpenAI), поэтому резерв и факт на одной шкале.
+        """
+        copies = max(1, count)
+        rate = rub_per_usd if rub_per_usd and rub_per_usd > 0 else RUB_PER_USD
+        multiplier = provider.cost_multiplier if provider is not None else 1.0
+        rub = cost_rub
+        if rub is None and isinstance(usage, dict):
+            raw_rub = usage.get("cost_rub")
+            if isinstance(raw_rub, (int, float)) and not isinstance(raw_rub, bool):
+                rub = float(raw_rub)
+        if rub is not None and rub >= 0:
+            return ImageCostEstimate(rub / rate, "cost_rub", rub)
+        if model and not _openai_image_model(model):
+            return ImageCostEstimate(
+                flat_image_usd(model) * copies * multiplier, "flat"
+            )
+        from_usage = _image_cost_from_usage(usage)
+        if from_usage is not None:
+            return ImageCostEstimate(from_usage * multiplier, "usage")
+        tokens = _image_output_tokens(quality, size)
+        if tokens is None:
+            return ImageCostEstimate(IMAGE_USD * copies * multiplier, "flat")
+        return ImageCostEstimate(
+            copies * tokens * IMAGE_OUT_USD_PER_1M / 1_000_000 * multiplier,
+            "table",
+        )
+
+    @staticmethod
     def estimate_image_cost(
         count: int = 1,
         *,
@@ -235,18 +342,21 @@ class CostTracker:
         quality: str | None = None,
         size: str | None = None,
         usage: dict[str, Any] | None = None,
+        provider: ProviderConfig | None = None,
+        cost_rub: float | None = None,
+        rub_per_usd: float | None = None,
     ) -> float:
-        """Стоимость картинки: usage, затем таблица quality, иначе плоская ставка."""
-        copies = max(1, count)
-        if model and not _openai_image_model(model):
-            return IMAGE_FLUX_USD * copies
-        from_usage = _image_cost_from_usage(usage)
-        if from_usage is not None:
-            return from_usage
-        tokens = _image_output_tokens(quality, size)
-        if tokens is None:
-            return IMAGE_USD * copies
-        return copies * tokens * IMAGE_OUT_USD_PER_1M / 1_000_000
+        """Стоимость картинки в условных USD (см. ``estimate_image_cost_detailed``)."""
+        return CostTracker.estimate_image_cost_detailed(
+            count,
+            model=model,
+            quality=quality,
+            size=size,
+            usage=usage,
+            provider=provider,
+            cost_rub=cost_rub,
+            rub_per_usd=rub_per_usd,
+        ).amount_usd
 
     @staticmethod
     def estimate_stt_cost(duration_seconds: float) -> float:
@@ -315,6 +425,10 @@ class CostTracker:
         kind: str,
         amount_usd: float,
         user_id: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        source: str | None = None,
+        cost_rub: float | None = None,
     ) -> None:
         """Persist spend and update Prometheus counters.
 
@@ -348,6 +462,12 @@ class CostTracker:
                 ttl_seconds=ttl,
             )
         LLM_SPEND_USD.labels(kind=kind).inc(amount_usd)
+        LLM_COST_USD.labels(
+            kind=kind,
+            provider=provider or "unknown",
+            model=model or "unknown",
+            source=source or "flat",
+        ).inc(amount_usd)
         if self.daily_budget > 0:
             spent = await self._get(f"cost:day:{day}")
             LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
@@ -357,6 +477,10 @@ class CostTracker:
             amount_usd=round(amount_usd, 6),
             user_id=user_id,
             reserved_cleared=round(reserved, 6),
+            provider=provider,
+            model=model,
+            source=source,
+            cost_rub=cost_rub,
         )
 
     async def _reserve(

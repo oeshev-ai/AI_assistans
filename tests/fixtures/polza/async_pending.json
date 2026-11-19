@@ -1,0 +1,7 @@
+{
+  "id": "gen_2234552383989092353",
+  "object": "media.generation",
+  "status": "pending",
+  "created": 1795062805,
+  "model": "openai/gpt-image-2.6-flare"
+}

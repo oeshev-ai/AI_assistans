@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
 
 from app.bot import runtime as R
@@ -254,7 +255,12 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     health_runner = await start_health_server(
         port=health_port,
         redis_client=shared_redis,
-        proxy_probe=assistant.test_connection,
+        proxy_probe=lambda: assistant.probe_provider("proxyapi"),
+        provider_probes={
+            provider_id: functools.partial(assistant.probe_provider, provider_id)
+            for provider_id in assistant.provider_ids()
+            if provider_id != "proxyapi"
+        },
         setup_app=_setup_upload_http,
     )
     dispatcher.workflow_data["health_runner"] = health_runner

@@ -28,6 +28,33 @@
 | правка, size=auto, вход 4032×3024 | — | low | 0.033416 | 10.16 |
 | генерация афиши | 1024×1536 | high | 0.041905 | 12.74 |
 
+### Провайдеры: роутинг, fallback и стоимость
+
+По умолчанию всё идёт через ProxyAPI. Картинки (генерация и правки) можно отправлять на Polza.ai через `POST /v1/media`; ProxyAPI при этом остаётся страховкой. Текст, аудио и видео адресуются отдельными переменными, но остаются на ProxyAPI.
+
+| провайдер | коэф. ₽ за $1 прайса OpenAI | правка 1536×1024 high | постер 1024×1536 high | генерация 1024² low |
+|---|---:|---:|---:|---:|
+| ProxyAPI | ~304 | 16.11 ₽ (замер) | 12.74 ₽ (замер) | 7.53 ₽ (замер) |
+| Polza.ai | ~118.6 | ~6.29 ₽ (расчёт по прайсу) | ~4.97 ₽ (пересчёт) | ~2.94 ₽ (пересчёт) |
+
+```text
+ TEXT/AUDIO/VIDEO_PROVIDER ──► proxyapi
+ IMAGE_PROVIDER ──► polza (/v1/media) ──ok──► результат
+                        │ недоступен: таймаут, 5xx, SERVICE_UNAVAILABLE,
+                        │ BAD_GATEWAY, REQUEST_TIMEOUT, breaker open,
+                        │ исчерпан POLZA_TOTAL_WAIT, 429 после 2 повторов,
+                        │ INSUFFICIENT_BALANCE (+ алерт provider_balance_exhausted)
+                        ▼
+              IMAGE_PROVIDER_FALLBACK (proxyapi) — ровно один раз
+ 400/401/403/404/413 и guard_* — без повторов и fallback
+```
+
+- Учёт: на Polza факт берётся из `usage.cost_rub / RUB_PER_USD`; если рублей нет — токены × `POLZA_COST_MULTIPLIER`. Единица учёта — прежний «условный USD»: **1 USD ≈ 304 ₽ реального расхода на ProxyAPI**.
+- Метрики: `provider_fallback_total{from,to,reason}`, `llm_cost_usd_total{kind,provider,model,source}`; `llm_spend_usd_total{kind}` не менялась.
+- **Потеря точных пикселей на Polza:** размер уходит как `aspect_ratio` (ближайшее из набора Polza) + `size` `WIDTHxHEIGHT`; для `gpt-image-2.6-flare` `image_resolution` не поддерживается (HTTP 400), итог проверен на 3:2 → 1536×1024, но для нестандартных пропорций сетка может отличаться. Вернуть прежнее поведение: `IMAGE_PROVIDER=proxyapi`.
+- **CDN Polza хранит результат 7 дней**; бот сразу отдаёт картинку в Telegram, но ссылки в логах и истории протухнут.
+- Апстрим пиннится (`POLZA_UPSTREAM_ONLY=OpenAI`, без fallback апстримов), потолок цены — `POLZA_MAX_PRICE_IMAGE_RUB`; контракт и наблюдения G0 — в `app/docs/polza-media-contract.md`.
+
 ## Как запустить
 
 ```bash

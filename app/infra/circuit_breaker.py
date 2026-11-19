@@ -144,9 +144,27 @@ def circuit(
     return decorator
 
 
-llm_breaker = AsyncCircuitBreaker(
-    name="llm_api", failure_threshold=5, recovery_timeout=60.0
-)
+_provider_breakers: dict[str, AsyncCircuitBreaker] = {}
+# Историческое имя breaker-а ProxyAPI в логах и дашбордах.
+_PROVIDER_BREAKER_NAMES = {"proxyapi": "llm_api"}
+
+
+def get_breaker(provider_id: str) -> AsyncCircuitBreaker:
+    """Breaker провайдера (создаётся лениво, один на id)."""
+    key = provider_id.strip().casefold()
+    breaker = _provider_breakers.get(key)
+    if breaker is None:
+        breaker = AsyncCircuitBreaker(
+            name=_PROVIDER_BREAKER_NAMES.get(key, f"{key}_api"),
+            failure_threshold=5,
+            recovery_timeout=60.0,
+        )
+        _provider_breakers[key] = breaker
+    return breaker
+
+
+# Алиас на breaker ProxyAPI: имя остаётся импортируемым.
+llm_breaker = get_breaker("proxyapi")
 weather_breaker = AsyncCircuitBreaker(
     name="weather_api", failure_threshold=5, recovery_timeout=60.0
 )

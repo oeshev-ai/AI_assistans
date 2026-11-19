@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import structlog
@@ -21,8 +21,13 @@ async def health_check(
     request: web.Request,
     redis_client: Any | None,
     proxy_probe: HealthProbe | None,
+    provider_probes: Mapping[str, HealthProbe] | None = None,
 ) -> web.Response:
-    """Return component status for Redis and ProxyAPI."""
+    """Return component status for Redis, ProxyAPI and extra LLM providers.
+
+    ``components.proxy_api`` is kept for compatibility; ``components.providers``
+    lists every provider (``proxyapi`` mirrors ``proxy_api``).
+    """
     health: dict[str, Any] = {
         "status": "healthy",
         "timestamp": time.time(),
@@ -52,6 +57,22 @@ async def health_check(
             health["components"]["proxy_api"] = "error"
             health["status"] = "degraded"
 
+    providers: dict[str, str] = {}
+    if proxy_probe is not None:
+        providers["proxyapi"] = health["components"]["proxy_api"]
+    for provider_id, probe in sorted((provider_probes or {}).items()):
+        try:
+            await probe()
+            providers[provider_id] = "ok"
+        except Exception as exc:
+            logger.warning(
+                "health_provider_failed", provider=provider_id, error=str(exc)
+            )
+            providers[provider_id] = "error"
+            health["status"] = "degraded"
+    if providers:
+        health["components"]["providers"] = providers
+
     if request.app.get("upload_enabled"):
         health["components"]["large_upload"] = "ok"
     else:
@@ -67,6 +88,7 @@ async def start_health_server(
     proxy_probe: HealthProbe | None = None,
     setup_app: AppSetup | None = None,
     bind: str | None = None,
+    provider_probes: Mapping[str, HealthProbe] | None = None,
 ) -> web.AppRunner:
     """Start an aiohttp app exposing ``GET /health``.
 
@@ -81,7 +103,7 @@ async def start_health_server(
     app["upload_enabled"] = False
 
     async def _handler(request: web.Request) -> web.Response:
-        return await health_check(request, redis_client, proxy_probe)
+        return await health_check(request, redis_client, proxy_probe, provider_probes)
 
     app.router.add_get("/health", _handler)
     if setup_app is not None:

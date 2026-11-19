@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "BAD_REQUEST",
+    "message": "Поле input.prompt должно быть строкой",
+    "trace_id": "94299cd0-e7a6-47a3-8880-75045cc923bd"
+  },
+  "trace_id": "94299cd0-e7a6-47a3-8880-75045cc923bd"
+}
