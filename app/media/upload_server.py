@@ -384,7 +384,9 @@ def setup_upload_routes(
             )
         except S3StorageError as exc:
             logger.warning("upload_presign_s3_failed", error=str(exc.message))
-            return web.json_response({"error": "Ошибка подготовки загрузки"}, status=500)
+            return web.json_response(
+                {"error": "Ошибка подготовки загрузки"}, status=500
+            )
 
         session.object_key = key
         session.filename = file_name
