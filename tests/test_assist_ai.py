@@ -10,16 +10,14 @@ import pytest
 from respx import MockRouter
 
 from app.bot.runtime import _extract_generated_images
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIError,
-    BaseTool,
-    ImageModelScope,
+from app.llm.assist_ai import AssistAIClient, AssistAIError, ImageModelScope
+from app.llm.chat_runtime import (
     _attach_chat_tools,
     _gpt6_chat_omit_tools,
     _gpt6_chat_tools_need_reasoning_none,
     _ToolCallBuilder,
 )
+from app.llm.tooling import BaseTool
 
 CHAT_URL = "https://api.proxyapi.ru/v1/chat/completions"
 

@@ -289,9 +289,7 @@ def track_upload_task(app: web.Application, task: asyncio.Task[Any]) -> None:
     task.add_done_callback(tasks.discard)
 
 
-async def drain_upload_tasks(
-    app: web.Application, *, timeout: float = 30.0
-) -> None:
+async def drain_upload_tasks(app: web.Application, *, timeout: float = 30.0) -> None:
     """Cancel in-flight upload completion tasks during process shutdown."""
     tasks: set[asyncio.Task[Any]] = set(app.get(UPLOAD_TASKS_KEY) or ())
     if not tasks:
@@ -522,39 +520,48 @@ def setup_upload_routes(
             session.error = error
             await store.update(session)
 
-        reader = await request.multipart()
-        field = await reader.next()
-        if not isinstance(field, BodyPartReader) or field.name != "file":
-            await _release_claim()
-            return web.json_response({"error": "Ожидалось поле file"}, status=400)
-
-        file_name = Path(field.filename or "media.bin").name
-        lower_name = file_name.lower()
-        if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
-            await _release_claim()
-            return web.json_response(
-                {"error": "Недопустимое расширение файла"}, status=400
-            )
-
-        header_ctype = (
-            (field.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        )
-        effective_type = header_ctype or _guess_mime(file_name)
-        if effective_type == "application/octet-stream":
-            effective_type = _guess_mime(file_name)
-        if (
-            effective_type not in allowed_mimes
-            and effective_type != "application/octet-stream"
-        ):
-            await _release_claim()
-            return web.json_response(
-                {"error": f"MIME не разрешён: {effective_type}"}, status=400
-            )
-
+        # Весь разбор multipart внутри try: иначе claim остаётся в processing.
         tmp_path: str | None = None
         size = 0
         too_large = False
         try:
+            try:
+                reader = await request.multipart()
+                field = await reader.next()
+            except Exception:
+                logger.exception("upload_file_multipart_failed", upload_id=upload_id)
+                # pending — клиент может повторить; processing не должен «зависнуть».
+                await _release_claim()
+                return web.json_response(
+                    {"error": "Некорректное тело запроса"}, status=400
+                )
+            if not isinstance(field, BodyPartReader) or field.name != "file":
+                await _release_claim()
+                return web.json_response({"error": "Ожидалось поле file"}, status=400)
+
+            file_name = Path(field.filename or "media.bin").name
+            lower_name = file_name.lower()
+            if not any(lower_name.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+                await _release_claim()
+                return web.json_response(
+                    {"error": "Недопустимое расширение файла"}, status=400
+                )
+
+            header_ctype = (
+                (field.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            )
+            effective_type = header_ctype or _guess_mime(file_name)
+            if effective_type == "application/octet-stream":
+                effective_type = _guess_mime(file_name)
+            if (
+                effective_type not in allowed_mimes
+                and effective_type != "application/octet-stream"
+            ):
+                await _release_claim()
+                return web.json_response(
+                    {"error": f"MIME не разрешён: {effective_type}"}, status=400
+                )
+
             with tempfile.NamedTemporaryFile(
                 delete=False, suffix=Path(file_name).suffix
             ) as tmp:

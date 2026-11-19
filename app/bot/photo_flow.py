@@ -17,7 +17,8 @@ from app.infra.cost_tracker import (
 )
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
-from app.llm.assist_ai import AssistAIError, ImageModelScope, image_model_family
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import ImageModelScope, image_model_family
 from app.llm.vision import (
     VisionError,
     build_multimodal_content,
@@ -331,17 +332,11 @@ async def _edit(
     status = await _status(turn, "Правлю изображение…")
     token = set_user_media(ordered)
     try:
-        try:
-            await cost_tracker.check_budget(
-                user_id, cost_tracker.estimate_image_cost(1)
-            )
-        except BudgetExceededError as exc:
-            await message.answer(exc.message)
-            return
         import app.infra.job_queue as job_queue
 
         with ImageModelScope(model, M._stored_image_size(profile)), MediaTurnScope():
             try:
+                # Budget preflight — в AssistAIClient.edit_images.
                 result = await job_queue.edit_images(
                     turn.assistant,
                     files,
@@ -350,6 +345,9 @@ async def _edit(
                     labels=labels,
                     size=edit_size,
                 )
+            except BudgetExceededError as exc:
+                await message.answer(exc.message)
+                return
             except AssistAIError as exc:
                 if "несколько изображений" in exc.message:
                     logger.info(
@@ -431,28 +429,18 @@ async def _generate(
     labels = [str(index + 1) for index in range(len(loaded))]
     prompt = security.sanitize_prompt(instruction)
     if files:
-        prompt = (
-            f"{prompt}\n"
-            + " ".join(
-                f"Image {index + 1} is a reference photo."
-                for index in range(len(files))
-            )
+        prompt = f"{prompt}\n" + " ".join(
+            f"Image {index + 1} is a reference photo." for index in range(len(files))
         )
     edit_size = _edit_size_for_model(size, generate_model, edit_model)
     status = await _status(turn, "Рисую изображение…")
     token = set_user_media(loaded)
     try:
-        try:
-            await cost_tracker.check_budget(
-                user_id, cost_tracker.estimate_image_cost(1)
-            )
-        except BudgetExceededError as exc:
-            await message.answer(exc.message)
-            return
         import app.infra.job_queue as job_queue
 
         model = edit_model if files else generate_model
         with ImageModelScope(model, size), MediaTurnScope():
+            # Budget preflight — в generate_image / edit_images.
             if files:
                 result = await job_queue.edit_images(
                     turn.assistant,
@@ -501,6 +489,8 @@ async def _generate(
             f"[Альбом: {len(media.items)} фото] {decision.instruction_ru or ''}".strip(),
             reply,
         )
+    except BudgetExceededError as exc:
+        await message.answer(exc.message)
     except AssistAIError as exc:
         await message.answer(exc.message)
     finally:

@@ -213,7 +213,7 @@ async def synthesize_speech(
             "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
         )
         payload = await job.result(timeout=timeout)
-        from app.llm.assist_ai import SpeechResult
+        from app.llm.media_api import SpeechResult
 
         return SpeechResult(
             audio=base64.b64decode(payload["audio_b64"]),
@@ -273,9 +273,7 @@ async def transcribe_audio(
                 model=model,
                 language=language,
             )
-        logger.info(
-            "arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id
-        )
+        logger.info("arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id)
         try:
             return str(await job.result(timeout=timeout))
         except Exception as exc:

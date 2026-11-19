@@ -10,16 +10,11 @@ from typing import Any, Literal, Self
 import structlog
 
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIError,
-    BaseTool,
-    SpeechResult,
-    _error_json,
-    _exception_text,
-    _get_generation_ids,
-    note_generation_id,
-)
+from app.llm.assist_ai import AssistAIClient
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import _get_generation_ids, note_generation_id
+from app.llm.media_api import SpeechResult
+from app.llm.tooling import BaseTool, _error_json, _exception_text
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
 logger = structlog.get_logger("media_tools")
@@ -239,6 +234,7 @@ class EditImageTool(BaseTool):
         )
         try:
             import app.infra.job_queue as job_queue
+            from app.infra.cost_tracker import BudgetExceededError
 
             result = await job_queue.edit_images(
                 self._client,
@@ -247,6 +243,8 @@ class EditImageTool(BaseTool):
                 model=selected,
                 labels=labels,
             )
+        except BudgetExceededError as exc:
+            return _error_json(exc.message)
         except AssistAIError as exc:
             return _error_json(exc.message)
         except (TypeError, ValueError) as exc:
@@ -395,7 +393,7 @@ class GenerateVideoTool(BaseTool):
         prompt = kwargs.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return _error_json("Параметр prompt обязателен.")
-        from app.infra.cost_tracker import get_billing_user
+        from app.infra.cost_tracker import BudgetExceededError, get_billing_user
         from app.infra.rate_limiter import rate_limiter
         from app.infra.security import security
 
@@ -411,12 +409,15 @@ class GenerateVideoTool(BaseTool):
         duration = kwargs.get("duration")
         resolution = kwargs.get("resolution")
         try:
+            # Budget preflight — в AssistAIClient.generate_video.
             video = await self._client.generate_video(
                 prompt=prompt,
                 model=selected,
                 duration=duration if isinstance(duration, int) else None,
                 resolution=resolution if isinstance(resolution, str) else None,
             )
+        except BudgetExceededError as exc:
+            return _error_json(exc.message)
         except AssistAIError as exc:
             return _error_json(exc.message)
         except Exception as exc:
@@ -501,9 +502,7 @@ class TranscribeMediaTool(BaseTool):
                 f"Слишком много медиа-запросов. Подождите {int(retry_after) or 60} секунд."
             )
         # Rough duration from payload size (~4 KB/s compressed audio).
-        estimated = cost_tracker.estimate_stt_cost(
-            max(15.0, len(source.data) / 4000.0)
-        )
+        estimated = cost_tracker.estimate_stt_cost(max(15.0, len(source.data) / 4000.0))
         try:
             await cost_tracker.check_budget(estimated=estimated)
         except BudgetExceededError as exc:

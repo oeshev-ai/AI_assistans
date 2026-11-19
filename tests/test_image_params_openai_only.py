@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.llm.assist_ai import _image_generation_body
+from app.llm.image_ops import _image_generation_body
 
 
 def test_legacy_pixel_sizes_map_to_current() -> None:

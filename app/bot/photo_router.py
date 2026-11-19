@@ -9,7 +9,8 @@ from typing import Any, Literal
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.llm.assist_ai import AssistAIClient, AssistAIError
+from app.llm.assist_ai import AssistAIClient
+from app.llm.errors import AssistAIError
 from app.llm.vision import build_image_content
 
 logger = structlog.get_logger("photo_router")

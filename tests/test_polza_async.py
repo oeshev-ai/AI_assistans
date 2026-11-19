@@ -30,7 +30,8 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         recorded.append(seconds)
 
     monkeypatch.setattr(polza_media, "_sleep", fake_sleep)
-    monkeypatch.setattr("app.llm.assist_ai._sleep", fake_sleep)
+    monkeypatch.setattr("app.llm.image_ops._sleep", fake_sleep)
+    monkeypatch.setattr("app.llm.transport._sleep", fake_sleep)
     return recorded
 
 
@@ -75,6 +76,8 @@ def test_capped_timeout_respects_remaining_budget() -> None:
 
     base = httpx.Timeout(60.0, connect=10.0)
     capped = _capped_timeout(base, 2.5)
+    assert capped.read is not None
+    assert capped.connect is not None
     assert float(capped.read) <= 2.5
     assert float(capped.connect) <= 2.5
 

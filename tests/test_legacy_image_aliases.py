@@ -62,9 +62,7 @@ def test_alias_flag_off_keeps_old_id_until_fallback(
 
 
 def test_from_env_without_image_vars(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "app.llm.assist_ai.load_dotenv", lambda *_args, **_kwargs: False
-    )
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *_args, **_kwargs: False)
     for name in (
         "PROXYAPI_IMAGE_MODEL",
         "PROXYAPI_IMAGE_EDIT_MODEL",

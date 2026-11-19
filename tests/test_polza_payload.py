@@ -14,13 +14,9 @@ import respx
 import structlog
 
 from app.infra.cost_tracker import set_billing_user
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIError,
-    max_edit_images,
-    prepare_edit_files,
-    supports_multi_image,
-)
+from app.llm.assist_ai import AssistAIClient
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import max_edit_images, prepare_edit_files, supports_multi_image
 from app.llm.polza_media import (
     POLZA_MAX_REFERENCE_IMAGES,
     build_media_body,

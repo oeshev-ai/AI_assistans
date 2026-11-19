@@ -59,13 +59,9 @@ from app.infra.logging_setup import (
 from app.infra.metrics import note_active_user, observe_message, start_metrics_server
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIConfig,
-    AssistAIError,
-    ImageModelScope,
-    image_model_family,
-)
+from app.llm.assist_ai import AssistAIClient, AssistAIConfig
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import ImageModelScope, image_model_family
 from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,

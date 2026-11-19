@@ -6,7 +6,8 @@ import io
 
 import pytest
 
-from app.llm.assist_ai import AssistAIError, prepare_edit_files
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import prepare_edit_files
 
 
 def _png(color: tuple[int, int, int]) -> bytes:

@@ -1093,7 +1093,9 @@ async def _process_s3_upload_session(
         data = await storage.download_bytes(object_key, max_bytes=max_bytes)
         from app.media.file_magic import mime_compatible
 
-        if not mime_compatible(filename=filename, claimed_mime=mime_type, head=data[:64]):
+        if not mime_compatible(
+            filename=filename, claimed_mime=mime_type, head=data[:64]
+        ):
             await bot.send_message(
                 chat_id, "Файл отклонён: содержимое не соответствует типу."
             )
@@ -1933,7 +1935,7 @@ async def _generate_and_send(
     finally:
         _KEEP_OUTGOING.reset(keep)
     try:
-        await cost_tracker.check_budget(user_id, cost_tracker.estimate_image_cost(1))
+        # Budget preflight живёт в AssistAIClient.generate_image (без двойной резервации).
         images = await job_queue.generate_image(assistant, prompt, model, size)
         await _delete_bot_message(progress)
         if not images:

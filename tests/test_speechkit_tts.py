@@ -9,12 +9,9 @@ import httpx
 import pytest
 from respx import MockRouter
 
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIConfig,
-    AssistAIError,
-    SpeechResult,
-)
+from app.llm.assist_ai import AssistAIClient, AssistAIConfig
+from app.llm.errors import AssistAIError
+from app.llm.media_api import SpeechResult
 from app.llm.speechkit_tts import (
     SpeechKitConfig,
     SpeechKitError,

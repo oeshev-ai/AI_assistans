@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from app.llm.assist_ai import _get_generation_ids, _set_generation_ids
+from app.llm.image_ops import _get_generation_ids, _set_generation_ids
 
 
 @pytest.mark.asyncio

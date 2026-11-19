@@ -391,9 +391,7 @@ def _network_error(exc: httpx.RequestError, operation: str) -> AssistAIError:
     return AssistAIError(_USER_MESSAGES["NETWORK_ERROR"], error_code="NETWORK_ERROR")
 
 
-def _capped_timeout(
-    base: httpx.Timeout | None, remaining: float
-) -> httpx.Timeout:
+def _capped_timeout(base: httpx.Timeout | None, remaining: float) -> httpx.Timeout:
     """HTTP timeout that never exceeds the poll wall-clock budget."""
     budget = max(0.05, remaining)
     connect = min(10.0, budget)

@@ -51,7 +51,8 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def fake_sleep(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("app.llm.assist_ai._sleep", fake_sleep)
+    monkeypatch.setattr("app.llm.image_ops._sleep", fake_sleep)
+    monkeypatch.setattr("app.llm.transport._sleep", fake_sleep)
     monkeypatch.setattr("app.llm.polza_media._sleep", fake_sleep)
     return recorded
 
@@ -73,7 +74,7 @@ def test_empty_env_routes_everything_to_proxyapi(
 
 
 def test_from_env_reads_routes_and_waits(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("app.llm.assist_ai.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
     monkeypatch.setenv("PROXYAPI_BASE_URL", "https://proxy.example/v9/")
     monkeypatch.setenv("POLZA_API_KEY", "pz-key")
@@ -94,7 +95,7 @@ def test_from_env_reads_routes_and_waits(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_from_env_defaults_match_pre_g2(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("app.llm.assist_ai.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
     monkeypatch.delenv("POLZA_API_KEY", raising=False)
     config = AssistAIConfig.from_env()
@@ -109,7 +110,7 @@ def test_from_env_defaults_match_pre_g2(monkeypatch: pytest.MonkeyPatch) -> None
 def test_unknown_image_provider_fails_at_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("app.llm.assist_ai.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
     monkeypatch.delenv("POLZA_API_KEY", raising=False)
     monkeypatch.setenv("IMAGE_PROVIDER", "polza")
