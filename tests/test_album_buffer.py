@@ -91,3 +91,35 @@ async def test_users_do_not_flush_each_others_albums() -> None:
     assert hub.has_pending(1, 20) is True
     assert await hub.flush_text(1, 20, "для 20", on_ready) is True
     assert ready[-1] == (20, "для 20")
+
+
+@pytest.mark.asyncio
+async def test_redis_merges_photos_from_peer_hub(fakeredis_client) -> None:
+    """Two hubs sharing Redis glue one media_group_id."""
+    left = AlbumHub(debounce=5)
+    right = AlbumHub(debounce=5)
+    left.attach_redis(fakeredis_client)
+    right.attach_redis(fakeredis_client)
+    ready: list[list[int]] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append([item.message_id for item in built.photos])
+
+    await left.add(1, 10, "g", _photo(1), "svc-a", on_ready)
+    await right.add(1, 10, "g", _photo(2), "svc-b", on_ready)
+    flushed = await left.flush_text(1, 10, "склей", on_ready)
+    assert flushed is True
+    assert ready == [[1, 2]]
+    # Peer must not deliver leftovers after Redis claim.
+    assert await right.flush_text(1, 10, "повтор", on_ready) is False
+    assert ready == [[1, 2]]
+
+
+@pytest.fixture
+async def fakeredis_client():
+    fakeredis = pytest.importorskip("fakeredis.aioredis")
+    client = fakeredis.FakeRedis(decode_responses=True)
+    try:
+        yield client
+    finally:
+        await client.aclose()

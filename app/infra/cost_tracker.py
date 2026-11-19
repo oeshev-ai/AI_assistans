@@ -110,9 +110,9 @@ LLM_BUDGET_REMAINING = Gauge(
 CHAT_INPUT_PER_1K = env_float("COST_CHAT_INPUT_PER_1K", 0.00015)
 CHAT_OUTPUT_PER_1K = env_float("COST_CHAT_OUTPUT_PER_1K", 0.0006)
 IMAGE_USD = env_float("COST_IMAGE_USD", 0.04)
-# TODO calibration: заглушка, равная COST_IMAGE_USD. Реальное значение брать из
-# дашборда после ~10 генераций: Δ₽ / количество / RUB_PER_USD.
-IMAGE_FLUX_USD = env_float("COST_IMAGE_FLUX_USD", IMAGE_USD)
+# FLUX klein ~1–2 ₽ → ~0.005 условных USD при RUB_PER_USD=304.
+# Уточнять по дашборду: Δ₽ / N / RUB_PER_USD → COST_IMAGE_FLAT_MAP.
+IMAGE_FLUX_USD = env_float("COST_IMAGE_FLUX_USD", 0.005)
 # Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
 RUB_PER_USD = env_float("RUB_PER_USD", 304.0)
 
@@ -138,7 +138,7 @@ def _parse_flat_map(raw: str | None) -> dict[str, float]:
     return result
 
 
-# TODO calibration: значения из дашборда, пока пусто — работает COST_IMAGE_FLUX_USD.
+# Per-model flat USD when usage missing; empty → COST_IMAGE_FLUX_USD for non-OpenAI.
 IMAGE_FLAT_MAP: dict[str, float] = _parse_flat_map(os.getenv("COST_IMAGE_FLAT_MAP"))
 
 

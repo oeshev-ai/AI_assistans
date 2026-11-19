@@ -193,6 +193,14 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     rate_limiter.attach_redis(shared_redis)
     cost_tracker.attach_redis(shared_redis)
     cost_tracker.require_llm_budgets_configured()
+    from app.bot.album import get_album_hub
+
+    get_album_hub().attach_redis(shared_redis)
+    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1":
+        logger.warning(
+            "photo_router_fast_path_enabled",
+            hint="Skips LLM router; forces edit at confidence 1.0 — keep 0 in production",
+        )
     await job_queue.init_job_queue(redis_url)
     dispatcher.workflow_data["shared_redis"] = shared_redis
     try:

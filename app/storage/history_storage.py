@@ -1,8 +1,11 @@
-"""Хранилище истории диалогов: Redis или память процесса.
+"""Legacy flat chat history (unused by the bot).
 
-Сообщения лежат в формате OpenAI: ``{"role": "...", "content": "..."}``.
-``AssistAIClient`` получает их как обычный ``list[dict]`` и сам список не
-является хранилищем: в модель уходит копия.
+The bot stores dialogs in ``topic_history.TopicHistoryStorage`` with
+``TOPIC_TTL_DAYS``. This module remains for ``trim_messages``, shared
+``RedisConfig``, and older tests. Do not wire ``ChatHistoryStorage`` into
+new bot paths — prefer topics.
+
+Сообщения: OpenAI ``{"role": "...", "content": "..."}``.
 """
 
 from __future__ import annotations

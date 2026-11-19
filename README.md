@@ -86,7 +86,7 @@ docker compose --profile arq up -d --build
 - История и профили переживают рестарт (Redis, `maxmemory-policy noeviction`); без Redis — in-memory fallback
 - Файлы > ~20 МБ обрабатываются через upload → Object Storage → авто-STT
 - Прод-контур: allowlist (`TELEGRAM_ALLOWED_USER_IDS`), опциональный `REDIS_PASSWORD`, лимиты, circuit breaker, метрики, health, CI
-- Альбомы фото буферизуются в процессе бота — один экземпляр polling (не несколько реплик без sticky routing)
+- Альбомы: debounce в процессе бота; метаданные фото дублируются в Redis (`shared_redis`), чтобы реплики могли склеить один `media_group_id`
 
 ## Контакт
 
