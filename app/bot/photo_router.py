@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,13 +75,51 @@ class PhotoDecision(BaseModel):
 
 
 def decision_schema() -> dict[str, Any]:
-    """response_format json_schema для PhotoDecision."""
+    """response_format json_schema для PhotoDecision.
+
+    OpenAI strict требует: все ключи ``properties`` в ``required``,
+    ``additionalProperties: false``, nullable через ``type: [T, null]``
+    (сырой ``model_json_schema()`` с ``anyOf`` и ``required: [intent]``
+    даёт HTTP 400 на GPT-6).
+    """
+    intent_values = list(get_args(PhotoIntent))
+    edit_values = list(get_args(EditType))
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "intent": {"type": "string", "enum": intent_values},
+            "base_index": {"type": ["integer", "null"]},
+            "reference_indexes": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "edit_type": {
+                "type": ["string", "null"],
+                "enum": [*edit_values, None],
+            },
+            "instruction_en": {"type": ["string", "null"]},
+            "instruction_ru": {"type": ["string", "null"]},
+            "question_ru": {"type": ["string", "null"]},
+            "confidence": {"type": "number"},
+        },
+        "required": [
+            "intent",
+            "base_index",
+            "reference_indexes",
+            "edit_type",
+            "instruction_en",
+            "instruction_ru",
+            "question_ru",
+            "confidence",
+        ],
+    }
     return {
         "type": "json_schema",
         "json_schema": {
             "name": "photo_decision",
             "strict": True,
-            "schema": PhotoDecision.model_json_schema(),
+            "schema": schema,
         },
     }
 

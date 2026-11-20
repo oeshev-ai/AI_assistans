@@ -115,6 +115,31 @@ async def test_redis_merges_photos_from_peer_hub(fakeredis_client) -> None:
     assert ready == [[1, 2]]
 
 
+@pytest.mark.asyncio
+async def test_redis_take_error_falls_back_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redis take failure must not drop the local album buffer."""
+    hub = AlbumHub(debounce=5)
+    hub.attach_redis(object())  # non-None marks Redis mode
+    ready: list[list[int]] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append([item.message_id for item in built.photos])
+
+    async def boom(_key):  # type: ignore[no-untyped-def]
+        return None, []
+
+    async def noop_append(_key, _photo) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(hub, "_redis_take", boom)
+    monkeypatch.setattr(hub, "_redis_append", noop_append)
+
+    await hub.add(1, 10, "g", _photo(3, "подпись"), "svc", on_ready)
+    flushed = await hub.flush_text(1, 10, "из локального", on_ready)
+    assert flushed is True
+    assert ready == [[3]]
+
+
 @pytest.fixture
 async def fakeredis_client():
     fakeredis = pytest.importorskip("fakeredis.aioredis")

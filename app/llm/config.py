@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 
-from app.llm.models_config import resolve_image_model
+from app.llm.models_config import resolve_image_model, resolve_text_model
 from app.llm.providers import ProviderConfig, ProviderRegistry
 
 logger = structlog.get_logger("AssistAI.config")
@@ -151,6 +151,14 @@ class AssistAIConfig(BaseModel):
         resolved = resolve_image_model(value) or value
         if resolved != value:
             logger.warning("image_model_aliased", source="env", old=value, new=resolved)
+        return resolved
+
+    @field_validator("default_text_model", "photo_router_model", mode="after")
+    @classmethod
+    def _alias_legacy_text_model(cls, value: str) -> str:
+        resolved = resolve_text_model(value) or value
+        if resolved != value:
+            logger.warning("text_model_aliased", source="env", old=value, new=resolved)
         return resolved
 
     @field_validator("base_url")

@@ -12,6 +12,7 @@ import structlog
 
 from app.infra.cost_tracker import cost_tracker, isolated_budget_reservation
 from app.llm.errors import AssistAIError
+from app.llm.models_config import resolve_polza_text_model, resolve_text_model
 from app.llm.tooling import ToolRegistry
 from app.llm.transport import _CHAT_PATH, ProviderTransportMixin
 
@@ -109,6 +110,23 @@ def _apply_generation_options(
         payload["max_tokens"] = max_tokens
 
 
+def _needs_max_completion_tokens_retry(exc: AssistAIError) -> bool:
+    """True если провайдер отклонил ``max_tokens`` в пользу ``max_completion_tokens``."""
+    if exc.status_code not in (400, None):
+        return False
+    text = (exc.message or "").casefold()
+    return "max_completion_tokens" in text and "max_tokens" in text
+
+
+def _swap_max_tokens_to_completion(payload: dict[str, Any]) -> int | None:
+    """Перекладывает ``max_tokens`` → ``max_completion_tokens``. Возвращает лимит."""
+    value = payload.pop("max_tokens", None)
+    if value is None:
+        return None
+    payload["max_completion_tokens"] = value
+    return int(value)
+
+
 def _assistant_stream_tool_message(
     reasoning: str,
     content: str,
@@ -192,6 +210,15 @@ class ChatRuntimeMixin(ProviderTransportMixin):
     _tools: ToolRegistry
     get_tools_schema: Callable[[], list[dict[str, Any]]]
 
+    def _resolve_chat_model(self, model: str | None) -> str:
+        """Модель для chat: legacy-алиас, на Polza — ещё алиас каталога."""
+        selected = resolve_text_model(model or self.config.default_text_model) or (
+            model or self.config.default_text_model
+        )
+        if self._endpoint("text").id == "polza":
+            return resolve_polza_text_model(selected) or selected
+        return selected
+
     async def chat_completion(
         self,
         messages: list[dict[str, Any]],
@@ -229,7 +256,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         if not messages:
             raise ValueError("Список messages не может быть пустым.")
 
-        selected_model = model or self.config.default_text_model
+        selected_model = self._resolve_chat_model(model)
         tools = self.get_tools_schema()
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
@@ -255,7 +282,22 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 self.config.max_tool_iterations,
                 len(messages),
             )
-            data = await self._post_json(_CHAT_PATH, payload)
+            try:
+                data = await self._post_json(_CHAT_PATH, payload)
+            except AssistAIError as exc:
+                if (
+                    "max_tokens" in payload
+                    and _needs_max_completion_tokens_retry(exc)
+                ):
+                    swapped = _swap_max_tokens_to_completion(payload)
+                    logger.info(
+                        "chat_max_tokens_remapped",
+                        model=selected_model,
+                        max_completion_tokens=swapped,
+                    )
+                    data = await self._post_json(_CHAT_PATH, payload)
+                else:
+                    raise
             message, finish_reason = self._extract_choice(data)
             await self._record_chat_usage(data, messages, assistant_message=message)
             raw_tool_calls = message.get("tool_calls") or []
@@ -346,7 +388,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         if not messages:
             raise ValueError("Список messages не может быть пустым.")
 
-        selected_model = model or self.config.default_text_model
+        selected_model = self._resolve_chat_model(model)
         tools = self.get_tools_schema()
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
@@ -377,35 +419,58 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             content_parts: list[str] = []
             tool_builder = _ToolCallBuilder()
             finish_reason = ""
+            remapped_max_tokens = False
 
-            async for chunk in self._iter_chat_chunks(payload):
-                choices = chunk.get("choices")
-                if not isinstance(choices, list) or not choices:
-                    continue
-                choice = choices[0]
-                if not isinstance(choice, dict):
-                    continue
-                reason = choice.get("finish_reason")
-                if isinstance(reason, str) and reason:
-                    finish_reason = reason
-                delta = choice.get("delta") or {}
-                if not isinstance(delta, dict):
-                    continue
+            while True:
+                try:
+                    async for chunk in self._iter_chat_chunks(payload):
+                        choices = chunk.get("choices")
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            continue
+                        reason = choice.get("finish_reason")
+                        if isinstance(reason, str) and reason:
+                            finish_reason = reason
+                        delta = choice.get("delta") or {}
+                        if not isinstance(delta, dict):
+                            continue
 
-                reasoning = _reasoning_piece(delta)
-                if reasoning:
-                    reasoning_parts.append(reasoning)
+                        reasoning = _reasoning_piece(delta)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
 
-                content = delta.get("content")
-                if isinstance(content, str) and content:
-                    content_parts.append(content)
-                    yield ChatDelta("content", content)
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            content_parts.append(content)
+                            yield ChatDelta("content", content)
 
-                raw_calls = delta.get("tool_calls")
-                if isinstance(raw_calls, list):
-                    for call in raw_calls:
-                        if isinstance(call, dict):
-                            tool_builder.add(call)
+                        raw_calls = delta.get("tool_calls")
+                        if isinstance(raw_calls, list):
+                            for call in raw_calls:
+                                if isinstance(call, dict):
+                                    tool_builder.add(call)
+                    break
+                except AssistAIError as exc:
+                    if (
+                        remapped_max_tokens
+                        or "max_tokens" not in payload
+                        or not _needs_max_completion_tokens_retry(exc)
+                    ):
+                        raise
+                    remapped_max_tokens = True
+                    swapped = _swap_max_tokens_to_completion(payload)
+                    logger.info(
+                        "chat_max_tokens_remapped",
+                        model=selected_model,
+                        max_completion_tokens=swapped,
+                        stream=True,
+                    )
+                    reasoning_parts.clear()
+                    content_parts.clear()
+                    tool_builder = _ToolCallBuilder()
+                    finish_reason = ""
 
             tool_calls = [
                 self._tools.normalize_tool_call(call) for call in tool_builder.calls()

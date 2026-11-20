@@ -194,11 +194,30 @@ async def test_extra_clients_are_closed(
     assert client._http.is_closed
 
 
-def test_text_route_to_polza_rejected_by_capabilities(
+@pytest.mark.asyncio
+async def test_text_route_to_polza_uses_chat_base_url(
     multi_client_factory: Callable[..., AssistAIClient],
 ) -> None:
-    with pytest.raises(ValueError, match="chat"):
-        multi_client_factory(routes={"text": "polza"})
+    client = multi_client_factory(routes={"text": "polza", "image": "polza"})
+    assert client._endpoint("text").id == "polza"
+    assert client._endpoint("text").chat_base_url == "https://polza.ai/api/v1"
+    with respx.mock(assert_all_called=False) as router:
+        chat = router.post("https://polza.ai/api/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json={"choices": []})
+        )
+        media = router.post(_POLZA_MEDIA).mock(
+            return_value=httpx.Response(200, json=_POLZA_OK)
+        )
+        wrong = router.post("https://polza.ai/api/chat/completions").mock(
+            return_value=httpx.Response(200, json={"choices": []})
+        )
+        await client._post_json("chat/completions", {"model": "m", "messages": []})
+        images = await client.generate_image("постер", model=_MODEL, size="1024x1024")
+    assert len(chat.calls) == 1
+    assert chat.calls[0].request.headers["authorization"] == "Bearer test-polza-key"
+    assert not wrong.called
+    assert images == ["https://s3.polza.ai/ok.png"]
+    assert media.called
 
 
 # --- G4: breaker ---

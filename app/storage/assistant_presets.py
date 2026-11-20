@@ -135,7 +135,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "если о них не просили. Язык перевода определяй из запроса, "
             "по умолчанию — английский."
         ),
-        text_model="qwen/qwen3.8-max-0902",
+        text_model="qwen/qwen4-max",
         image_model=None,
         image_size=None,
         voice_mode="auto",

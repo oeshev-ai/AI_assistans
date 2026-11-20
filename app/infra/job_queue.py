@@ -131,6 +131,17 @@ def image_result_timeout(explicit: float | None = None) -> float:
     return _polza_image_wait_needed()
 
 
+def _arq_enqueue_failed(task: str) -> Exception:
+    """Очередь включена, но job не принят — не уходим в inline (риск OOM бота)."""
+    from app.llm.errors import AssistAIError
+
+    logger.error("arq_enqueue_failed_closed", task=task)
+    return AssistAIError(
+        "Очередь обработки изображений недоступна. Попробуйте позже.",
+        error_code="SERVICE_UNAVAILABLE",
+    )
+
+
 async def generate_image(
     assistant: Any,
     prompt: str,
@@ -145,16 +156,19 @@ async def generate_image(
     wait = image_result_timeout(timeout)
     if is_queue_enabled():
         assert _pool is not None
-        job = await _pool.enqueue_job(
-            "generate_image_task",
-            prompt,
-            model,
-            size,
-            user_id,
-        )
+        try:
+            job = await _pool.enqueue_job(
+                "generate_image_task",
+                prompt,
+                model,
+                size,
+                user_id,
+            )
+        except Exception as exc:
+            logger.warning("arq_generate_enqueue_failed", error=str(exc))
+            raise _arq_enqueue_failed("generate_image_task") from exc
         if job is None:
-            logger.warning("arq_enqueue_skipped_inline", task="generate_image_task")
-            return await assistant.generate_image(prompt=prompt, model=model, size=size)
+            raise _arq_enqueue_failed("generate_image_task")
         logger.info("arq_job_enqueued", task="generate_image_task", job_id=job.job_id)
         result = await job.result(timeout=wait)
         return list(result)
@@ -204,25 +218,13 @@ async def edit_images(
                 await _pool.delete(key)
             except Exception:
                 pass
-            return await assistant.edit_images(
-                files,
-                prompt,
-                model=model,
-                labels=labels,
-                size=size,
-                complexity=complexity,
-            )
+            raise _arq_enqueue_failed("edit_image_task") from exc
         if job is None:
-            await _pool.delete(key)
-            logger.warning("arq_enqueue_skipped_inline", task="edit_image_task")
-            return await assistant.edit_images(
-                files,
-                prompt,
-                model=model,
-                labels=labels,
-                size=size,
-                complexity=complexity,
-            )
+            try:
+                await _pool.delete(key)
+            except Exception:
+                pass
+            raise _arq_enqueue_failed("edit_image_task")
         logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
         try:
             result = await job.result(timeout=wait)

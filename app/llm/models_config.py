@@ -17,7 +17,7 @@ AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
     "openai/gpt-6-luna",
     "openai/gpt-6.1-terra",
     "openai/gpt-6-sol",
-    "qwen/qwen3.8-max-0902",
+    "qwen/qwen4-max",
 )
 
 # Картинки: GPT Image 2.6 — основная; FLUX, Qwen и Recraft — свои поля размера.
@@ -63,7 +63,7 @@ MODEL_HINTS: dict[str, str] = {
     # Текст
     "deepseek/deepseek-v4.1-flash": "Дёшево: логика, код, математика, чёткая структура",
     "openai/gpt-6-luna": "Универсальный ассистент, аккуратно вызывает инструменты",
-    "qwen/qwen3.8-max-0902": "Сложные тексты, аналитика, переводы со стилем",
+    "qwen/qwen4-max": "Сложные тексты, аналитика, переводы со стилем",
     "google/gemini-3.8-flash": "Баланс: длинный контекст, документы, обучение",
     "anthropic/claude-sonnet-5-5": "Код, ревью, рефакторинг, точные инструкции",
     "openai/gpt-6-sol": "Флагман: сложные рассуждения и аналитика",
@@ -94,10 +94,16 @@ LEGACY_IMAGE_MODEL_ALIASES: dict[str, str] = {
 
 LEGACY_TEXT_MODEL_ALIASES: dict[str, str] = {
     "qwen/qwen3.8-flash": "deepseek/deepseek-v4.1-flash",
+    "qwen/qwen3.8-max-0902": "qwen/qwen4-max",
     "z-ai/glm-5.3-flash": "deepseek/deepseek-v4.1-flash",
     "google/gemini-3.1-flash-lite": "google/gemini-3.8-flash",
     "google/gemini-3.5-flash-lite": "google/gemini-3.8-flash",
     "anthropic/claude-haiku-5-5": "google/gemini-3.8-flash",
+}
+
+# Id в каталоге бота (ProxyAPI) → id на Polza ``/v1/models``.
+POLZA_TEXT_MODEL_ALIASES: dict[str, str] = {
+    "anthropic/claude-sonnet-5-5": "anthropic/claude-sonnet-5.5",
 }
 
 
@@ -115,6 +121,13 @@ def resolve_text_model(model_id: str | None) -> str | None:
     if not model_id or not _aliases_enabled("TEXT_LEGACY_ALIASES"):
         return model_id
     return LEGACY_TEXT_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
+
+
+def resolve_polza_text_model(model_id: str | None) -> str | None:
+    """Алиас текстовой модели под каталог Polza; иначе исходный id."""
+    if not model_id:
+        return model_id
+    return POLZA_TEXT_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
 
 
 def model_hint(model_id: str | None) -> str:

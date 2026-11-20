@@ -53,5 +53,7 @@ def test_image_catalog_starts_with_flare_and_drops_deprecated() -> None:
 def test_text_catalog_uses_new_ids() -> None:
     assert "openai/gpt-6-sol" in AVAILABLE_TEXT_MODELS
     assert "openai/gpt-6.1-terra" in AVAILABLE_TEXT_MODELS
+    assert "qwen/qwen4-max" in AVAILABLE_TEXT_MODELS
     assert "openai/gpt-6.1-sol" not in AVAILABLE_TEXT_MODELS
     assert "openai/gpt-6-astra" not in AVAILABLE_TEXT_MODELS
+    assert "qwen/qwen3.8-max-0902" not in AVAILABLE_TEXT_MODELS

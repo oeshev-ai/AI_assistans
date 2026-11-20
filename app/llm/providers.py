@@ -44,11 +44,21 @@ class ProviderConfig(BaseModel):
     upstream_only: tuple[str, ...] = ()
     allow_upstream_fallbacks: bool = True
     max_price_image_rub: float = 0.0
+    # OpenAI-совместимый корень для chat (Polza: …/api/v1). Пусто → base_url.
+    chat_base_url: str = ""
 
     @field_validator("base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
         return require_secure_base_url(value)
+
+    @field_validator("chat_base_url")
+    @classmethod
+    def _normalize_chat_base_url(cls, value: str) -> str:
+        cleaned = (value or "").strip().rstrip("/")
+        if not cleaned:
+            return ""
+        return require_secure_base_url(cleaned)
 
     @field_validator("capabilities", mode="before")
     @classmethod
@@ -87,9 +97,10 @@ class ProviderConfig(BaseModel):
 _ROUTE_OPS = ("text", "image", "audio", "video")
 _DEFAULT_PROXYAPI_BASE = "https://api.proxyapi.ru/v1"
 _DEFAULT_POLZA_BASE = "https://polza.ai/api"
+_DEFAULT_POLZA_CHAT_BASE = "https://polza.ai/api/v1"
 PROXYAPI_CAPABILITIES = frozenset({"chat", "images", "images_edit", "audio", "video"})
 _PROXYAPI_CAPABILITIES = PROXYAPI_CAPABILITIES
-_POLZA_CAPABILITIES = frozenset({"images", "images_edit"})
+_POLZA_CAPABILITIES = frozenset({"chat", "images", "images_edit"})
 
 
 def _env(name: str, default: str = "") -> str:
@@ -153,6 +164,8 @@ def load_providers(
             upstream_only=upstream or ("OpenAI",),
             allow_upstream_fallbacks=_env_flag("POLZA_ALLOW_UPSTREAM_FALLBACKS", False),
             max_price_image_rub=_env_float("POLZA_MAX_PRICE_IMAGE_RUB", 12.0),
+            chat_base_url=_env("POLZA_CHAT_BASE_URL", _DEFAULT_POLZA_CHAT_BASE)
+            or _DEFAULT_POLZA_CHAT_BASE,
         )
     return providers
 

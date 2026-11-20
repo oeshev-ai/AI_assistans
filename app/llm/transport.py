@@ -65,6 +65,19 @@ def _provider_label(provider: ProviderConfig) -> str:
     return "ProxyAPI" if provider.id == "proxyapi" else provider.id
 
 
+def _chat_base(provider: ProviderConfig) -> str:
+    """Корень для ``/chat/completions``: ``chat_base_url`` или ``base_url``."""
+    return (provider.chat_base_url or provider.base_url).rstrip("/")
+
+
+def _request_base(provider: ProviderConfig, path: str) -> str:
+    """База HTTP: chat → ``chat_base_url``, остальное → ``base_url``."""
+    cleaned = path.lstrip("/")
+    if cleaned == _CHAT_PATH or cleaned.startswith("chat/"):
+        return _chat_base(provider)
+    return provider.base_url.rstrip("/")
+
+
 def _retry_after_seconds(response: httpx.Response) -> float | None:
     """Секунды из ``Retry-After`` (HTTP-date не разбираем)."""
     raw = response.headers.get("retry-after")
@@ -240,6 +253,7 @@ class ProviderTransportMixin:
             raise AssistAIError("Клиент уже закрыт.")
 
         provider = self._endpoint("text")
+        label = _provider_label(provider)
         breaker = get_breaker(provider.id)
         try:
             await breaker.ensure_allows_call()
@@ -249,16 +263,18 @@ class ProviderTransportMixin:
                 error_code="CIRCUIT_OPEN",
             ) from exc
 
-        url = f"{provider.base_url.rstrip('/')}/{_CHAT_PATH}"
+        url = f"{_chat_base(provider)}/{_CHAT_PATH}"
         read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
-        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH)
+        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH, provider=provider.id)
         t0 = time.perf_counter()
         try:
             async with self._client_for(provider).stream(
                 "POST", url, json=payload, timeout=timeout
             ) as response:
-                await self._raise_for_stream_status(response, _CHAT_PATH)
+                await self._raise_for_stream_status(
+                    response, _CHAT_PATH, label=label
+                )
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_data(line)
                     if chunk is _SSE_SKIP:
@@ -273,7 +289,7 @@ class ProviderTransportMixin:
                             else:
                                 message = str(error)
                             logger.error("proxy_api_stream_error", detail=message)
-                            raise AssistAIError(f"ProxyAPI: {message}")
+                            raise AssistAIError(f"{label}: {message}")
                         yield chunk
             API_CALLS.labels(
                 service="proxy_api", endpoint="chat_stream", status="success"
@@ -295,7 +311,7 @@ class ProviderTransportMixin:
             await breaker._on_failure(exc)
             logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
             raise AssistAIError(
-                f"Превышено время ожидания ответа ProxyAPI ({_CHAT_PATH})."
+                f"Превышено время ожидания ответа {label} ({_CHAT_PATH})."
             ) from exc
         except httpx.RequestError as exc:
             API_CALLS.labels(
@@ -305,7 +321,7 @@ class ProviderTransportMixin:
             await breaker._on_failure(exc)
             logger.error("proxy_api_stream_network", path=_CHAT_PATH, error=str(exc))
             raise AssistAIError(
-                f"Сетевая ошибка при обращении к ProxyAPI: {exc}"
+                f"Сетевая ошибка при обращении к {label}: {exc}"
             ) from exc
         finally:
             LATENCY.labels(service="proxy_api", endpoint="chat_stream").observe(
@@ -313,7 +329,12 @@ class ProviderTransportMixin:
             )
 
     @staticmethod
-    async def _raise_for_stream_status(response: httpx.Response, path: str) -> None:
+    async def _raise_for_stream_status(
+        response: httpx.Response,
+        path: str,
+        *,
+        label: str = "ProxyAPI",
+    ) -> None:
         if response.status_code < 400:
             return
         raw = await response.aread()
@@ -328,9 +349,9 @@ class ProviderTransportMixin:
                 detail = str(error["message"])[:500]
             elif isinstance(error, str) and error:
                 detail = error[:500]
-        logger.error("ProxyAPI HTTP %s для %s: %s", response.status_code, path, detail)
+        logger.error("%s HTTP %s для %s: %s", label, response.status_code, path, detail)
         raise AssistAIError(
-            f"ProxyAPI вернул HTTP {response.status_code}: {detail}",
+            f"{label} вернул HTTP {response.status_code}: {detail}",
             status_code=response.status_code,
         )
 
@@ -425,8 +446,8 @@ class ProviderTransportMixin:
 
         target = provider or self._endpoint("text")
         label = _provider_label(target)
-        url = f"{target.base_url.rstrip('/')}/{path.lstrip('/')}"
-        logger.info("proxy_api_post", url=url, path=path)
+        url = f"{_request_base(target, path)}/{path.lstrip('/')}"
+        logger.info("proxy_api_post", url=url, path=path, provider=target.id)
         try:
             response = await self._client_for(target).post(
                 url, json=payload, timeout=timeout

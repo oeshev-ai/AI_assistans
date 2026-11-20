@@ -190,13 +190,15 @@ class AlbumHub:
         except Exception as exc:
             logger.warning("album_redis_append_failed", error=str(exc))
 
-    async def _redis_take(self, key: AlbumKey) -> tuple[bool, list[IncomingPhoto]]:
+    async def _redis_take(
+        self, key: AlbumKey
+    ) -> tuple[bool | None, list[IncomingPhoto]]:
         """Atomically claim album photos.
 
-        Returns ``(won, photos)``. ``won=False`` means another replica is
-        flushing — caller must drop its local copy to avoid double delivery.
-        When Redis is attached, the list is the source of truth (local was
-        already pushed on ``add``).
+        Returns ``(won, photos)``.
+        ``won=False`` — peer holds the lock (drop local to avoid double delivery).
+        ``won=None`` — Redis error (caller keeps local photos).
+        When Redis is healthy, the list is the source of truth.
         """
         if self._redis is None:
             return True, []
@@ -213,7 +215,7 @@ class AlbumHub:
                 await self._redis.delete(lock)
         except Exception as exc:
             logger.warning("album_redis_take_failed", error=str(exc))
-            return False, []
+            return None, []
         photos: list[IncomingPhoto] = []
         for raw in raw_items or []:
             text = (
@@ -230,6 +232,14 @@ class AlbumHub:
     ) -> list[IncomingPhoto] | None:
         """Photos to flush, or ``None`` if a peer already claimed the album."""
         won, remote = await self._redis_take(key)
+        if won is None:
+            logger.warning(
+                "album_redis_claim_fallback_local",
+                local_count=len(local),
+                chat_id=key[0],
+                user_id=key[1],
+            )
+            return local
         if not won:
             return None
         if self._redis is None:

@@ -26,6 +26,29 @@ async def test_generate_image_inline_when_disabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generate_image_enqueue_none_fail_closed() -> None:
+    from app.llm.errors import AssistAIError
+
+    await job_queue.close_job_queue()
+    job_queue._enabled = True
+
+    class FakePool:
+        async def enqueue_job(self, *args, **kwargs):
+            return None
+
+    job_queue._pool = FakePool()
+
+    class FakeAssistant:
+        async def generate_image(self, *args, **kwargs):
+            raise AssertionError("must not fall back inline")
+
+    with pytest.raises(AssistAIError, match="Очередь обработки"):
+        await job_queue.generate_image(FakeAssistant(), "cat", "model-a", "512x512")
+    job_queue._enabled = False
+    job_queue._pool = None
+
+
+@pytest.mark.asyncio
 async def test_transcribe_inline_when_disabled() -> None:
     await job_queue.close_job_queue()
     job_queue._enabled = False
