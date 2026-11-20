@@ -25,6 +25,7 @@ from app.llm.polza_media import (
     image_resolution_tier,
     map_media_error,
     parse_media_payload,
+    polza_request_fields,
     polza_size_fields,
 )
 from app.llm.providers import ProviderConfig
@@ -70,22 +71,42 @@ def test_base64_references_keep_base_first() -> None:
     assert base64.b64decode(media_input["images"][1]["data"]) == ref
 
 
-def test_provider_object_pins_upstream_and_caps_price() -> None:
+def test_provider_object_pins_upstream_without_max_price_for_flare() -> None:
+    # gpt-image: token pricing — max_price.image даёт 400 на Polza.
     body = _body()
     assert body["provider"] == {
         "only": ["OpenAI"],
         "allow_fallbacks": False,
-        "max_price": {"image": 12.0},
     }
+    assert "max_price" not in body["provider"]
     assert "require_parameters" not in body["provider"]
     assert "data_residency" not in body["provider"]
 
 
+def test_flux_provider_object_sends_max_price_without_openai_pin() -> None:
+    body = build_media_body(
+        make_polza_provider(),
+        model="black-forest-labs/flux-3-image",
+        prompt="x",
+        aspect_ratio="1:1",
+        image_resolution="1K",
+        output_format=None,
+        pin_upstream=False,
+        send_max_price=True,
+    )
+    assert body["provider"] == {"max_price": {"image": 12.0}}
+
+
 def test_zero_price_cap_omits_max_price() -> None:
     provider = make_polza_provider(max_price_image_rub=0.0)
-    body = build_media_body(provider, model=_MODEL, prompt="x")
-    assert "max_price" not in body["provider"]
-    assert body["provider"]["only"] == ["OpenAI"]
+    body = build_media_body(
+        provider,
+        model="black-forest-labs/flux-3-image",
+        prompt="x",
+        pin_upstream=False,
+        send_max_price=True,
+    )
+    assert body.get("provider") is None
 
 
 def test_user_is_hashed_and_bounded() -> None:
@@ -115,9 +136,113 @@ def test_size_fields(size: str, expected: dict[str, str]) -> None:
 
 
 def test_image_resolution_tiers_documented_only() -> None:
-    assert image_resolution_tier(1536, 1024) == "1K"
+    assert image_resolution_tier(768, 768) == "768"
+    assert image_resolution_tier(1024, 1024) == "1K"
+    assert image_resolution_tier(1536, 1024) == "1.5K"
     assert image_resolution_tier(2048, 1024) == "2K"
     assert image_resolution_tier(3840, 2160) == "4K"
+
+
+_FLUX = "black-forest-labs/flux-3-image"
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (
+            "1024x1024",
+            {
+                "model": _FLUX,
+                "aspect_ratio": "1:1",
+                "image_resolution": "1K",
+                "size": None,
+                "quality": None,
+                "output_format": None,
+                "pin_upstream": False,
+                "send_max_price": True,
+                "unsupported": False,
+            },
+        ),
+        (
+            "2K",
+            {
+                "model": _FLUX,
+                "aspect_ratio": None,
+                "image_resolution": "2K",
+                "size": None,
+                "quality": None,
+                "output_format": None,
+                "pin_upstream": False,
+                "send_max_price": True,
+                "unsupported": False,
+            },
+        ),
+        (
+            "16:9",
+            {
+                "model": _FLUX,
+                "aspect_ratio": "16:9",
+                "image_resolution": None,
+                "size": None,
+                "quality": None,
+                "output_format": None,
+                "pin_upstream": False,
+                "send_max_price": True,
+                "unsupported": False,
+            },
+        ),
+    ],
+)
+def test_flux_request_fields(size: str, expected: dict[str, Any]) -> None:
+    assert polza_request_fields(_FLUX, size, quality="high") == expected
+
+
+def test_flux_body_omits_quality_size_format_and_openai_pin() -> None:
+    fields = polza_request_fields(_FLUX, "1024x1024", quality="high")
+    body = build_media_body(
+        make_polza_provider(),
+        model=str(fields["model"]),
+        prompt="яблоко",
+        aspect_ratio=fields["aspect_ratio"],
+        size=fields["size"],
+        image_resolution=fields["image_resolution"],
+        quality=fields["quality"],
+        output_format=fields["output_format"],
+        pin_upstream=fields["pin_upstream"],
+        send_max_price=fields["send_max_price"],
+    )
+    media_input = body["input"]
+    assert media_input["aspect_ratio"] == "1:1"
+    assert media_input["image_resolution"] == "1K"
+    for forbidden in ("quality", "output_format", "size"):
+        assert forbidden not in media_input
+    assert body["provider"] == {"max_price": {"image": 12.0}}
+    assert "only" not in body["provider"]
+
+
+def test_klein_snaps_resolution_and_omits_max_price() -> None:
+    fields = polza_request_fields(
+        "black-forest-labs/flux-3-image-klein", "1.5K", quality="high"
+    )
+    assert fields["image_resolution"] == "2K"
+    assert fields["output_format"] == "png"
+    assert fields["send_max_price"] is False
+    assert fields["quality"] is None
+
+
+def test_qwen_alias_and_resolution_fields() -> None:
+    fields = polza_request_fields("qwen/qwen-image-2.1-pro", "1024x1024", quality="high")
+    assert fields["model"] == "qwen/image-2.1"
+    assert fields["aspect_ratio"] == "1:1"
+    assert fields["image_resolution"] == "1K"
+    assert fields["output_format"] == "png"
+    assert fields["pin_upstream"] is False
+    assert fields["send_max_price"] is True
+
+
+def test_recraft_unsupported_on_polza() -> None:
+    fields = polza_request_fields("recraft/recraft-v4.1", "16:9", quality="high")
+    assert fields["unsupported"] is True
 
 
 def test_parse_completed_fixtures(

@@ -3,7 +3,13 @@
 Контракт проверен живым прогоном (``app/docs/polza-media-contract.md``):
 
 * для ``openai/gpt-image-2.6-flare`` ``image_resolution`` даёт HTTP 400,
-  размер задаётся ``aspect_ratio`` + пиксельным ``size`` (``1536x1024``);
+  размер задаётся ``aspect_ratio`` + пиксельным ``size``; ``max_price.image``
+  при token pricing — 400 (не отправляем);
+* для ``flux-3-image`` / ``flux-3-image-klein`` / ``qwen/image-2.1`` —
+  ``aspect_ratio`` + ``image_resolution``; без ``quality`` и без
+  ``provider.only=["OpenAI"]``; у klein нет 768/1.5K и ``max_price``;
+* ``qwen/qwen-image-2.1-pro`` → алиас ``qwen/image-2.1``; ``recraft/*`` на
+  Polza нет — ``SERVICE_UNAVAILABLE`` для fallback на ProxyAPI;
 * ``data`` — список ``[{"url": ...}]`` (допускаем и объект, и ``b64_json``);
 * референсы передаются как ``{"type": "base64", "data": ...}``;
 * опрос статуса — только ``GET /v1/media/{id}``;
@@ -40,6 +46,7 @@ _MAX_POLL_ERRORS = 2
 # Соотношения, которые отдаём Polza. Расширено относительно набора FLUX
 # (``_snap_aspect_ratio`` в ``assist_ai``), но только значениями, которые
 # документация перечисляет явно; экзотику (``3:1``) снапим к ближайшему.
+# Каталог FLUX 3 Image + flare: снапим неизвестные пропорции к ближайшему.
 POLZA_ASPECTS: tuple[tuple[int, int], ...] = (
     (1, 1),
     (5, 4),
@@ -48,11 +55,16 @@ POLZA_ASPECTS: tuple[tuple[int, int], ...] = (
     (3, 4),
     (3, 2),
     (2, 3),
+    (7, 5),
+    (5, 7),
     (16, 9),
     (9, 16),
+    (2, 1),
+    (1, 2),
     (21, 9),
     (9, 21),
 )
+_FLUX_RESOLUTIONS = frozenset({"768", "1K", "1.5K", "2K", "4K"})
 _PIXEL_SIZE = re.compile(r"^(\d+)\s*[xX×]\s*(\d+)$")
 _ASPECT_RATIO = re.compile(r"^(\d+)\s*:\s*(\d+)$")
 _TIER_SIZE = re.compile(r"^(\d+(?:\.\d+)?)\s*[Kk]$")
@@ -163,16 +175,147 @@ def snap_aspect_ratio(width: int, height: int) -> str:
 
 
 def image_resolution_tier(width: int, height: int) -> str:
-    """Ярус ``image_resolution`` по длинной стороне (для моделей, где он поддержан).
+    """Ярус ``image_resolution`` по длинной стороне (FLUX / каталог Polza).
 
     Для ``gpt-image-2.6-flare`` поле даёт 400 и **не отправляется**.
     """
     long_side = max(width, height)
-    if long_side <= 1536:
+    if long_side <= 768:
+        return "768"
+    if long_side <= 1280:
         return "1K"
+    if long_side <= 1792:
+        return "1.5K"
     if long_side <= 2560:
         return "2K"
     return "4K"
+
+
+# ProxyAPI id → id в каталоге Polza ``/v1/models``.
+_POLZA_MODEL_ALIASES: dict[str, str] = {
+    "qwen/qwen-image-2.1-pro": "qwen/image-2.1",
+    "qwen/qwen-image-2.1-turbo": "qwen/image-2.1",
+}
+
+_RESOLUTION_RANK: tuple[str, ...] = ("768", "1K", "1.5K", "2K", "4K")
+
+
+@dataclass(frozen=True)
+class PolzaMediaProfile:
+    """Контракт ``/v1/media`` для семейства модели (из каталога Polza)."""
+
+    model_id: str
+    mode: str  # "openai_pixels" | "resolution"
+    resolutions: frozenset[str]
+    allow_quality: bool
+    allow_output_format: bool
+    pin_upstream: bool
+    send_max_price: bool
+    allow_aspect_auto: bool
+    unsupported: bool = False
+
+
+def resolve_polza_model_id(model: str) -> str:
+    """Id модели для Polza: алиас ProxyAPI→каталог или исходный id."""
+    cleaned = model.strip()
+    return _POLZA_MODEL_ALIASES.get(cleaned.casefold(), cleaned)
+
+
+def polza_media_profile(model: str) -> PolzaMediaProfile:
+    """Профиль параметров Polza для модели из каталога бота."""
+    resolved = resolve_polza_model_id(model)
+    mid = resolved.casefold()
+    if "recraft" in mid:
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="resolution",
+            resolutions=frozenset(),
+            allow_quality=False,
+            allow_output_format=False,
+            pin_upstream=False,
+            send_max_price=False,
+            allow_aspect_auto=False,
+            unsupported=True,
+        )
+    if mid.startswith("openai/") or "gpt-image" in mid:
+        # Token pricing: ``max_price.image`` → 400 «цена не определена».
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="openai_pixels",
+            resolutions=frozenset(),
+            allow_quality=True,
+            allow_output_format=True,
+            pin_upstream=True,
+            send_max_price=False,
+            allow_aspect_auto=True,
+        )
+    if "klein" in mid:
+        # ``unitParam=max_images``: max_price с image_resolution даёт 400.
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="resolution",
+            resolutions=frozenset({"1K", "2K", "4K"}),
+            allow_quality=False,
+            allow_output_format=True,
+            pin_upstream=False,
+            send_max_price=False,
+            allow_aspect_auto=False,
+        )
+    if "flux" in mid or "black-forest" in mid:
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="resolution",
+            resolutions=frozenset({"768", "1K", "1.5K", "2K", "4K"}),
+            allow_quality=False,
+            allow_output_format=False,
+            pin_upstream=False,
+            send_max_price=True,
+            allow_aspect_auto=True,
+        )
+    if mid.startswith("qwen/") or "qwen-image" in mid:
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="resolution",
+            resolutions=frozenset({"1K", "2K"}),
+            allow_quality=False,
+            allow_output_format=True,
+            pin_upstream=False,
+            send_max_price=True,
+            allow_aspect_auto=False,
+        )
+    return PolzaMediaProfile(
+        model_id=resolved,
+        mode="openai_pixels",
+        resolutions=frozenset(),
+        allow_quality=True,
+        allow_output_format=True,
+        pin_upstream=False,
+        send_max_price=False,
+        allow_aspect_auto=True,
+    )
+
+
+def uses_image_resolution(model: str) -> bool:
+    """True, если каталог принимает ``image_resolution``, не pixel ``size``."""
+    return polza_media_profile(model).mode == "resolution"
+
+
+def _snap_resolution(raw: str, allowed: frozenset[str]) -> str:
+    """Ближайший ярус из ``allowed`` (каталог модели)."""
+    if not allowed:
+        return raw
+    if raw in allowed:
+        return raw
+    matched = next((item for item in allowed if item.casefold() == raw.casefold()), None)
+    if matched is not None:
+        return matched
+    rank = {name: index for index, name in enumerate(_RESOLUTION_RANK)}
+    target = rank.get(raw, rank.get("1K", 1))
+    # При ничьей берём больший ярус (1.5K → 2K, не 1K).
+    return min(
+        allowed,
+        key=lambda item: (abs(rank.get(item, 99) - target), -rank.get(item, 0)),
+    )
 
 
 def polza_size_fields(size: str | None) -> dict[str, str]:
@@ -180,6 +323,7 @@ def polza_size_fields(size: str | None) -> dict[str, str]:
 
     Пиксели сохраняются в ``size`` (``WIDTHxHEIGHT``), ``aspect_ratio`` — ближайший
     из ``POLZA_ASPECTS``. ``auto`` → ``aspect_ratio: auto`` без размера.
+    Для OpenAI-моделей на Polza; FLUX/Qwen — через ``polza_request_fields``.
     """
     cleaned = (size or "").strip()
     if not cleaned or cleaned.casefold() in {"auto", "adaptive"}:
@@ -204,6 +348,85 @@ def polza_size_fields(size: str | None) -> dict[str, str]:
     return {"size": cleaned}
 
 
+def polza_request_fields(
+    model: str,
+    size: str | None,
+    *,
+    quality: str | None = None,
+) -> dict[str, Any]:
+    """Поля ``/v1/media`` + флаги роутинга под каталог модели.
+
+    Возвращает также ``model`` (с алиасом Polza) и ``unsupported``.
+    """
+    profile = polza_media_profile(model)
+    if profile.unsupported:
+        return {
+            "model": profile.model_id,
+            "aspect_ratio": None,
+            "size": None,
+            "image_resolution": None,
+            "quality": None,
+            "output_format": None,
+            "pin_upstream": False,
+            "send_max_price": False,
+            "unsupported": True,
+        }
+
+    if profile.mode == "openai_pixels":
+        fields = polza_size_fields(size)
+        return {
+            "model": profile.model_id,
+            **fields,
+            "image_resolution": None,
+            "quality": quality if profile.allow_quality else None,
+            "output_format": "png" if profile.allow_output_format else None,
+            "pin_upstream": profile.pin_upstream,
+            "send_max_price": profile.send_max_price,
+            "unsupported": False,
+        }
+
+    cleaned = (size or "").strip()
+    aspect: str | None = None
+    resolution: str | None = None
+    if not cleaned or cleaned.casefold() in {"auto", "adaptive"}:
+        aspect = "auto" if profile.allow_aspect_auto else "1:1"
+    else:
+        pixel = _PIXEL_SIZE.fullmatch(cleaned)
+        if pixel is not None:
+            width, height = int(pixel.group(1)), int(pixel.group(2))
+            aspect = snap_aspect_ratio(width, height)
+            resolution = _snap_resolution(
+                image_resolution_tier(width, height), profile.resolutions
+            )
+        else:
+            ratio = _ASPECT_RATIO.fullmatch(cleaned)
+            if ratio is not None:
+                aspect = snap_aspect_ratio(
+                    int(ratio.group(1)) * 1000, int(ratio.group(2)) * 1000
+                )
+            else:
+                tier = _TIER_SIZE.fullmatch(cleaned)
+                if cleaned in _FLUX_RESOLUTIONS or cleaned in profile.resolutions:
+                    candidate = cleaned
+                elif tier is not None:
+                    candidate = f"{tier.group(1)}K"
+                else:
+                    candidate = cleaned
+                resolution = _snap_resolution(candidate, profile.resolutions)
+
+    return {
+        "model": profile.model_id,
+        "aspect_ratio": aspect,
+        "size": None,
+        "image_resolution": resolution,
+        "quality": None,
+        "output_format": "png" if profile.allow_output_format else None,
+        "pin_upstream": profile.pin_upstream,
+        "send_max_price": profile.send_max_price,
+        "unsupported": False,
+    }
+
+
 def hash_user_id(user_id: int | str | None) -> str | None:
     """Хеш telegram id для поля ``user`` (сырой id наружу не уходит)."""
     if user_id is None:
@@ -225,6 +448,8 @@ def build_media_body(
     images: list[bytes] | None = None,
     max_images: int | None = 1,
     user: str | None = None,
+    pin_upstream: bool | None = None,
+    send_max_price: bool | None = None,
 ) -> dict[str, Any]:
     """Тело ``POST /v1/media``. ``complexity`` и ``background`` не включаются."""
     media_input: dict[str, Any] = {"prompt": prompt}
@@ -249,7 +474,12 @@ def build_media_body(
     body: dict[str, Any] = {"model": model, "input": media_input}
     if user:
         body["user"] = user[:_MAX_USER_LEN]
-    routing = provider.media_provider_object()
+    profile = polza_media_profile(model)
+    pin = profile.pin_upstream if pin_upstream is None else pin_upstream
+    price = profile.send_max_price if send_max_price is None else send_max_price
+    routing = provider.media_provider_object(
+        pin_upstream=pin, send_max_price=price
+    )
     if routing is not None:
         body["provider"] = routing
     return body
@@ -487,6 +717,8 @@ async def generate(
     images: list[bytes] | None = None,
     max_images: int | None = 1,
     user: str | None = None,
+    pin_upstream: bool | None = None,
+    send_max_price: bool | None = None,
     poll_interval: float = 4.0,
     total_wait: float = 240.0,
     timeout: httpx.Timeout | None = None,
@@ -514,6 +746,8 @@ async def generate(
         images=images,
         max_images=max_images,
         user=user,
+        pin_upstream=pin_upstream,
+        send_max_price=send_max_price,
     )
     url = f"{provider.base_url}{_MEDIA_PATH}"
     logger.info(
@@ -521,6 +755,7 @@ async def generate(
         model=model,
         aspect_ratio=aspect_ratio,
         size=size,
+        image_resolution=image_resolution,
         quality=quality,
         refs=len(images or []),
         prompt_chars=len(prompt),

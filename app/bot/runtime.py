@@ -566,6 +566,60 @@ def _is_http_url(value: str) -> bool:
     return value.startswith(("http://", "https://"))
 
 
+# s3.polza.ai с VPN часто ReadTimeout; s3-alt отдаёт тот же объект за секунды.
+_IMAGE_URL_TIMEOUT = httpx.Timeout(45.0, connect=15.0)
+_POLZA_CDN_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "s3.polza.ai": ("s3-alt.polza.ai",),
+}
+
+
+def _image_url_candidates(url: str) -> list[str]:
+    """Сначала зеркало CDN (если есть), затем исходный URL."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    alts = _POLZA_CDN_FALLBACKS.get(parsed.netloc.casefold(), ())
+    candidates = [urlunparse(parsed._replace(netloc=alt)) for alt in alts]
+    if url not in candidates:
+        candidates.append(url)
+    return candidates
+
+
+async def _download_image_url(url: str) -> bytes:
+    """Скачивает картинку на стороне бота до отправки в Telegram."""
+    from urllib.parse import urlparse
+
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(
+        timeout=_IMAGE_URL_TIMEOUT, follow_redirects=True
+    ) as client:
+        for candidate in _image_url_candidates(url):
+            try:
+                response = await client.get(candidate)
+                response.raise_for_status()
+                raw = response.content
+            except httpx.HTTPError as exc:
+                last_error = exc
+                logger.warning(
+                    "image_cdn_download_failed",
+                    host=urlparse(candidate).netloc,
+                    error=type(exc).__name__,
+                )
+                continue
+            if raw:
+                if candidate != url:
+                    logger.info(
+                        "image_cdn_fallback_used",
+                        from_host=urlparse(url).netloc,
+                        to_host=urlparse(candidate).netloc,
+                    )
+                return raw
+            last_error = AssistAIError("CDN провайдера вернул пустое изображение.")
+    raise AssistAIError(
+        "Не удалось скачать изображение с CDN провайдера."
+    ) from last_error
+
+
 def _extract_generated_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Достаёт картинки из результатов инструмента ``generate_image``.
 
@@ -641,7 +695,11 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
         try:
             if item.kind == "image":
                 if item.url:
-                    await message.answer_photo(photo=item.url)
+                    raw = await _download_image_url(item.url)
+                    await message.answer_photo(
+                        photo=BufferedInputFile(raw, filename=item.filename),
+                        request_timeout=120,
+                    )
                 elif item.data:
                     await message.answer_photo(
                         photo=BufferedInputFile(item.data, filename=item.filename)
@@ -673,18 +731,29 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
 
 
 async def _send_generated_image(message: Message, image: str, index: int) -> None:
-    """URL уходит как ссылка, base64 — как файл. Оба варианта отдаёт generate_image."""
+    """URL сначала качается ботом, затем уходит файлом; base64 — сразу файлом.
+
+    Сырой URL Telegram часто не достаёт (``failed to get HTTP URL content``).
+    ``URLInputFile`` качает CDN внутри ``sendPhoto`` и при медленном
+    ``s3.polza.ai`` ловит ``Request timeout`` (~30 с). Скачиваем отдельно
+    (до 120 с), в Telegram отдаём уже байты.
+    """
     filename = "image.png" if index == 0 else f"image_{index + 1}.png"
     if _is_http_url(image):
-        await message.answer_photo(photo=image)
-        return
-    try:
-        raw = base64.b64decode(image, validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise AssistAIError("ProxyAPI вернул нечитаемый base64 изображения.") from exc
+        raw = await _download_image_url(image)
+    else:
+        try:
+            raw = base64.b64decode(image, validate=False)
+        except (binascii.Error, ValueError) as exc:
+            raise AssistAIError(
+                "Провайдер вернул нечитаемый base64 изображения."
+            ) from exc
     if not raw:
-        raise AssistAIError("ProxyAPI вернул пустое изображение.")
-    await message.answer_photo(photo=BufferedInputFile(raw, filename=filename))
+        raise AssistAIError("Провайдер вернул пустое изображение.")
+    await message.answer_photo(
+        photo=BufferedInputFile(raw, filename=filename),
+        request_timeout=120,
+    )
 
 
 async def _send_voice_reply(

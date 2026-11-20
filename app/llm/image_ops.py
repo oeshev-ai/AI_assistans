@@ -706,20 +706,31 @@ class ImageOpsMixin(ProviderTransportMixin):
                 "Попробуйте через минуту.",
                 error_code="CIRCUIT_OPEN",
             ) from exc
-        fields = polza_media.polza_size_fields(size)
+        fields = polza_media.polza_request_fields(
+            model, size, quality=self.config.image_quality
+        )
+        if fields.get("unsupported"):
+            raise AssistAIError(
+                "Сервис генерации изображений временно недоступен. Попробуйте позже.",
+                error_code="SERVICE_UNAVAILABLE",
+            )
         read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
         try:
             result = await polza_media.generate(
                 self._client_for(provider),
                 provider,
-                model=model,
+                model=str(fields.get("model") or model),
                 prompt=prompt,
                 aspect_ratio=fields.get("aspect_ratio"),
                 size=fields.get("size"),
-                quality=self.config.image_quality,
+                image_resolution=fields.get("image_resolution"),
+                quality=fields.get("quality"),
+                output_format=fields.get("output_format"),
                 images=images,
                 user=polza_media.hash_user_id(get_billing_user()),
+                pin_upstream=bool(fields.get("pin_upstream", True)),
+                send_max_price=bool(fields.get("send_max_price", True)),
                 poll_interval=self.config.polza_poll_interval,
                 total_wait=self.config.polza_total_wait,
                 timeout=timeout,

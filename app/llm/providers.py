@@ -57,19 +57,29 @@ class ProviderConfig(BaseModel):
             return frozenset(str(item) for item in value)
         return value
 
-    def media_provider_object(self) -> dict[str, Any] | None:
+    def media_provider_object(
+        self,
+        *,
+        pin_upstream: bool = True,
+        send_max_price: bool = True,
+    ) -> dict[str, Any] | None:
         """Объект ``provider`` для Polza ``/v1/media`` (пиннинг апстрима, потолок цены).
 
         ``require_parameters`` и ``data_residency`` намеренно не отправляются:
         первый превратил бы ``warnings[]`` в ошибки, второй отклонит OpenAI-модели.
+
+        ``pin_upstream=False`` — без ``only`` (FLUX/Qwen: ``only=["OpenAI"]`` →
+        ``noProvidersForMedia``). ``send_max_price=False`` — без потолка: у
+        token-priced ``gpt-image`` и у klein с ``unitParam`` Polza отвечает 400
+        «цена не определена».
         """
         obj: dict[str, Any] = {}
-        if self.upstream_only:
+        if pin_upstream and self.upstream_only:
             obj["only"] = list(self.upstream_only)
             obj["allow_fallbacks"] = bool(self.allow_upstream_fallbacks)
-        elif not self.allow_upstream_fallbacks:
+        elif pin_upstream and not self.allow_upstream_fallbacks:
             obj["allow_fallbacks"] = False
-        if self.max_price_image_rub > 0:
+        if send_max_price and self.max_price_image_rub > 0:
             obj["max_price"] = {"image": self.max_price_image_rub}
         return obj or None
 
