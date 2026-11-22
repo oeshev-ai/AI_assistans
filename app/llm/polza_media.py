@@ -8,8 +8,9 @@
 * для ``flux-3-image`` / ``flux-3-image-klein`` / ``qwen/image-2.1`` —
   ``aspect_ratio`` + ``image_resolution``; без ``quality`` и без
   ``provider.only=["OpenAI"]``; у klein нет 768/1.5K и ``max_price``;
-* ``qwen/qwen-image-2.1-pro`` → алиас ``qwen/image-2.1``; ``recraft/*`` на
-  Polza нет — ``SERVICE_UNAVAILABLE`` для fallback на ProxyAPI;
+* ``qwen/qwen-image-2.1-pro`` → алиас ``qwen/image-2.1``;
+  ``google/gemini-nano-banana-2.1`` — ``aspect_ratio`` + ``image_resolution``;
+  ``recraft/*`` на Polza нет — ``SERVICE_UNAVAILABLE`` для fallback на ProxyAPI;
 * ``data`` — список ``[{"url": ...}]`` (допускаем и объект, и ``b64_json``);
 * референсы передаются как ``{"type": "base64", "data": ...}``;
 * опрос статуса — только ``GET /v1/media/{id}``;
@@ -24,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,6 +36,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from app.infra.cost_tracker import extract_cost_rub
 from app.llm.errors import AssistAIError
 from app.llm.providers import ProviderConfig
 
@@ -89,6 +93,9 @@ _STATUS_CODES: dict[int, str] = {
 _UNAVAILABLE_TEXT = (
     "Сервис генерации изображений временно недоступен. Попробуйте позже."
 )
+_VIDEO_UNAVAILABLE_TEXT = (
+    "Сервис генерации видео временно недоступен. Попробуйте позже."
+)
 _USER_MESSAGES: dict[str, str] = {
     "BAD_REQUEST": (
         "Не удалось обработать запрос на изображение. "
@@ -116,6 +123,31 @@ _USER_MESSAGES: dict[str, str] = {
         "Для этого запроса нет доступного маршрута генерации."
     ),
 }
+_VIDEO_USER_MESSAGES: dict[str, str] = {
+    "BAD_REQUEST": (
+        "Не удалось обработать запрос на видео. "
+        "Измените описание или параметры и попробуйте снова."
+    ),
+    "UNAUTHORIZED": "Сервис генерации видео сейчас недоступен (ошибка доступа).",
+    "API_KEY_REVOKED": "Сервис генерации видео сейчас недоступен (ошибка доступа).",
+    "FORBIDDEN": "Сервис генерации видео сейчас недоступен (ошибка доступа).",
+    "INSUFFICIENT_BALANCE": _VIDEO_UNAVAILABLE_TEXT,
+    "NOT_FOUND": "Сервис генерации видео не нашёл запрошенный ресурс.",
+    "PAYLOAD_TOO_LARGE": "Входные данные слишком большие для видео. Упростите запрос.",
+    "TOO_MANY_REQUESTS": (
+        "Сервис генерации видео перегружен. Попробуйте через минуту."
+    ),
+    "REQUEST_TIMEOUT": _VIDEO_UNAVAILABLE_TEXT,
+    "BAD_GATEWAY": _VIDEO_UNAVAILABLE_TEXT,
+    "SERVICE_UNAVAILABLE": _VIDEO_UNAVAILABLE_TEXT,
+    "INTERNAL_ERROR": _VIDEO_UNAVAILABLE_TEXT,
+    "TIMEOUT": "Превышено время ожидания сервиса генерации видео.",
+    "NETWORK_ERROR": "Сетевая ошибка при обращении к сервису генерации видео.",
+    "POLL_TIMEOUT": "Превышено время ожидания сервиса генерации видео.",
+    "UNOFFICIAL_PROVIDERS_DISABLED": (
+        "Для этого запроса нет доступного маршрута генерации видео."
+    ),
+}
 
 
 async def _sleep(seconds: float) -> None:
@@ -135,13 +167,7 @@ class MediaResult:
     @property
     def cost_rub(self) -> float | None:
         """Фактическая цена в рублях из ``usage`` (``cost_rub`` или алиас ``cost``)."""
-        if not isinstance(self.usage, dict):
-            return None
-        for key in ("cost_rub", "cost"):
-            value = self.usage.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return float(value) if value >= 0 else None
-        return None
+        return extract_cost_rub(self.usage)
 
     def as_images_response(self) -> dict[str, Any]:
         """Нормализует в форму ``images/generations``: ``{data: [...], usage}``."""
@@ -237,6 +263,17 @@ def polza_media_profile(model: str) -> PolzaMediaProfile:
             allow_aspect_auto=False,
             unsupported=True,
         )
+    if "nano-banana" in mid or "gemini-nano-banana" in mid:
+        return PolzaMediaProfile(
+            model_id=resolved,
+            mode="resolution",
+            resolutions=frozenset({"1K", "2K", "4K"}),
+            allow_quality=False,
+            allow_output_format=True,
+            pin_upstream=False,
+            send_max_price=False,
+            allow_aspect_auto=True,
+        )
     if mid.startswith("openai/") or "gpt-image" in mid:
         # Token pricing: ``max_price.image`` → 400 «цена не определена».
         return PolzaMediaProfile(
@@ -306,7 +343,9 @@ def _snap_resolution(raw: str, allowed: frozenset[str]) -> str:
         return raw
     if raw in allowed:
         return raw
-    matched = next((item for item in allowed if item.casefold() == raw.casefold()), None)
+    matched = next(
+        (item for item in allowed if item.casefold() == raw.casefold()), None
+    )
     if matched is not None:
         return matched
     rank = {name: index for index, name in enumerate(_RESOLUTION_RANK)}
@@ -428,10 +467,19 @@ def polza_request_fields(
 
 
 def hash_user_id(user_id: int | str | None) -> str | None:
-    """Хеш telegram id для поля ``user`` (сырой id наружу не уходит)."""
+    """Хеш telegram id для поля ``user`` (сырой id наружу не уходит).
+
+    With ``POLZA_USER_HASH_SECRET`` uses HMAC-SHA256 so the digest is not
+    dictionary-guessable from a known Telegram id.
+    """
     if user_id is None:
         return None
-    digest = hashlib.sha256(f"assist-ai:{user_id}".encode()).hexdigest()
+    secret = (os.getenv("POLZA_USER_HASH_SECRET") or "").strip()
+    material = f"assist-ai:{user_id}".encode()
+    if secret:
+        digest = hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()
+    else:
+        digest = hashlib.sha256(material).hexdigest()
     return digest[:_MAX_USER_LEN]
 
 
@@ -477,9 +525,7 @@ def build_media_body(
     profile = polza_media_profile(model)
     pin = profile.pin_upstream if pin_upstream is None else pin_upstream
     price = profile.send_max_price if send_max_price is None else send_max_price
-    routing = provider.media_provider_object(
-        pin_upstream=pin, send_max_price=price
-    )
+    routing = provider.media_provider_object(pin_upstream=pin, send_max_price=price)
     if routing is not None:
         body["provider"] = routing
     return body
@@ -518,10 +564,14 @@ def _error_parts(body: Any) -> tuple[str | None, str | None, dict[str, Any]]:
     )
 
 
-def _user_message(code: str) -> str:
+def _user_message(code: str, *, medium: str = "image") -> str:
     upper = code.upper()
     if upper.startswith("GUARD_"):
+        if medium == "video":
+            return "Запрос отклонён политикой безопасности сервиса генерации видео."
         return "Запрос отклонён политикой безопасности сервиса генерации."
+    if medium == "video":
+        return _VIDEO_USER_MESSAGES.get(upper, _VIDEO_UNAVAILABLE_TEXT)
     return _USER_MESSAGES.get(upper, _UNAVAILABLE_TEXT)
 
 
@@ -531,6 +581,8 @@ def map_media_error(
     status_code: int | None,
     retry_after: float | None = None,
     provider_id: str = "polza",
+    medium: str = "image",
+    job_committed: bool = False,
 ) -> AssistAIError:
     """``error.code`` → ``AssistAIError``. Внутренности только в лог."""
     code, trace_id, metadata = _error_parts(body)
@@ -549,16 +601,23 @@ def map_media_error(
         trace_id=trace_id,
         reason=metadata.get("reason"),
         provider_name=metadata.get("provider_name"),
+        medium=medium,
     )
     return AssistAIError(
-        _user_message(code),
+        _user_message(code, medium=medium),
         status_code=status_code,
         error_code=code,
         retry_after=retry_after,
+        job_committed=job_committed,
     )
 
 
-def _raise_for_response(response: httpx.Response, provider_id: str) -> None:
+def _raise_for_response(
+    response: httpx.Response,
+    provider_id: str,
+    *,
+    medium: str = "image",
+) -> None:
     if response.status_code < 400:
         return
     try:
@@ -570,6 +629,7 @@ def _raise_for_response(response: httpx.Response, provider_id: str) -> None:
         status_code=response.status_code,
         retry_after=_parse_retry_after(response),
         provider_id=provider_id,
+        medium=medium,
     )
 
 
@@ -613,12 +673,23 @@ def _log_warnings(result: MediaResult) -> None:
         )
 
 
-def _network_error(exc: httpx.RequestError, operation: str) -> AssistAIError:
+def _network_error(
+    exc: httpx.RequestError,
+    operation: str,
+    *,
+    medium: str = "image",
+) -> AssistAIError:
+    messages = _VIDEO_USER_MESSAGES if medium == "video" else _USER_MESSAGES
     if isinstance(exc, httpx.TimeoutException):
-        logger.error("polza_media_timeout", operation=operation)
-        return AssistAIError(_USER_MESSAGES["TIMEOUT"], error_code="TIMEOUT")
-    logger.error("polza_media_network", operation=operation, error=type(exc).__name__)
-    return AssistAIError(_USER_MESSAGES["NETWORK_ERROR"], error_code="NETWORK_ERROR")
+        logger.error("polza_media_timeout", operation=operation, medium=medium)
+        return AssistAIError(messages["TIMEOUT"], error_code="TIMEOUT")
+    logger.error(
+        "polza_media_network",
+        operation=operation,
+        medium=medium,
+        error=type(exc).__name__,
+    )
+    return AssistAIError(messages["NETWORK_ERROR"], error_code="NETWORK_ERROR")
 
 
 def _capped_timeout(base: httpx.Timeout | None, remaining: float) -> httpx.Timeout:
@@ -642,6 +713,7 @@ async def _poll(
     poll_interval: float,
     total_wait: float,
     timeout: httpx.Timeout | None,
+    medium: str = "image",
 ) -> dict[str, Any]:
     """Опрос ``GET /v1/media/{id}`` до терминального статуса или ``total_wait``.
 
@@ -649,6 +721,8 @@ async def _poll(
     sleeps cannot busy-loop), and each GET is also capped by the wall-clock
     remainder so a long HTTP timeout cannot overrun the deadline.
     """
+    messages = _VIDEO_USER_MESSAGES if medium == "video" else _USER_MESSAGES
+    unavailable = _VIDEO_UNAVAILABLE_TEXT if medium == "video" else _UNAVAILABLE_TEXT
     url = f"{provider.base_url}{_MEDIA_PATH}/{quote(media_id, safe='')}"
     interval = max(0.0, poll_interval)
     budget = max(0.0, total_wait)
@@ -663,10 +737,9 @@ async def _poll(
                 "polza_media_poll_exhausted",
                 media_id=media_id,
                 waited=total_wait,
+                medium=medium,
             )
-            raise AssistAIError(
-                _USER_MESSAGES["POLL_TIMEOUT"], error_code="POLL_TIMEOUT"
-            )
+            raise AssistAIError(messages["POLL_TIMEOUT"], error_code="POLL_TIMEOUT")
         sleep_for = (
             min(interval, remaining_sleep, remaining_wall) if interval > 0 else 0.0
         )
@@ -679,12 +752,12 @@ async def _poll(
             response = await client.get(
                 url, timeout=_capped_timeout(timeout, max(remaining_wall, 0.05))
             )
-            _raise_for_response(response, provider.id)
+            _raise_for_response(response, provider.id, medium=medium)
             body = response.json()
         except httpx.RequestError as exc:
             errors += 1
             if errors > _MAX_POLL_ERRORS:
-                raise _network_error(exc, "poll") from exc
+                raise _network_error(exc, "poll", medium=medium) from exc
             continue
         except AssistAIError as exc:
             if exc.status_code is not None and exc.status_code >= 500:
@@ -693,9 +766,9 @@ async def _poll(
                     continue
             raise
         except ValueError as exc:
-            raise AssistAIError(_UNAVAILABLE_TEXT, error_code="BAD_GATEWAY") from exc
+            raise AssistAIError(unavailable, error_code="BAD_GATEWAY") from exc
         if not isinstance(body, dict):
-            raise AssistAIError(_UNAVAILABLE_TEXT, error_code="BAD_GATEWAY")
+            raise AssistAIError(unavailable, error_code="BAD_GATEWAY")
         errors = 0
         status = str(body.get("status") or "").casefold()
         if status in _PENDING_STATUSES:
@@ -765,48 +838,187 @@ async def generate(
     except httpx.RequestError as exc:
         raise _network_error(exc, "create") from exc
     _raise_for_response(response, provider.id)
+    # Successful create accepted by Polza — further poll/parse failures must not
+    # trigger a second paid job on the fallback provider (same as generate_video).
     try:
-        payload = response.json()
-    except ValueError as exc:
-        raise AssistAIError(_UNAVAILABLE_TEXT, error_code="BAD_GATEWAY") from exc
-    if not isinstance(payload, dict):
-        raise AssistAIError(_UNAVAILABLE_TEXT, error_code="BAD_GATEWAY")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise AssistAIError(
+                _UNAVAILABLE_TEXT, error_code="BAD_GATEWAY", job_committed=True
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AssistAIError(
+                _UNAVAILABLE_TEXT, error_code="BAD_GATEWAY", job_committed=True
+            )
 
-    status = str(payload.get("status") or "").casefold()
-    media_id = payload.get("id")
-    if (
-        status in _PENDING_STATUSES
-        and not _items(payload)
-        and isinstance(media_id, str)
-        and media_id
-    ):
-        logger.info("polza_media_async", media_id=media_id, status=status)
-        payload = await _poll(
-            client,
-            provider,
-            media_id,
-            poll_interval=poll_interval,
-            total_wait=total_wait,
-            timeout=timeout,
-        )
         status = str(payload.get("status") or "").casefold()
+        media_id = payload.get("id")
+        if (
+            status in _PENDING_STATUSES
+            and not _items(payload)
+            and isinstance(media_id, str)
+            and media_id
+        ):
+            logger.info("polza_media_async", media_id=media_id, status=status)
+            payload = await _poll(
+                client,
+                provider,
+                media_id,
+                poll_interval=poll_interval,
+                total_wait=total_wait,
+                timeout=timeout,
+            )
+            status = str(payload.get("status") or "").casefold()
 
-    if status in _FAILED_STATUSES or (payload.get("error") and not _items(payload)):
-        raise map_media_error(
-            payload,
-            status_code=None,
-            provider_id=provider.id,
-        )
+        if status in _FAILED_STATUSES or (payload.get("error") and not _items(payload)):
+            raise map_media_error(
+                payload,
+                status_code=None,
+                provider_id=provider.id,
+                job_committed=True,
+            )
 
-    result = parse_media_payload(payload)
-    _log_warnings(result)
-    if not result.images:
-        logger.error("polza_media_no_image", media_id=result.media_id, status=status)
-        raise AssistAIError("Сервис генерации не вернул изображение.")
+        result = parse_media_payload(payload)
+        _log_warnings(result)
+        if not result.images:
+            logger.error(
+                "polza_media_no_image", media_id=result.media_id, status=status
+            )
+            raise AssistAIError(
+                "Сервис генерации не вернул изображение.",
+                error_code="SERVICE_UNAVAILABLE",
+                job_committed=True,
+            )
+    except AssistAIError as exc:
+        exc.job_committed = True
+        raise
     logger.info(
         "polza_media_done",
         media_id=result.media_id,
         images=len(result.images),
+        cost_rub=result.cost_rub,
+    )
+    return result
+
+
+def build_video_body(
+    *,
+    model: str,
+    prompt: str,
+    duration: int | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str = "16:9",
+) -> dict[str, Any]:
+    """Тело ``POST /v1/media`` для Seedance и др. видеомоделей Polza."""
+    media_input: dict[str, Any] = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+    }
+    if isinstance(duration, int) and duration > 0:
+        media_input["duration"] = str(duration)
+    if isinstance(resolution, str) and resolution.strip():
+        media_input["resolution"] = resolution.strip()
+    return {"model": model, "input": media_input, "async": True}
+
+
+async def generate_video(
+    client: httpx.AsyncClient,
+    provider: ProviderConfig,
+    *,
+    model: str,
+    prompt: str,
+    duration: int | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str = "16:9",
+    poll_interval: float = 5.0,
+    total_wait: float = 600.0,
+    timeout: httpx.Timeout | None = None,
+) -> MediaResult:
+    """Асинхронная генерация видео через Polza ``/v1/media`` + poll."""
+    body = build_video_body(
+        model=model,
+        prompt=prompt,
+        duration=duration,
+        resolution=resolution,
+        aspect_ratio=aspect_ratio,
+    )
+    url = f"{provider.base_url}{_MEDIA_PATH}"
+    logger.info(
+        "polza_video_request",
+        model=model,
+        duration=duration,
+        resolution=resolution,
+        prompt_chars=len(prompt),
+    )
+    try:
+        response = await client.post(url, json=body, timeout=timeout)
+    except httpx.RequestError as exc:
+        raise _network_error(exc, "video_create", medium="video") from exc
+    _raise_for_response(response, provider.id, medium="video")
+    # Successful create accepted by Polza — further poll/parse failures must not
+    # trigger a second paid job on the fallback provider.
+    try:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise AssistAIError(
+                _VIDEO_UNAVAILABLE_TEXT,
+                error_code="BAD_GATEWAY",
+                job_committed=True,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AssistAIError(
+                _VIDEO_UNAVAILABLE_TEXT,
+                error_code="BAD_GATEWAY",
+                job_committed=True,
+            )
+
+        status = str(payload.get("status") or "").casefold()
+        media_id = payload.get("id")
+        if (
+            status in _PENDING_STATUSES
+            and not _items(payload)
+            and isinstance(media_id, str)
+            and media_id
+        ):
+            logger.info("polza_video_async", media_id=media_id, status=status)
+            payload = await _poll(
+                client,
+                provider,
+                media_id,
+                poll_interval=poll_interval,
+                total_wait=total_wait,
+                timeout=timeout,
+                medium="video",
+            )
+            status = str(payload.get("status") or "").casefold()
+
+        if status in _FAILED_STATUSES or (payload.get("error") and not _items(payload)):
+            raise map_media_error(
+                payload,
+                status_code=None,
+                provider_id=provider.id,
+                medium="video",
+                job_committed=True,
+            )
+
+        result = parse_media_payload(payload)
+        _log_warnings(result)
+        if not result.images:
+            logger.error("polza_video_no_file", media_id=result.media_id, status=status)
+            raise AssistAIError(
+                "Сервис генерации не вернул видео.",
+                error_code="SERVICE_UNAVAILABLE",
+                job_committed=True,
+            )
+    except AssistAIError as exc:
+        exc.job_committed = True
+        raise
+    logger.info(
+        "polza_video_done",
+        media_id=result.media_id,
+        files=len(result.images),
         cost_rub=result.cost_rub,
     )
     return result

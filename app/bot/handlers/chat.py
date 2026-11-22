@@ -27,6 +27,7 @@ from app.bot.constants import (
     security,
     set_billing_user,
 )
+from app.infra.cost_tracker import prefer_cost_rub
 from app.storage.pending_media import PendingMediaStorage
 
 
@@ -151,22 +152,30 @@ async def handle_voice(
     status = await message.answer("🎤 Распознаю речь…")
     keep = R._release_outgoing(keep)
     try:
-        await cost_tracker.check_budget(
-            user_id, cost_tracker.estimate_stt_cost(float(voice.duration))
-        )
+        estimated = cost_tracker.estimate_stt_cost(float(voice.duration))
+        await cost_tracker.check_budget(user_id, estimated)
         audio_bytes, filename = await R._download_voice(message)
         await R._active_profile(chat_id, assistant_storage)
-        transcribed = await job_queue.transcribe_audio(
+        recognized = await job_queue.transcribe_audio(
             assistant,
             audio_bytes,
             filename=filename,
             language=None,
         )
+        amount, source, rub = prefer_cost_rub(
+            [(recognized.cost_usd, recognized.cost_source, recognized.cost_rub)],
+            estimated,
+        )
         await cost_tracker.record(
             kind="stt",
-            amount_usd=cost_tracker.estimate_stt_cost(float(voice.duration)),
+            amount_usd=amount,
             user_id=user_id,
+            provider=recognized.provider_id,
+            model=recognized.model,
+            source=source,
+            cost_rub=rub,
         )
+        transcribed = recognized.text
     except BudgetExceededError as exc:
         await R._edit_stream(status, exc.message, "")
         await R._append_chrome(state, [status.message_id])

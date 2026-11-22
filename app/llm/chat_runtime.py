@@ -10,9 +10,16 @@ from typing import Any, Literal
 
 import structlog
 
-from app.infra.cost_tracker import cost_tracker, isolated_budget_reservation
-from app.llm.errors import AssistAIError
+from app.infra.cost_tracker import (
+    BudgetExceededError,
+    chat_cost_usd,
+    cost_tracker,
+    isolated_budget_reservation,
+)
+from app.infra.metrics import note_provider_fallback
+from app.llm.errors import AssistAIError, fallback_reason
 from app.llm.models_config import resolve_polza_text_model, resolve_text_model
+from app.llm.providers import ProviderConfig
 from app.llm.tooling import ToolRegistry
 from app.llm.transport import _CHAT_PATH, ProviderTransportMixin
 
@@ -100,6 +107,7 @@ def _apply_generation_options(
     response_format: dict[str, Any] | None,
     temperature: float | None,
     max_tokens: int | None,
+    reasoning: dict[str, Any] | None = None,
 ) -> None:
     """Добавляет необязательные поля генерации, не трогая tools."""
     if response_format is not None:
@@ -108,6 +116,8 @@ def _apply_generation_options(
         payload["temperature"] = temperature
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
 
 
 def _needs_max_completion_tokens_retry(exc: AssistAIError) -> bool:
@@ -210,14 +220,110 @@ class ChatRuntimeMixin(ProviderTransportMixin):
     _tools: ToolRegistry
     get_tools_schema: Callable[[], list[dict[str, Any]]]
 
-    def _resolve_chat_model(self, model: str | None) -> str:
-        """Модель для chat: legacy-алиас, на Polza — ещё алиас каталога."""
+    def _catalog_chat_model(self, model: str | None) -> str:
+        """Id модели в каталоге бота (после legacy-алиаса)."""
         selected = resolve_text_model(model or self.config.default_text_model) or (
             model or self.config.default_text_model
         )
-        if self._endpoint("text").id == "polza":
-            return resolve_polza_text_model(selected) or selected
         return selected
+
+    def _provider_chat_model(self, catalog_model: str, provider: ProviderConfig) -> str:
+        """Id модели под конкретного провайдера (Polza может отличаться)."""
+        if provider.id == "polza":
+            return resolve_polza_text_model(catalog_model) or catalog_model
+        return catalog_model
+
+    def _resolve_chat_model(self, model: str | None) -> str:
+        """Модель для chat: legacy-алиас, на Polza — ещё алиас каталога."""
+        catalog = self._catalog_chat_model(model)
+        return self._provider_chat_model(catalog, self._endpoint("text"))
+
+    async def _chat_post_with_fallback(
+        self,
+        payload: dict[str, Any],
+        *,
+        catalog_model: str,
+        stick_to: ProviderConfig | None = None,
+    ) -> tuple[dict[str, Any], ProviderConfig]:
+        """Один chat POST: основной провайдер, при недоступности — один fallback."""
+        if stick_to is not None:
+            req = dict(payload)
+            req["model"] = self._provider_chat_model(catalog_model, stick_to)
+            return await self._post_json(_CHAT_PATH, req, provider=stick_to), stick_to
+
+        primary, fallback = self._registry.resolve_route("text")
+        last_exc: AssistAIError | None = None
+        for provider in (primary,) + ((fallback,) if fallback is not None else ()):
+            req = dict(payload)
+            req["model"] = self._provider_chat_model(catalog_model, provider)
+            try:
+                data = await self._post_json(_CHAT_PATH, req, provider=provider)
+            except AssistAIError as exc:
+                last_exc = exc
+                if reason := fallback_reason(exc):
+                    if reason == "insufficient_balance":
+                        logger.error("provider_balance_exhausted", provider=provider.id)
+                    if provider is primary and fallback is not None:
+                        logger.warning(
+                            "provider_fallback",
+                            **{
+                                "from": primary.id,
+                                "to": fallback.id,
+                                "reason": reason,
+                            },
+                        )
+                        note_provider_fallback(primary.id, fallback.id, reason)
+                        continue
+                raise
+            return data, provider
+        assert last_exc is not None
+        raise last_exc
+
+    async def _iter_chat_with_fallback(
+        self,
+        payload: dict[str, Any],
+        *,
+        catalog_model: str,
+        stick_to: ProviderConfig | None = None,
+    ) -> AsyncIterator[tuple[dict[str, Any], ProviderConfig]]:
+        """SSE chat: основной провайдер; fallback только до первого chunk."""
+        if stick_to is not None:
+            req = dict(payload)
+            req["model"] = self._provider_chat_model(catalog_model, stick_to)
+            async for chunk in self._iter_chat_chunks(req, provider=stick_to):
+                yield chunk, stick_to
+            return
+
+        primary, fallback = self._registry.resolve_route("text")
+        providers: tuple[ProviderConfig, ...] = (primary,) + (
+            (fallback,) if fallback is not None else ()
+        )
+        last_exc: AssistAIError | None = None
+        for provider in providers:
+            req = dict(payload)
+            req["model"] = self._provider_chat_model(catalog_model, provider)
+            yielded = False
+            try:
+                async for chunk in self._iter_chat_chunks(req, provider=provider):
+                    yielded = True
+                    yield chunk, provider
+                return
+            except AssistAIError as exc:
+                last_exc = exc
+                if yielded:
+                    raise
+                reason = fallback_reason(exc)
+                if reason is None or provider is not primary or fallback is None:
+                    raise
+                if reason == "insufficient_balance":
+                    logger.error("provider_balance_exhausted", provider=provider.id)
+                logger.warning(
+                    "provider_fallback",
+                    **{"from": primary.id, "to": fallback.id, "reason": reason},
+                )
+                note_provider_fallback(primary.id, fallback.id, reason)
+        assert last_exc is not None
+        raise last_exc
 
     async def chat_completion(
         self,
@@ -229,6 +335,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         response_format: dict[str, Any] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> str:
         """Ведёт диалог с моделью и сама выполняет запрошенные инструменты.
 
@@ -256,10 +363,16 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         if not messages:
             raise ValueError("Список messages не может быть пустым.")
 
-        selected_model = self._resolve_chat_model(model)
+        catalog_model = self._catalog_chat_model(model)
         tools = self.get_tools_schema()
+        active_provider: ProviderConfig | None = None
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
+            if iteration > 1:
+                await self._ensure_round_budget(messages)
+            selected_model = self._provider_chat_model(
+                catalog_model, active_provider or self._endpoint("text")
+            )
             payload: dict[str, Any] = {
                 "model": selected_model,
                 "messages": messages,
@@ -273,6 +386,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 response_format=response_format,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning=reasoning,
             )
 
             logger.info(
@@ -283,23 +397,34 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 len(messages),
             )
             try:
-                data = await self._post_json(_CHAT_PATH, payload)
+                data, active_provider = await self._chat_post_with_fallback(
+                    payload,
+                    catalog_model=catalog_model,
+                    stick_to=active_provider,
+                )
             except AssistAIError as exc:
-                if (
-                    "max_tokens" in payload
-                    and _needs_max_completion_tokens_retry(exc)
-                ):
+                if "max_tokens" in payload and _needs_max_completion_tokens_retry(exc):
                     swapped = _swap_max_tokens_to_completion(payload)
                     logger.info(
                         "chat_max_tokens_remapped",
                         model=selected_model,
                         max_completion_tokens=swapped,
                     )
-                    data = await self._post_json(_CHAT_PATH, payload)
+                    data, active_provider = await self._chat_post_with_fallback(
+                        payload,
+                        catalog_model=catalog_model,
+                        stick_to=active_provider,
+                    )
                 else:
                     raise
             message, finish_reason = self._extract_choice(data)
-            await self._record_chat_usage(data, messages, assistant_message=message)
+            await self._record_chat_usage(
+                data,
+                messages,
+                assistant_message=message,
+                provider_id=active_provider.id,
+                provider=active_provider,
+            )
             raw_tool_calls = message.get("tool_calls") or []
             tool_calls = [
                 self._tools.normalize_tool_call(call)
@@ -388,10 +513,16 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         if not messages:
             raise ValueError("Список messages не может быть пустым.")
 
-        selected_model = self._resolve_chat_model(model)
+        catalog_model = self._catalog_chat_model(model)
         tools = self.get_tools_schema()
+        active_provider: ProviderConfig | None = None
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
+            if iteration > 1:
+                await self._ensure_round_budget(messages)
+            selected_model = self._provider_chat_model(
+                catalog_model, active_provider or self._endpoint("text")
+            )
             payload: dict[str, Any] = {
                 "model": selected_model,
                 "messages": messages,
@@ -420,10 +551,22 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             tool_builder = _ToolCallBuilder()
             finish_reason = ""
             remapped_max_tokens = False
+            last_usage: dict[str, Any] | None = None
+            billed_model: str | None = None
 
             while True:
                 try:
-                    async for chunk in self._iter_chat_chunks(payload):
+                    async for chunk, active_provider in self._iter_chat_with_fallback(
+                        payload,
+                        catalog_model=catalog_model,
+                        stick_to=active_provider,
+                    ):
+                        raw_usage = chunk.get("usage")
+                        if isinstance(raw_usage, dict):
+                            last_usage = raw_usage
+                        raw_model = chunk.get("model")
+                        if isinstance(raw_model, str) and raw_model:
+                            billed_model = raw_model
                         choices = chunk.get("choices")
                         if not isinstance(choices, list) or not choices:
                             continue
@@ -471,6 +614,8 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                     content_parts.clear()
                     tool_builder = _ToolCallBuilder()
                     finish_reason = ""
+                    last_usage = None
+                    billed_model = None
 
             tool_calls = [
                 self._tools.normalize_tool_call(call) for call in tool_builder.calls()
@@ -494,14 +639,17 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                         reasoning_text, content_text, tool_calls
                     )
                 )
-                # Charge the tool-calling round; final answer is billed separately.
-                await self._record_chat_estimate(
+                # Один record на раунд: факт usage, иначе эвристика.
+                await self._bill_stream_round(
                     messages,
                     content_text
                     or " ".join(
                         str(call["function"].get("arguments") or "")
                         for call in tool_calls
                     ),
+                    usage=last_usage,
+                    model=billed_model or selected_model,
+                    provider=active_provider,
                 )
                 results = await asyncio.gather(
                     *(_execute_tool_isolated(self._tools, call) for call in tool_calls)
@@ -532,7 +680,13 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 continue
 
             messages.append({"role": "assistant", "content": content_text})
-            await self._record_chat_estimate(messages, content_text)
+            await self._bill_stream_round(
+                messages,
+                content_text,
+                usage=last_usage,
+                model=billed_model or selected_model,
+                provider=active_provider,
+            )
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,
@@ -544,27 +698,74 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             f"Превышен лимит вызовов инструментов: {self.config.max_tool_iterations}"
         )
 
+    async def _ensure_round_budget(self, messages: list[dict[str, Any]]) -> None:
+        """Reserve headroom for the next tool-loop round after the hold is burned.
+
+        Handlers reserve once for the turn; ``record`` only burns
+        ``min(reserved, actual)``. Later rounds may need a fresh hold so the
+        daily cap is checked again before another paid LLM call.
+        """
+        input_chars = sum(len(_as_text(m.get("content"))) for m in messages)
+        estimated = cost_tracker.estimate_chat_cost(
+            input_chars=max(input_chars, 200), output_chars=400
+        )
+        try:
+            await cost_tracker.check_budget(estimated=estimated)
+        except BudgetExceededError:
+            raise
+
+    async def _bill_stream_round(
+        self,
+        messages: list[dict[str, Any]],
+        output_text: str,
+        *,
+        usage: dict[str, Any] | None,
+        model: str | None,
+        provider: ProviderConfig | None,
+    ) -> None:
+        """Один record на раунд stream: финальный usage-chunk или эвристика."""
+        provider_id = provider.id if provider is not None else None
+        if usage is None:
+            await self._record_chat_estimate(
+                messages,
+                output_text,
+                provider_id=provider_id,
+                provider=provider,
+            )
+            return
+        await self._record_chat_usage(
+            {"usage": usage, "model": model},
+            messages[:-1],
+            assistant_message=messages[-1] if messages else None,
+            provider_id=provider_id,
+            provider=provider,
+        )
+
     async def _record_chat_usage(
         self,
         data: dict[str, Any],
         messages: list[dict[str, Any]],
         *,
         assistant_message: dict[str, Any] | None = None,
+        provider_id: str | None = None,
+        provider: ProviderConfig | None = None,
     ) -> None:
-        """Record spend from provider ``usage`` or a chars heuristic."""
+        """Record spend from ``cost_rub``, token usage, or a chars heuristic."""
         usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            usage = None
         prompt_tokens = None
         completion_tokens = None
-        if isinstance(usage, dict):
+        if usage is not None:
             raw_in = usage.get("prompt_tokens")
             raw_out = usage.get("completion_tokens")
-            if isinstance(raw_in, int):
+            if isinstance(raw_in, int) and not isinstance(raw_in, bool):
                 prompt_tokens = raw_in
-            if isinstance(raw_out, int):
+            if isinstance(raw_out, int) and not isinstance(raw_out, bool):
                 completion_tokens = raw_out
         input_chars = sum(len(_as_text(m.get("content"))) for m in messages)
         output_chars = 0
-        if completion_tokens is None and isinstance(assistant_message, dict):
+        if isinstance(assistant_message, dict):
             output_chars = len(_as_text(assistant_message.get("content")))
             for call in assistant_message.get("tool_calls") or []:
                 if not isinstance(call, dict):
@@ -572,35 +773,48 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 function = call.get("function")
                 if isinstance(function, dict):
                     output_chars += len(str(function.get("arguments") or ""))
-        amount = cost_tracker.estimate_chat_cost(
+        amount, source, rub = chat_cost_usd(
+            usage=usage,
+            provider=provider,
+            rub_per_usd=self.config.rub_per_usd,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            input_chars=0 if prompt_tokens is not None else input_chars,
-            output_chars=0 if completion_tokens is not None else output_chars,
+            input_chars=input_chars,
+            output_chars=output_chars,
         )
         model_name = data.get("model") if isinstance(data, dict) else None
         await cost_tracker.record(
             kind="chat",
             amount_usd=amount,
-            provider=self._endpoint("text").id,
+            provider=provider_id or self._endpoint("text").id,
             model=model_name if isinstance(model_name, str) else None,
-            source="usage" if prompt_tokens is not None else "flat",
+            source=source,
+            cost_rub=rub,
         )
 
     async def _record_chat_estimate(
-        self, messages: list[dict[str, Any]], output_text: str
+        self,
+        messages: list[dict[str, Any]],
+        output_text: str,
+        *,
+        provider_id: str | None = None,
+        provider: ProviderConfig | None = None,
     ) -> None:
         """Estimate stream_chat spend when usage chunks are unavailable."""
         input_chars = sum(len(_as_text(m.get("content"))) for m in messages[:-1])
-        amount = cost_tracker.estimate_chat_cost(
+        amount, source, rub = chat_cost_usd(
+            usage=None,
+            provider=provider,
+            rub_per_usd=self.config.rub_per_usd,
             input_chars=input_chars,
             output_chars=len(output_text),
         )
         await cost_tracker.record(
             kind="chat",
             amount_usd=amount,
-            provider=self._endpoint("text").id,
-            source="flat",
+            provider=provider_id or self._endpoint("text").id,
+            source=source,
+            cost_rub=rub,
         )
 
     @staticmethod

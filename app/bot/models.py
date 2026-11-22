@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from app.bot.constants import (
     _ASPECT_IMAGE_SIZES,
+    _BANANA_IMAGE_SIZES,
     _MENU_ASSISTANTS,
     _MENU_TOPICS,
     _OPENAI_IMAGE_SIZES,
     _TIER_IMAGE_SIZES,
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
-    ELEVENLABS_TTS_VOICES,
     OPENAI_TTS_VOICES,
     PAGE_SIZE,
     SPEECHKIT_VOICES,
@@ -25,13 +25,12 @@ from app.bot.constants import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     image_model_family,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     logger,
     model_hint,
     resolve_speechkit_voice,
 )
-from app.llm.models_config import resolve_text_model
+from app.llm.models_config import resolve_text_model, resolve_tts_model
 
 
 def _text_model_of(
@@ -113,18 +112,20 @@ def _reply_menu(assistant_name: str, topic_name: str) -> ReplyKeyboardMarkup:
 def _size_choices(model_id: str) -> tuple[str, ...]:
     """Кнопки размера зависят от семейства image-модели."""
     family = image_model_family(model_id)
+    if family == "banana":
+        return _BANANA_IMAGE_SIZES
     if family in {"flux", "seedream"}:
         return _TIER_IMAGE_SIZES
-    if family in {"qwen", "recraft"}:
+    if family == "qwen":
         return _ASPECT_IMAGE_SIZES
     return _OPENAI_IMAGE_SIZES
 
 
 def _default_image_size(model_id: str) -> str:
     family = image_model_family(model_id)
-    if family in {"flux", "seedream"}:
+    if family in {"flux", "seedream", "banana"}:
         return "1K"
-    if family in {"qwen", "recraft"}:
+    if family == "qwen":
         return "1:1"
     return "1024x1024"
 
@@ -215,7 +216,8 @@ def _clip_tts_text(text: str) -> str:
 
 def _tts_model_of(profile: AssistantProfile, assistant: AssistAIClient) -> str:
     """Эффективная TTS-модель персоны (пустой выбор = дефолт конфига)."""
-    return profile.tts_model or assistant.config.default_tts_model
+    raw = profile.tts_model or assistant.config.default_tts_model
+    return resolve_tts_model(raw) or raw
 
 
 def _tts_voices_for(
@@ -225,8 +227,6 @@ def _tts_voices_for(
     effective = model_id or assistant.config.default_tts_model
     if is_speechkit_tts_model(effective):
         return SPEECHKIT_VOICES
-    if is_elevenlabs_tts_model(effective):
-        return ELEVENLABS_TTS_VOICES
     return OPENAI_TTS_VOICES
 
 

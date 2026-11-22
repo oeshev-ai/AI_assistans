@@ -145,6 +145,7 @@ class AlbumHub:
         self._buf: dict[AlbumKey, list[IncomingPhoto]] = {}
         self._tasks: dict[AlbumKey, asyncio.Task[None]] = {}
         self._latest: dict[AlbumKey, Any] = {}
+        self._append_failed: set[AlbumKey] = set()
         self._lock = asyncio.Lock()
         self._redis: Any | None = None
 
@@ -187,8 +188,20 @@ class AlbumHub:
             pipe.rpush(rkey, photo.to_json())
             pipe.expire(rkey, _REDIS_TTL_SEC)
             await pipe.execute()
+            self._append_failed.discard(key)
         except Exception as exc:
+            self._append_failed.add(key)
             logger.warning("album_redis_append_failed", error=str(exc))
+
+    @staticmethod
+    def _merge_photos(
+        remote: list[IncomingPhoto], local: list[IncomingPhoto]
+    ) -> list[IncomingPhoto]:
+        """Union by message_id; local fills gaps after a partial Redis append."""
+        by_id: dict[int, IncomingPhoto] = {item.message_id: item for item in remote}
+        for item in local:
+            by_id.setdefault(item.message_id, item)
+        return sorted(by_id.values(), key=lambda item: item.message_id)
 
     async def _redis_take(
         self, key: AlbumKey
@@ -197,7 +210,7 @@ class AlbumHub:
 
         Returns ``(won, photos)``.
         ``won=False`` — peer holds the lock (drop local to avoid double delivery).
-        ``won=None`` — Redis error (caller keeps local photos).
+        ``won=None`` — Redis error (caller must fail closed when Redis is attached).
         When Redis is healthy, the list is the source of truth.
         """
         if self._redis is None:
@@ -209,8 +222,12 @@ class AlbumHub:
             if not got_lock:
                 return False, []
             try:
-                raw_items = await self._redis.lrange(rkey, 0, -1)
-                await self._redis.delete(rkey)
+                # Atomic claim: MULTI/EXEC so RPUSH cannot land between LRANGE and DEL.
+                pipe = self._redis.pipeline(transaction=True)
+                pipe.lrange(rkey, 0, -1)
+                pipe.delete(rkey)
+                results = await pipe.execute()
+                raw_items = results[0] if results else []
             finally:
                 await self._redis.delete(lock)
         except Exception as exc:
@@ -230,20 +247,37 @@ class AlbumHub:
     async def _claim_photos(
         self, key: AlbumKey, local: list[IncomingPhoto]
     ) -> list[IncomingPhoto] | None:
-        """Photos to flush, or ``None`` if a peer already claimed the album."""
+        """Photos to flush, or ``None`` if a peer already claimed / claim unsafe."""
         won, remote = await self._redis_take(key)
+        append_failed = key in self._append_failed
+        self._append_failed.discard(key)
         if won is None:
-            logger.warning(
-                "album_redis_claim_fallback_local",
-                local_count=len(local),
-                chat_id=key[0],
-                user_id=key[1],
-            )
+            # Fail closed with Redis attached: local fallback duplicates paid work
+            # across replicas. Without Redis, local is the only source of truth.
+            if self._redis is not None:
+                logger.warning(
+                    "album_redis_claim_fail_closed",
+                    local_count=len(local),
+                    chat_id=key[0],
+                    user_id=key[1],
+                )
+                return None
             return local
         if not won:
             return None
         if self._redis is None:
             return local
+        if append_failed:
+            merged = self._merge_photos(remote, local)
+            logger.warning(
+                "album_redis_append_incomplete_using_merge",
+                remote_count=len(remote),
+                local_count=len(local),
+                merged_count=len(merged),
+                chat_id=key[0],
+                user_id=key[1],
+            )
+            return merged
         # Redis SoT: empty after a won lock ⇒ peer already flushed.
         return remote
 

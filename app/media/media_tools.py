@@ -9,11 +9,11 @@ from typing import Any, Literal, Self
 
 import structlog
 
-from app.infra.cost_tracker import BudgetExceededError, cost_tracker
+from app.infra.cost_tracker import BudgetExceededError, cost_tracker, prefer_cost_rub
 from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
 from app.llm.image_ops import _get_generation_ids, note_generation_id
-from app.llm.media_api import SpeechResult
+from app.llm.media_api import SpeechResult, TranscriptionResult
 from app.llm.tooling import BaseTool, _error_json, _exception_text
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
@@ -514,19 +514,48 @@ class TranscribeMediaTool(BaseTool):
                 is_video=source.kind == "video",
             )
             parts: list[str] = []
+            facts: list[tuple[float | None, str | None, float | None]] = []
+            providers: list[str | None] = []
+            models: list[str | None] = []
+            saw_unpriced = False
             for audio_bytes, name in chunks:
-                text = await self._client.transcribe_audio(
+                raw = await self._client.transcribe_audio(
                     audio_bytes,
                     filename=name,
                     language=lang,
                 )
+                if isinstance(raw, TranscriptionResult):
+                    text = raw.text
+                    facts.append((raw.cost_usd, raw.cost_source, raw.cost_rub))
+                    providers.append(raw.provider_id)
+                    models.append(raw.model)
+                else:
+                    text = raw if isinstance(raw, str) else str(raw)
+                    saw_unpriced = True
                 if text:
                     parts.append(text)
             transcript = "\n\n".join(parts).strip()
             if not transcript:
                 return _error_json("Речь не распознана.")
 
-            await cost_tracker.record(kind="stt", amount_usd=estimated)
+            if saw_unpriced:
+                amount, cost_source, rub = estimated, None, None
+                provider = None
+                billed_model = None
+            else:
+                amount, cost_source, rub = prefer_cost_rub(facts, estimated)
+                provider = (
+                    providers[0] if providers and len(set(providers)) == 1 else None
+                )
+                billed_model = models[0] if models and len(set(models)) == 1 else None
+            await cost_tracker.record(
+                kind="stt",
+                amount_usd=amount,
+                provider=provider,
+                model=billed_model,
+                source=cost_source,
+                cost_rub=rub,
+            )
             bucket = _outbound()
             if bucket is not None:
                 bucket.add(
@@ -714,7 +743,18 @@ class SynthesizeSpeechTool(BaseTool):
                 text=cleaned,
                 voice=selected_voice,
             )
-            await cost_tracker.record(kind="tts", amount_usd=estimated)
+            amount, source, rub = prefer_cost_rub(
+                [(speech.cost_usd, speech.cost_source, speech.cost_rub)],
+                estimated,
+            )
+            await cost_tracker.record(
+                kind="tts",
+                amount_usd=amount,
+                provider=speech.provider_id,
+                model=speech.model,
+                source=source,
+                cost_rub=rub,
+            )
             bucket = _outbound()
             if bucket is not None:
                 bucket.add(

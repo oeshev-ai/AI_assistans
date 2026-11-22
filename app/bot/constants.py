@@ -66,9 +66,7 @@ from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     AVAILABLE_TTS_MODELS,
-    ELEVENLABS_TTS_VOICES,
     OPENAI_TTS_VOICES,
-    is_elevenlabs_tts_model,
     model_hint,
 )
 from app.llm.speechkit_tts import (
@@ -167,17 +165,17 @@ MAX_MEDIA_SIZE_MB = 20  # лимит Telegram Bot API getFile
 SHOW_RECOGNIZED_TEXT = True
 VOICE_RECOGNIZED_PREVIEW_LIMIT = 500
 TTS_MAX_CHARS = 3500
-# Совместимость со старым именем; актуальный список — ``_tts_voices_for``.
-PROXYAPI_TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
 TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
 _MENU_ASSISTANTS = "Персоны"
 _MENU_TOPICS = "Темы"
 _OPENAI_IMAGE_SIZES: tuple[str, ...] = ("1024x1024", "1024x1792", "1792x1024")
 _TIER_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K")
+_BANANA_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K", "4K")
 _ASPECT_IMAGE_SIZES: tuple[str, ...] = ("1:1", "16:9", "9:16")
 IMAGE_SIZES: tuple[str, ...] = (
     *_OPENAI_IMAGE_SIZES,
     *_TIER_IMAGE_SIZES,
+    *_BANANA_IMAGE_SIZES,
     *_ASPECT_IMAGE_SIZES,
 )
 _FLOW_KEYS = (

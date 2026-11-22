@@ -162,7 +162,7 @@ async def test_assist_client_speechkit_missing_key() -> None:
 async def test_assist_client_routes_by_model_not_provider(
     respx_mock: MockRouter,
 ) -> None:
-    """Даже при TTS_PROVIDER=proxyapi модель yandex/speechkit идёт в SpeechKit."""
+    """Даже при TTS_PROVIDER=polza модель yandex/speechkit идёт в SpeechKit."""
     chunk = base64.b64encode(b"sk-ogg").decode()
     respx_mock.post(SPEECHKIT_URL).mock(
         return_value=httpx.Response(
@@ -173,7 +173,7 @@ async def test_assist_client_routes_by_model_not_provider(
     client = AssistAIClient(
         AssistAIConfig(
             proxyapi_key="test-proxy-key",
-            tts_provider="proxyapi",
+            tts_provider="polza",
             speechkit_api_key="sk-key",
             speechkit_folder_id="folder",
             default_tts_model="openai/gpt-4o-mini-tts",

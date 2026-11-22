@@ -41,14 +41,12 @@ Thumbs.db
 *.jpg
 *.jpeg
 *.webp
-!docs/**
 prompt.md
 
 # Redis RDB backups
 backups/
 
-docs/
-!app/docs/
-app/docs/**
-!app/docs/polza-media-contract.md
 artifacts/
+
+# Внутренние ТЗ и контракты, не для репозитория
+app/docs/

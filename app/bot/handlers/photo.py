@@ -90,11 +90,9 @@ async def _load(
         await R._reply_profile_error(turn.message)
         return None
     user_id = (
-        turn.message.from_user.id
-        if turn.message.from_user
-        else turn.message.chat.id
+        turn.message.from_user.id if turn.message.from_user else turn.message.chat.id
     )
-    media = await turn.pending.get(turn.message.chat.id, profile.id, user_id)
+    media = await turn.pending.pop(turn.message.chat.id, profile.id, user_id)
     if media is None or not media.items:
         await turn.message.answer("Фото устарели. Пришлите их ещё раз.")
         await R._reset_flow(turn.state)
@@ -104,18 +102,16 @@ async def _load(
 
 async def _run_analyze(turn: PhotoTurn, media: PendingMedia, question: str) -> None:
     media.caption = question
-    await turn.pending.put(media)
     from app.bot.photo_flow import route_album
 
-    await route_album(turn, media, charge_text_limit=False)
+    await route_album(turn, media, charge_text_limit=False, pending_claimed=True)
 
 
 async def _run_edit(turn: PhotoTurn, media: PendingMedia, instruction: str) -> None:
     media.caption = instruction
-    await turn.pending.put(media)
     from app.bot.photo_flow import route_album
 
-    await route_album(turn, media, charge_text_limit=False)
+    await route_album(turn, media, charge_text_limit=False, pending_claimed=True)
 
 
 def _turn_from(
@@ -198,11 +194,7 @@ async def on_photo_cancel(
     if isinstance(message, Message):
         try:
             profile = await R._active_profile(message.chat.id, assistant_storage)
-            user_id = (
-                callback.from_user.id
-                if callback.from_user
-                else message.chat.id
-            )
+            user_id = callback.from_user.id if callback.from_user else message.chat.id
             await pending_media.clear(message.chat.id, profile.id, user_id)
         except Exception:
             logger.info("photo_cancel_without_profile")

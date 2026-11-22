@@ -23,6 +23,7 @@ from app.llm.models_config import (
     LEGACY_TEXT_MODEL_ALIASES,
     resolve_image_model,
     resolve_text_model,
+    resolve_tts_model,
 )
 from app.storage.history_storage import RedisConfig
 
@@ -148,6 +149,11 @@ class AssistantProfile(BaseModel):
         self.vision_model = alias_model(
             self.vision_model, LEGACY_TEXT_MODEL_ALIASES, "text"
         )
+        if self.tts_model:
+            resolved_tts = resolve_tts_model(self.tts_model)
+            if resolved_tts and resolved_tts != self.tts_model:
+                logger.info("tts_model_aliased", old=self.tts_model, new=resolved_tts)
+                self.tts_model = resolved_tts
         return self
 
 

@@ -15,7 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 
-from app.llm.models_config import resolve_image_model, resolve_text_model
+from app.llm.models_config import (
+    resolve_image_model,
+    resolve_text_model,
+    resolve_tts_model,
+)
 from app.llm.providers import ProviderConfig, ProviderRegistry
 
 logger = structlog.get_logger("AssistAI.config")
@@ -80,6 +84,14 @@ def _positive_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _model_env(name: str, default: str) -> str:
+    """Значение из окружения. Пустая строка оставляет дефолт."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip() or default
+
+
 def _positive_float(name: str, default: float) -> float:
     """Читает положительный float. Пустое или битое значение оставляет дефолт."""
     raw = os.getenv(name, "").strip()
@@ -92,16 +104,32 @@ def _positive_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _tts_provider_value(raw: str) -> str:
+    """Поставщик озвучки: ``polza``, ``proxyapi`` или ``speechkit``."""
+    if raw in {"", "polza"}:
+        return "polza"
+    if raw in {"speechkit", "proxyapi"}:
+        return raw
+    logger.warning("tts_provider_invalid", value=raw, fallback="polza")
+    return "polza"
+
+
 class AssistAIConfig(BaseModel):
     """Конфигурация клиента. Ключи не попадают в ``repr``.
 
-    ``from_env`` читает ``PROXYAPI_API_KEY``, ``OPENWEATHER_API_KEY``
-    и ``EXCHANGERATE_API_KEY``. Пустой ключ погоды или курса валют
-    не мешает запустить клиент: соответствующий инструмент просто не регистрируется.
+    ``from_env`` читает ``PROXYAPI_API_KEY`` (обязателен, fallback),
+    ``POLZA_API_KEY`` (обязателен, если любой ``*_PROVIDER=polza`` —
+    это дефолт), ``OPENWEATHER_API_KEY`` и ``EXCHANGERATE_API_KEY``.
+    Пустой ключ погоды или курса валют не мешает запустить клиент:
+    соответствующий инструмент просто не регистрируется.
 
-    TTS: ``TTS_PROVIDER`` = ``speechkit`` | ``proxyapi``. Для SpeechKit —
-    ``YC_SPEECHKIT_API_KEY``, ``YC_FOLDER_ID``, ``SPEECHKIT_VOICE`` / ``ROLE`` / ``SPEED``.
-    Для ProxyAPI: ``PROXYAPI_TTS_MODEL``, ``PROXYAPI_TTS_VOICE``, ``PROXYAPI_TTS_FORMAT``.
+    TTS: ``TTS_PROVIDER`` — поставщик озвучки, ``polza`` | ``speechkit`` |
+    ``proxyapi``. ``polza`` и ``proxyapi`` — ``/audio/speech`` у этого хоста.
+    ``speechkit`` — Yandex (``YC_SPEECHKIT_API_KEY``, ``YC_FOLDER_ID``,
+    ``SPEECHKIT_VOICE`` / ``ROLE`` / ``SPEED``). Голос и формат каталожного
+    TTS — ``TTS_VOICE``, ``TTS_FORMAT``.
+    Модели общие для провайдеров: ``TEXT_MODEL``, ``TRANSCRIBE_MODEL``,
+    ``TTS_MODEL``, ``IMAGE_MODEL``, ``IMAGE_EDIT_MODEL``, ``VIDEO_MODEL``.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -118,14 +146,12 @@ class AssistAIConfig(BaseModel):
     default_tts_format: str = "opus"
     default_image_edit_model: str = "openai/gpt-image-2.6-flare"
     image_quality: Literal["low", "medium", "high", "xhigh", "max", "auto"] = "high"
-    image_complexity_generate: Literal["low", "medium", "high"] = "high"
-    image_complexity_edit: Literal["low", "medium", "high"] = "low"
     image_edit_size_mode: Literal["source", "auto", "fixed"] = "source"
     image_input_max_edge: int = Field(default=1536, ge=0)
-    send_complexity: bool = True
+    # Kept for env/from_env compatibility; resolution reads IMAGE/TEXT/TTS_LEGACY_ALIASES directly.
     legacy_model_aliases: bool = True
     default_video_model: str = "bytedance/seedance-2.0"
-    tts_provider: Literal["speechkit", "proxyapi"] = "proxyapi"
+    tts_provider: Literal["speechkit", "polza", "proxyapi"] = "polza"
     speechkit_api_key: str = Field(default="", repr=False)
     speechkit_folder_id: str = ""
     speechkit_role: str = "friendly"
@@ -136,11 +162,16 @@ class AssistAIConfig(BaseModel):
     photo_router_model: str = "deepseek/deepseek-v4.1-flash"
     router_confidence: float = Field(default=0.55, ge=0, le=1)
     router_max_tokens: int = Field(default=600, ge=1)
-    # Мультипровайдерность. Пустые providers/routes = только ProxyAPI из
-    # base_url/proxyapi_key (поведение до G2).
+    # Мультипровайдерность. Пустые routes в from_env → polza primary;
+    # ProxyAPI остаётся fallback (image/text/audio/video_provider_fallback).
+    # Пустой AssistAIConfig без routes: _build_registry сидит на polza, если
+    # polza есть в providers, иначе на proxyapi.
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     routes: dict[str, str] = Field(default_factory=dict)
     image_provider_fallback: str = ""
+    text_provider_fallback: str = ""
+    audio_provider_fallback: str = ""
+    video_provider_fallback: str = ""
     rub_per_usd: float = Field(default=304.0, gt=0)
     polza_total_wait: float = Field(default=240.0, gt=0)
     polza_poll_interval: float = Field(default=4.0, gt=0)
@@ -161,6 +192,14 @@ class AssistAIConfig(BaseModel):
             logger.warning("text_model_aliased", source="env", old=value, new=resolved)
         return resolved
 
+    @field_validator("default_tts_model", mode="after")
+    @classmethod
+    def _alias_legacy_tts_model(cls, value: str) -> str:
+        resolved = resolve_tts_model(value) or value
+        if resolved != value:
+            logger.warning("tts_model_aliased", source="env", old=value, new=resolved)
+        return resolved
+
     @field_validator("base_url")
     @classmethod
     def _normalize_base_url(cls, value: str) -> str:
@@ -171,9 +210,9 @@ class AssistAIConfig(BaseModel):
     @field_validator("tts_provider", mode="before")
     @classmethod
     def _normalize_tts_provider(cls, value: Any) -> str:
-        cleaned = str(value or "proxyapi").strip().casefold()
-        if cleaned not in {"speechkit", "proxyapi"}:
-            raise ValueError("tts_provider должен быть speechkit или proxyapi")
+        cleaned = str(value or "polza").strip().casefold()
+        if cleaned not in {"speechkit", "polza", "proxyapi"}:
+            raise ValueError("tts_provider должен быть polza, proxyapi или speechkit")
         return cleaned
 
     @classmethod
@@ -181,19 +220,11 @@ class AssistAIConfig(BaseModel):
         """Собирает конфигурацию из переменных окружения и файла ``.env``."""
         load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         load_dotenv()
-        provider_raw = os.getenv("TTS_PROVIDER", "proxyapi").strip().casefold()
-        provider: Literal["speechkit", "proxyapi"]
-        if provider_raw == "speechkit":
-            provider = "speechkit"
-        elif provider_raw in {"", "proxyapi"}:
-            provider = "proxyapi"
-        else:
-            logger.warning(
-                "tts_provider_invalid",
-                value=provider_raw,
-                fallback="proxyapi",
-            )
-            provider = "proxyapi"
+        provider_raw = os.getenv("TTS_PROVIDER", "").strip().casefold()
+        provider: Literal["speechkit", "polza", "proxyapi"] = cast(
+            Literal["speechkit", "polza", "proxyapi"],
+            _tts_provider_value(provider_raw),
+        )
         speechkit_key = os.getenv("YC_SPEECHKIT_API_KEY", "").strip()
         speechkit_voice = os.getenv("SPEECHKIT_VOICE", "marina").strip() or "marina"
         speechkit_role = os.getenv("SPEECHKIT_ROLE", "friendly").strip()
@@ -219,78 +250,73 @@ class AssistAIConfig(BaseModel):
         else:
             from app.llm.media_api import normalize_tts_format
 
-            default_tts_voice = os.getenv("PROXYAPI_TTS_VOICE", "alloy")
-            default_tts_format = normalize_tts_format(
-                os.getenv("PROXYAPI_TTS_FORMAT", "opus")
-            )
-            default_tts_model = os.getenv(
-                "PROXYAPI_TTS_MODEL", "openai/gpt-4o-mini-tts"
-            )
+            default_tts_voice = _model_env("TTS_VOICE", "alloy")
+            default_tts_format = normalize_tts_format(_model_env("TTS_FORMAT", "opus"))
+            default_tts_model = _model_env("TTS_MODEL", "openai/gpt-4o-mini-tts")
+        from app.llm.providers import load_routes
+
         proxy_key = os.getenv("PROXYAPI_API_KEY", "").strip()
+        polza_key = os.getenv("POLZA_API_KEY", "").strip()
         base_url = (
             os.getenv("PROXYAPI_BASE_URL", "").strip() or "https://api.proxyapi.ru/v1"
         )
+        preview_routes = load_routes()
+        polza_ops = [op for op, pid in preview_routes.items() if pid == "polza"]
+        if polza_ops and not polza_key:
+            raise ValueError(
+                "POLZA_API_KEY обязателен: маршруты указывают на polza "
+                f"({', '.join(polza_ops)})"
+            )
         providers: dict[str, ProviderConfig] = {}
         routes: dict[str, str] = {}
         image_fallback = ""
+        text_fallback = ""
+        audio_fallback = ""
+        video_fallback = ""
         if proxy_key:
             # Без ключа ProxyAPI реестр не строим: ошибку отдаст валидация ключа.
-            registry = ProviderRegistry.from_env(proxyapi_key=proxy_key)
+            registry = ProviderRegistry.from_env(
+                proxyapi_key=proxy_key,
+                polza_key=polza_key or None,
+            )
             providers = registry.providers
             routes = registry.routes
             image_fallback = registry.image_fallback
-        default_text_model = (
-            os.getenv("PROXYAPI_TEXT_MODEL", "deepseek/deepseek-v4.1-flash").strip()
-            or "deepseek/deepseek-v4.1-flash"
-        )
+            text_fallback = registry.text_fallback
+            audio_fallback = registry.audio_fallback
+            video_fallback = registry.video_fallback
+        default_text_model = _model_env("TEXT_MODEL", "deepseek/deepseek-v4.1-flash")
         return cls(
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
             base_url=base_url,
             providers=providers,
             routes=routes,
             image_provider_fallback=image_fallback,
+            text_provider_fallback=text_fallback,
+            audio_provider_fallback=audio_fallback,
+            video_provider_fallback=video_fallback,
             rub_per_usd=_positive_float("RUB_PER_USD", 304.0),
             polza_total_wait=_positive_float("POLZA_TOTAL_WAIT", 240.0),
             polza_poll_interval=_positive_float("POLZA_POLL_INTERVAL", 4.0),
             openweather_api_key=os.getenv("OPENWEATHER_API_KEY", ""),
             exchangerate_api_key=os.getenv("EXCHANGERATE_API_KEY", ""),
             default_text_model=default_text_model,
-            default_transcribe_model=os.getenv(
-                "PROXYAPI_TRANSCRIBE_MODEL", "openai/whisper-large-v3"
+            default_transcribe_model=_model_env(
+                "TRANSCRIBE_MODEL", "openai/whisper-large-v3"
             ),
             default_tts_model=default_tts_model,
             default_tts_voice=default_tts_voice,
             default_tts_format=default_tts_format,
-            default_image_model=os.getenv(
-                "PROXYAPI_IMAGE_MODEL", "openai/gpt-image-2.6-flare"
-            ).strip()
-            or "openai/gpt-image-2.6-flare",
-            default_image_edit_model=os.getenv(
-                "PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.6-flare"
-            ).strip()
-            or "openai/gpt-image-2.6-flare",
+            default_image_model=_model_env("IMAGE_MODEL", "openai/gpt-image-2.6-flare"),
+            default_image_edit_model=_model_env(
+                "IMAGE_EDIT_MODEL", "openai/gpt-image-2.6-flare"
+            ),
             image_quality=cast(
                 Literal["low", "medium", "high", "xhigh", "max", "auto"],
                 _choice(
                     "IMAGE_QUALITY",
                     "high",
                     {"low", "medium", "high", "xhigh", "max", "auto"},
-                ),
-            ),
-            image_complexity_generate=cast(
-                Literal["low", "medium", "high"],
-                _choice(
-                    "IMAGE_COMPLEXITY_GENERATE",
-                    "high",
-                    {"low", "medium", "high"},
-                ),
-            ),
-            image_complexity_edit=cast(
-                Literal["low", "medium", "high"],
-                _choice(
-                    "IMAGE_COMPLEXITY_EDIT",
-                    "low",
-                    {"low", "medium", "high"},
                 ),
             ),
             image_input_max_edge=_non_negative_int("IMAGE_INPUT_MAX_EDGE", 1536),
@@ -302,11 +328,8 @@ class AssistAIConfig(BaseModel):
                     {"source", "auto", "fixed"},
                 ),
             ),
-            send_complexity=_env_flag("IMAGE_SEND_COMPLEXITY", True),
             legacy_model_aliases=_env_flag("IMAGE_LEGACY_ALIASES", True),
-            default_video_model=os.getenv(
-                "PROXYAPI_VIDEO_MODEL", "bytedance/seedance-2.0"
-            ),
+            default_video_model=_model_env("VIDEO_MODEL", "bytedance/seedance-2.0"),
             tts_provider=provider,
             speechkit_api_key=speechkit_key,
             speechkit_folder_id=os.getenv("YC_FOLDER_ID", "").strip(),

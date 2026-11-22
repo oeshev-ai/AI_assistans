@@ -95,3 +95,26 @@ async def test_image_text_does_not_override_mocked_contract() -> None:
         instruction_ru="правка",
         confidence=0.95,
     )
+
+
+@pytest.mark.asyncio
+async def test_empty_caption_does_not_ask_router() -> None:
+    from app.bot.photo_flow import _decision
+    from app.storage.pending_media import PendingMedia
+
+    router = _Router(['{"intent":"edit","instruction_en":"old","confidence":0.9}'])
+    media = PendingMedia(
+        chat_id=1,
+        user_id=1,
+        assistant_id="a",
+        items=[],
+        caption="",
+    )
+    decision = await _decision(
+        SimpleNamespace(assistant=router, topic_storage=None),
+        media,
+        _images(),
+        "topic",
+    )
+    assert decision.intent == "unclear"
+    assert router.calls == []

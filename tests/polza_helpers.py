@@ -14,7 +14,7 @@ def make_polza_provider(**overrides: Any) -> ProviderConfig:
         "kind": "polza_media",
         "base_url": "https://polza.ai/api",
         "api_key": "test-polza-key",
-        "capabilities": ["chat", "images", "images_edit"],
+        "capabilities": ["chat", "images", "images_edit", "audio", "video"],
         "cost_source": "cost_rub",
         "cost_multiplier": 0.39,
         "upstream_only": ("OpenAI",),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,9 +44,9 @@ async def test_upload_process_respects_media_rate_limit(
         mime_type="audio/mpeg",
         file_size=12_000,
     )
-    bot = SimpleNamespace(send_message=AsyncMock())
-    store = SimpleNamespace(update=AsyncMock())
-    storage = SimpleNamespace(
+    bot: Any = SimpleNamespace(send_message=AsyncMock())
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
         download_bytes=AsyncMock(),
         delete_object=AsyncMock(),
@@ -95,9 +96,9 @@ async def test_upload_process_respects_budget(
         mime_type="audio/mpeg",
         file_size=12_000,
     )
-    bot = SimpleNamespace(send_message=AsyncMock())
-    store = SimpleNamespace(update=AsyncMock())
-    storage = SimpleNamespace(
+    bot: Any = SimpleNamespace(send_message=AsyncMock())
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
         download_bytes=AsyncMock(),
         delete_object=AsyncMock(),

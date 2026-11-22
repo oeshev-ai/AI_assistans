@@ -104,7 +104,8 @@ async def test_poll_exhaustion_raises_poll_timeout(
                 )
     assert len(poll.calls) == 2
     assert info.value.error_code == "POLL_TIMEOUT"
-    assert fallback_reason(info.value) == "poll_timeout"
+    assert info.value.job_committed is True
+    assert fallback_reason(info.value) is None
 
 
 @pytest.mark.asyncio
@@ -152,15 +153,18 @@ async def test_transient_poll_5xx_is_tolerated(
 
 
 @pytest.mark.asyncio
-async def test_client_poll_exhaustion_falls_back_to_proxyapi(
+async def test_client_poll_exhaustion_no_fallback(
     multi_client_factory: Callable[..., AssistAIClient],
     polza_fixture: Callable[[str], dict[str, Any]],
     sleeps: list[float],
 ) -> None:
+    """After Polza accepts the image job, poll timeout must not open ProxyAPI."""
     pending = polza_fixture("async_pending")
     client = multi_client_factory(polza_total_wait=8.0, polza_poll_interval=4.0)
     with respx.mock(assert_all_called=False) as router:
-        router.post(_MEDIA_URL).mock(return_value=httpx.Response(200, json=pending))
+        polza = router.post(_MEDIA_URL).mock(
+            return_value=httpx.Response(200, json=pending)
+        )
         router.get(f"{_BASE}/v1/media/{pending['id']}").mock(
             return_value=httpx.Response(200, json=pending)
         )
@@ -169,9 +173,12 @@ async def test_client_poll_exhaustion_falls_back_to_proxyapi(
                 200, json={"data": [{"url": "https://cdn.example/fallback.png"}]}
             )
         )
-        images = await client.generate_image("постер", model=_MODEL, size="1024x1024")
-    assert images == ["https://cdn.example/fallback.png"]
-    assert len(proxy.calls) == 1
+        with pytest.raises(AssistAIError) as info:
+            await client.generate_image("постер", model=_MODEL, size="1024x1024")
+    assert info.value.error_code == "POLL_TIMEOUT"
+    assert info.value.job_committed is True
+    assert len(polza.calls) == 1
+    assert not proxy.called
 
 
 @pytest.mark.asyncio

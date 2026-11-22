@@ -21,10 +21,13 @@ from tests.polza_helpers import make_polza_provider
 _POLZA_FIXTURES = Path(__file__).parent / "fixtures" / "polza"
 _PROVIDER_ENV = (
     "TEXT_PROVIDER",
+    "TEXT_PROVIDER_FALLBACK",
     "IMAGE_PROVIDER",
     "IMAGE_PROVIDER_FALLBACK",
     "AUDIO_PROVIDER",
+    "AUDIO_PROVIDER_FALLBACK",
     "VIDEO_PROVIDER",
+    "VIDEO_PROVIDER_FALLBACK",
     "PROXYAPI_BASE_URL",
     "POLZA_BASE_URL",
     "POLZA_API_KEY",
@@ -99,6 +102,9 @@ async def multi_client_factory() -> AsyncIterator[Callable[..., AssistAIClient]]
         *,
         image_provider: str = "polza",
         fallback: str = "proxyapi",
+        text_fallback: str = "proxyapi",
+        audio_fallback: str = "proxyapi",
+        video_fallback: str = "proxyapi",
         provider_overrides: dict[str, Any] | None = None,
         **config_overrides: Any,
     ) -> AssistAIClient:
@@ -111,12 +117,26 @@ async def multi_client_factory() -> AsyncIterator[Callable[..., AssistAIClient]]
             "tts_provider": "proxyapi",
             "timeout": 5.0,
             "providers": providers,
-            "routes": {"image": image_provider},
+            # Image-focused factory: text/audio/video stay on ProxyAPI unless
+            # the caller overrides ``routes`` (seed would otherwise put all on polza).
+            "routes": {
+                "text": "proxyapi",
+                "image": image_provider,
+                "audio": "proxyapi",
+                "video": "proxyapi",
+            },
             "image_provider_fallback": fallback,
+            "text_provider_fallback": text_fallback,
+            "audio_provider_fallback": audio_fallback,
+            "video_provider_fallback": video_fallback,
             "polza_poll_interval": 4.0,
             "polza_total_wait": 240.0,
         }
         fields.update(config_overrides)
+        if "tts_provider" not in config_overrides:
+            audio_id = fields["routes"].get("audio", "proxyapi")
+            if audio_id in {"polza", "proxyapi"}:
+                fields["tts_provider"] = audio_id
         client = AssistAIClient(AssistAIConfig(**fields))
         created.append(client)
         return client

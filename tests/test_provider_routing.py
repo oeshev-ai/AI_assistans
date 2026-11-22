@@ -60,9 +60,10 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 # --- G2: конфиг и выбор эндпоинтов ---
 
 
-def test_empty_env_routes_everything_to_proxyapi(
+def test_proxyapi_only_client_routes_everything_to_proxyapi(
     assist_client: AssistAIClient,
 ) -> None:
+    """AssistAIConfig без polza в providers → seed на proxyapi."""
     for operation in ("text", "chat", "image", "images_edit", "audio", "video"):
         provider = assist_client._endpoint(operation)
         assert provider.id == "proxyapi"
@@ -78,6 +79,8 @@ def test_from_env_reads_routes_and_waits(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
     monkeypatch.setenv("PROXYAPI_BASE_URL", "https://proxy.example/v9/")
     monkeypatch.setenv("POLZA_API_KEY", "pz-key")
+    monkeypatch.setenv("TEXT_PROVIDER", "polza")
+    monkeypatch.setenv("TEXT_PROVIDER_FALLBACK", "proxyapi")
     monkeypatch.setenv("IMAGE_PROVIDER", "polza")
     monkeypatch.setenv("IMAGE_PROVIDER_FALLBACK", "proxyapi")
     monkeypatch.setenv("RUB_PER_USD", "300")
@@ -86,25 +89,58 @@ def test_from_env_reads_routes_and_waits(monkeypatch: pytest.MonkeyPatch) -> Non
     config = AssistAIConfig.from_env()
     assert config.base_url == "https://proxy.example/v9"
     assert config.routes["image"] == "polza"
-    assert config.routes["text"] == "proxyapi"
+    assert config.routes["text"] == "polza"
     assert config.image_provider_fallback == "proxyapi"
+    assert config.text_provider_fallback == "proxyapi"
     assert config.rub_per_usd == 300.0
     assert config.polza_total_wait == 120.0
     assert config.polza_poll_interval == 2.0
     assert set(config.providers) == {"proxyapi", "polza"}
 
 
-def test_from_env_defaults_match_pre_g2(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_defaults_polza_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
-    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv("POLZA_API_KEY", "pz-key")
+    for name in (
+        "TEXT_PROVIDER",
+        "TEXT_PROVIDER_FALLBACK",
+        "IMAGE_PROVIDER",
+        "IMAGE_PROVIDER_FALLBACK",
+        "AUDIO_PROVIDER",
+        "AUDIO_PROVIDER_FALLBACK",
+        "VIDEO_PROVIDER",
+        "VIDEO_PROVIDER_FALLBACK",
+    ):
+        monkeypatch.delenv(name, raising=False)
     config = AssistAIConfig.from_env()
     assert config.base_url == _PROXY_BASE
-    assert set(config.providers) == {"proxyapi"}
-    assert set(config.routes.values()) == {"proxyapi"}
+    assert set(config.providers) == {"proxyapi", "polza"}
+    assert set(config.routes.values()) == {"polza"}
+    assert config.image_provider_fallback == "proxyapi"
+    assert config.text_provider_fallback == "proxyapi"
+    assert config.audio_provider_fallback == "proxyapi"
+    assert config.video_provider_fallback == "proxyapi"
     assert config.rub_per_usd == 304.0
     assert config.polza_total_wait == 240.0
     assert config.polza_poll_interval == 4.0
+
+
+def test_missing_polza_key_fails_when_routes_default_to_polza(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    for name in (
+        "TEXT_PROVIDER",
+        "IMAGE_PROVIDER",
+        "AUDIO_PROVIDER",
+        "VIDEO_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="POLZA_API_KEY"):
+        AssistAIConfig.from_env()
 
 
 def test_unknown_image_provider_fails_at_startup(
@@ -113,13 +149,16 @@ def test_unknown_image_provider_fails_at_startup(
     monkeypatch.setattr("app.llm.config.load_dotenv", lambda *a, **k: None)
     monkeypatch.setenv("PROXYAPI_API_KEY", "px-key")
     monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv("TEXT_PROVIDER", "proxyapi")
+    monkeypatch.setenv("AUDIO_PROVIDER", "proxyapi")
+    monkeypatch.setenv("VIDEO_PROVIDER", "proxyapi")
     monkeypatch.setenv("IMAGE_PROVIDER", "polza")
-    with pytest.raises(ValueError, match="polza"):
+    with pytest.raises(ValueError, match=r"POLZA_API_KEY|polza"):
         AssistAIConfig.from_env()
 
 
 @pytest.mark.asyncio
-async def test_empty_env_generate_hits_proxyapi_only(
+async def test_proxyapi_only_generate_hits_proxyapi(
     assist_client: AssistAIClient,
 ) -> None:
     with respx.mock(assert_all_called=False) as router:
@@ -137,7 +176,7 @@ async def test_empty_env_generate_hits_proxyapi_only(
 
 
 @pytest.mark.asyncio
-async def test_empty_env_edit_hits_proxyapi_only(
+async def test_proxyapi_only_edit_hits_proxyapi(
     assist_client: AssistAIClient,
 ) -> None:
     import io
@@ -241,6 +280,95 @@ async def test_open_polza_breaker_does_not_block_proxyapi() -> None:
 
 
 # --- G4: fallback ---
+
+_CHAT_OK = {
+    "choices": [
+        {
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }
+    ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+}
+_POLZA_CHAT = "https://polza.ai/api/v1/chat/completions"
+_PROXY_CHAT = f"{_PROXY_BASE}/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_text_unavailable_falls_back_to_proxyapi(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"text": "polza", "image": "polza"},
+        text_fallback="proxyapi",
+    )
+    before = _fallback_count("polza", "proxyapi", "http_5xx")
+    with respx.mock(assert_all_called=False) as router:
+        polza = router.post(_POLZA_CHAT).mock(return_value=httpx.Response(503))
+        proxy = router.post(_PROXY_CHAT).mock(
+            return_value=httpx.Response(200, json=_CHAT_OK)
+        )
+        with structlog.testing.capture_logs() as logs:
+            text = await client.chat_completion(
+                [{"role": "user", "content": "hi"}],
+                use_tools=False,
+            )
+    assert text == "ok"
+    assert len(polza.calls) == 1
+    assert len(proxy.calls) == 1
+    assert _fallback_count("polza", "proxyapi", "http_5xx") == before + 1
+    event = next(item for item in logs if item["event"] == "provider_fallback")
+    assert (event["from"], event["to"], event["reason"]) == (
+        "polza",
+        "proxyapi",
+        "http_5xx",
+    )
+
+
+@pytest.mark.asyncio
+async def test_text_client_error_does_not_fall_back(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"text": "polza", "image": "polza"},
+        text_fallback="proxyapi",
+    )
+    with respx.mock(assert_all_called=False) as router:
+        polza = router.post(_POLZA_CHAT).mock(
+            return_value=httpx.Response(400, json={"error": {"code": "BAD_REQUEST"}})
+        )
+        proxy = router.post(_PROXY_CHAT).mock(
+            return_value=httpx.Response(200, json=_CHAT_OK)
+        )
+        with pytest.raises(AssistAIError) as info:
+            await client.chat_completion(
+                [{"role": "user", "content": "hi"}],
+                use_tools=False,
+            )
+    assert len(polza.calls) == 1
+    assert not proxy.called
+    assert info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_text_no_fallback_configured_raises(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"text": "polza", "image": "polza"},
+        text_fallback="",
+    )
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_POLZA_CHAT).mock(return_value=httpx.Response(503))
+        proxy = router.post(_PROXY_CHAT).mock(
+            return_value=httpx.Response(200, json=_CHAT_OK)
+        )
+        with pytest.raises(AssistAIError):
+            await client.chat_completion(
+                [{"role": "user", "content": "hi"}],
+                use_tools=False,
+            )
+    assert not proxy.called
 
 
 @pytest.mark.asyncio
@@ -490,6 +618,12 @@ def test_fallback_reason_classification() -> None:
     assert fallback_reason(AssistAIError("x", status_code=413)) is None
     assert fallback_reason(AssistAIError("x", error_code="guard_blocked")) is None
     assert fallback_reason(AssistAIError("plain")) is None
+    assert (
+        fallback_reason(
+            AssistAIError("x", error_code="POLL_TIMEOUT", job_committed=True)
+        )
+        is None
+    )
     assert is_rate_limited(AssistAIError("x", status_code=429))
     assert not is_rate_limited(AssistAIError("x", status_code=503))
 

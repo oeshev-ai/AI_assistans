@@ -6,12 +6,11 @@ import asyncio
 import json
 import math
 import os
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -115,6 +114,105 @@ IMAGE_USD = env_float("COST_IMAGE_USD", 0.04)
 IMAGE_FLUX_USD = env_float("COST_IMAGE_FLUX_USD", 0.005)
 # Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
 RUB_PER_USD = env_float("RUB_PER_USD", 304.0)
+
+
+def extract_cost_rub(usage: dict[str, Any] | None) -> float | None:
+    """``usage.cost_rub`` или алиас ``usage.cost``.
+
+    Пропускает bool и нечисловые значения. NaN, Inf и отрицательные
+    отсекаются: если ``cost_rub`` числовой, но непригоден, алиас ``cost``
+    его не подменяет.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for key in ("cost_rub", "cost"):
+        if key not in usage:
+            continue
+        value = usage[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            return None
+        return number
+    return None
+
+
+def chat_cost_usd(
+    *,
+    usage: dict[str, Any] | None,
+    provider: ProviderConfig | None,
+    rub_per_usd: float,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    input_chars: int = 0,
+    output_chars: int = 0,
+) -> tuple[float, str, float | None]:
+    """Стоимость chat в условных USD: ``(amount_usd, source, cost_rub|None)``.
+
+    Порядок: 1) ``cost_rub`` / ``cost``; 2) токены × ставки × ``cost_multiplier``;
+    3) эвристика chars/4 × multiplier. Для ProxyAPI multiplier = 1.
+    """
+    rub = extract_cost_rub(usage)
+    if rub is not None:
+        rate = rub_per_usd if rub_per_usd > 0 else RUB_PER_USD
+        return rub / rate, "cost_rub", rub
+    multiplier = provider.cost_multiplier if provider is not None else 1.0
+    if multiplier < 0:
+        multiplier = 0.0
+    if prompt_tokens is not None or completion_tokens is not None:
+        amount = CostTracker.estimate_chat_cost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            input_chars=0 if prompt_tokens is not None else input_chars,
+            output_chars=0 if completion_tokens is not None else output_chars,
+        )
+        return amount * multiplier, "usage", None
+    amount = CostTracker.estimate_chat_cost(
+        input_chars=input_chars,
+        output_chars=output_chars,
+    )
+    return amount * multiplier, "flat", None
+
+
+def _priced_rub(
+    cost_rub: float | None,
+    usage: dict[str, Any] | None,
+) -> float | None:
+    """Явный ``cost_rub`` или разбор ``usage``. Битый явный аргумент не читает usage."""
+    if cost_rub is not None:
+        if (
+            isinstance(cost_rub, bool)
+            or not isinstance(cost_rub, (int, float))
+            or not math.isfinite(float(cost_rub))
+            or cost_rub < 0
+        ):
+            return None
+        return float(cost_rub)
+    return extract_cost_rub(usage)
+
+
+def prefer_cost_rub(
+    facts: list[tuple[float | None, str | None, float | None]],
+    estimated: float,
+) -> tuple[float, str | None, float | None]:
+    """Сумма факта ``cost_rub``, если он есть у каждого вызова; иначе оценка.
+
+    ``facts`` — ``(amount_usd, source, cost_rub)`` по ответам API.
+    Пустой список тоже остаётся на оценке (резерв ``check_budget``).
+    """
+    if not facts:
+        return estimated, None, None
+    amounts: list[float] = []
+    rubs: list[float] = []
+    for amount, source, rub in facts:
+        if source != "cost_rub" or amount is None:
+            return estimated, None, None
+        amounts.append(amount)
+        if rub is not None:
+            rubs.append(rub)
+    total_rub = sum(rubs) if len(rubs) == len(facts) else None
+    return sum(amounts), "cost_rub", total_rub
 
 
 def _parse_flat_map(raw: str | None) -> dict[str, float]:
@@ -313,8 +411,8 @@ class CostTracker:
     def _day_key() -> str:
         return datetime.now(UTC).strftime("%Y%m%d")
 
+    @staticmethod
     def estimate_chat_cost(
-        self,
         *,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
@@ -353,13 +451,9 @@ class CostTracker:
         copies = max(1, count)
         rate = rub_per_usd if rub_per_usd and rub_per_usd > 0 else RUB_PER_USD
         multiplier = provider.cost_multiplier if provider is not None else 1.0
-        rub = cost_rub
-        if rub is None and isinstance(usage, dict):
-            raw_rub = usage.get("cost_rub")
-            if isinstance(raw_rub, (int, float)) and not isinstance(raw_rub, bool):
-                rub = float(raw_rub)
-        if rub is not None and rub >= 0:
-            return ImageCostEstimate(rub / rate, "cost_rub", rub)
+        priced = _priced_rub(cost_rub, usage)
+        if priced is not None:
+            return ImageCostEstimate(priced / rate, "cost_rub", priced)
         if model and not _openai_image_model(model):
             return ImageCostEstimate(
                 flat_image_usd(model) * copies * multiplier, "flat"
@@ -471,19 +565,23 @@ class CostTracker:
         reserved = _reserved_usd.get()
         if reserved <= 0:
             return 0.0
-        _reserved_usd.set(0.0)
         day = self._day_key()
+        day_key = f"cost:day:{day}"
+        user_key = f"cost:user:{user_id}:day:{day}" if user_id is not None else ""
         ttl = 3 * 86400
+        day_delta, user_delta, has_user = self._release_deltas(
+            reserved, user_id=user_id
+        )
+        await self._settle(
+            day_key=day_key,
+            user_key=user_key if has_user else "",
+            day_delta=day_delta,
+            user_delta=user_delta,
+            ttl_seconds=ttl,
+        )
+        _reserved_usd.set(0.0)
         if self.daily_budget > 0:
-            await self._incr(f"cost:day:{day}", -reserved, ttl_seconds=ttl)
-        if user_id is not None and self.user_daily_budget > 0:
-            await self._incr(
-                f"cost:user:{user_id}:day:{day}",
-                -reserved,
-                ttl_seconds=ttl,
-            )
-        if self.daily_budget > 0:
-            spent = await self._get(f"cost:day:{day}")
+            spent = await self._get(day_key)
             LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
         logger.info(
             "llm_reservation_released",
@@ -491,6 +589,37 @@ class CostTracker:
             user_id=user_id,
         )
         return reserved
+
+    def _release_deltas(
+        self, reserved: float, *, user_id: int | None
+    ) -> tuple[float, float, bool]:
+        """Redis deltas that drop a hold without charging spend."""
+        day_delta = -reserved if self.daily_budget > 0 else 0.0
+        has_user = user_id is not None and self.user_daily_budget > 0
+        user_delta = -reserved if has_user else 0.0
+        return day_delta, user_delta, has_user
+
+    def _spend_deltas(
+        self, amount_usd: float, *, take: float, user_id: int | None
+    ) -> tuple[float, float, bool]:
+        """Redis deltas that charge ``amount`` while burning ``take`` of the hold.
+
+        Budget keys that held the reservation get ``amount - take``; other
+        tracked keys always get the full ``amount``.
+        """
+        if self.daily_budget > 0:
+            day_delta = amount_usd - take
+        else:
+            day_delta = amount_usd
+        # User spend is always tracked when user_id is set (metrics / per-user keys).
+        has_user = user_id is not None
+        if user_id is not None and self.user_daily_budget > 0:
+            user_delta = amount_usd - take
+        elif user_id is not None:
+            user_delta = amount_usd
+        else:
+            user_delta = 0.0
+        return day_delta, user_delta, has_user
 
     async def record(
         self,
@@ -505,35 +634,50 @@ class CostTracker:
     ) -> None:
         """Persist spend and update Prometheus counters.
 
-        Clears any ``check_budget`` reservation first, then charges the actual
-        amount so counters stay accurate under concurrent turns.
+        Settles against the current ``check_budget`` hold in one Redis
+        transaction: burns ``min(reserved, amount)`` from the hold and applies
+        only the residual delta. Remaining hold stays for later rounds of the
+        same turn (tool loops) until ``release_reservation``.
         """
         if amount_usd < 0:
             return
         if user_id is None:
             user_id = get_billing_user()
         day = self._day_key()
+        day_key = f"cost:day:{day}"
+        user_key = f"cost:user:{user_id}:day:{day}" if user_id is not None else ""
         ttl = 3 * 86400
         reserved = _reserved_usd.get()
-        if reserved > 0:
-            _reserved_usd.set(0.0)
-            if self.daily_budget > 0:
-                await self._incr(f"cost:day:{day}", -reserved, ttl_seconds=ttl)
-            if user_id is not None and self.user_daily_budget > 0:
-                await self._incr(
-                    f"cost:user:{user_id}:day:{day}",
-                    -reserved,
+        if amount_usd <= 0:
+            if reserved > 0:
+                day_delta, user_delta, has_user = self._release_deltas(
+                    reserved, user_id=user_id
+                )
+                await self._settle(
+                    day_key=day_key,
+                    user_key=user_key if has_user else "",
+                    day_delta=day_delta,
+                    user_delta=user_delta,
                     ttl_seconds=ttl,
                 )
-        if amount_usd <= 0:
+                _reserved_usd.set(0.0)
+                if self.daily_budget > 0:
+                    spent = await self._get(day_key)
+                    LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
             return
-        await self._incr(f"cost:day:{day}", amount_usd, ttl_seconds=ttl)
-        if user_id is not None:
-            await self._incr(
-                f"cost:user:{user_id}:day:{day}",
-                amount_usd,
-                ttl_seconds=ttl,
-            )
+
+        take = min(reserved, amount_usd)
+        day_delta, user_delta, has_user = self._spend_deltas(
+            amount_usd, take=take, user_id=user_id
+        )
+        await self._settle(
+            day_key=day_key,
+            user_key=user_key if has_user else "",
+            day_delta=day_delta,
+            user_delta=user_delta,
+            ttl_seconds=ttl,
+        )
+        _reserved_usd.set(reserved - take)
         LLM_SPEND_USD.labels(kind=kind).inc(amount_usd)
         LLM_COST_USD.labels(
             kind=kind,
@@ -542,19 +686,81 @@ class CostTracker:
             source=source or "flat",
         ).inc(amount_usd)
         if self.daily_budget > 0:
-            spent = await self._get(f"cost:day:{day}")
+            spent = await self._get(day_key)
             LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
         logger.info(
             "llm_spend_recorded",
             kind=kind,
             amount_usd=round(amount_usd, 6),
             user_id=user_id,
-            reserved_cleared=round(reserved, 6),
+            reserved_cleared=round(take, 6),
+            reserved_remaining=round(reserved - take, 6),
             provider=provider,
             model=model,
             source=source,
             cost_rub=cost_rub,
         )
+
+    async def _settle(
+        self,
+        *,
+        day_key: str,
+        user_key: str,
+        day_delta: float,
+        user_delta: float,
+        ttl_seconds: int,
+    ) -> None:
+        """Apply day/user spend deltas in one MULTI/EXEC (or under the memory lock)."""
+        if self._redis is not None:
+            try:
+                pipe = self._redis.pipeline(transaction=True)
+                if day_delta != 0:
+                    pipe.incrbyfloat(day_key, day_delta)
+                    pipe.expire(day_key, ttl_seconds)
+                if user_key and user_delta != 0:
+                    pipe.incrbyfloat(user_key, user_delta)
+                    pipe.expire(user_key, ttl_seconds)
+                if day_delta != 0 or (user_key and user_delta != 0):
+                    await pipe.execute()
+                return
+            except Exception as exc:
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "cost_tracker_redis_settle_failed",
+                        error=str(exc),
+                        fallback="deny",
+                    )
+                    raise
+                logger.warning(
+                    "cost_tracker_redis_settle_failed",
+                    error=str(exc),
+                    fallback="memory",
+                )
+        async with self._lock:
+            if day_delta != 0:
+                self._memory[day_key] = (
+                    float(self._memory.get(day_key, 0.0)) + day_delta
+                )
+            if user_key and user_delta != 0:
+                self._memory[user_key] = (
+                    float(self._memory.get(user_key, 0.0)) + user_delta
+                )
+            self._prune_memory(ttl_seconds)
+
+    def _prune_memory(self, ttl_seconds: int) -> None:
+        """Drop in-memory cost keys whose day stamp is older than ``ttl_seconds``."""
+        cutoff_day = (datetime.now(UTC) - timedelta(seconds=ttl_seconds)).strftime(
+            "%Y%m%d"
+        )
+        stale = [
+            key
+            for key in self._memory
+            if key.startswith("cost:") and key.rsplit(":", 1)[-1] < cutoff_day
+        ]
+        for key in stale:
+            self._memory.pop(key, None)
 
     async def _reserve(
         self,
@@ -660,9 +866,7 @@ class CostTracker:
                 )
         async with self._lock:
             self._memory[key] = self._memory.get(key, 0.0) + amount
-        # Soft expiry for memory mode: drop keys older than ~3 days by day stamp.
-        cutoff = time.time() - ttl_seconds
-        _ = cutoff
+            self._prune_memory(ttl_seconds)
 
 
 cost_tracker = CostTracker()

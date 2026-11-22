@@ -41,8 +41,13 @@ async def test_parallel_isolated_reservations_keep_parent_hold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unisolated_parallel_record_undercounts_parent() -> None:
-    """Documents the race fixed by isolated_budget_reservation."""
+async def test_unisolated_parallel_record_corrupts_parent_hold() -> None:
+    """Without isolation children inherit the parent hold ContextVar copy.
+
+    Partial-burn settle no longer wipes the parent Redis hold twice, but the
+    parent context still cannot see child burns — ``isolated_budget_reservation``
+    remains required for correct per-task accounting.
+    """
     tracker = CostTracker()
     tracker.daily_budget = 10.0
     tracker.user_daily_budget = 0
@@ -57,8 +62,9 @@ async def test_unisolated_parallel_record_undercounts_parent() -> None:
 
         await asyncio.gather(child_spend(), child_spend())
         day = tracker._day_key()
-        # Without isolation Redis/memory is undercounted (parent hold released twice).
-        assert await tracker._get(f"cost:day:{day}") < 2.0
+        # Parent context still believes the full 1.0 hold is live.
+        assert ct._reserved_usd.get() == pytest.approx(1.0)
+        assert await tracker._get(f"cost:day:{day}") == pytest.approx(2.0)
     finally:
         ct._reserved_usd.reset(token)
         await tracker.release_reservation(1)

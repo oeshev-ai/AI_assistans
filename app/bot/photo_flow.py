@@ -115,6 +115,9 @@ async def confirm_reply(
             model=text_model,
             use_tools=False,
             max_tokens=300,
+            # Gemini не даёт выключить рассуждение (HTTP 400), а оно съедает
+            # общий max_tokens и обрывает текст. Ограничиваем только его.
+            reasoning={"max_tokens": 64},
         )
     except Exception:
         logger.info("confirm_turn", ok=False, mode="A")
@@ -139,23 +142,26 @@ async def consume_pending_text(
     except Exception:
         return False
     user_id = message.from_user.id if message.from_user else message.chat.id
-    media = await pending.get(message.chat.id, profile.id, user_id)
+    # Claim immediately so concurrent texts cannot both start paid work.
+    media = await pending.pop(message.chat.id, profile.id, user_id)
     if media is None or not media.items:
         return False
     if text.casefold() in _CANCEL:
-        await pending.pop(message.chat.id, profile.id, user_id)
         await message.answer("Отменено.")
         await R._reset_flow(state)
         return True
     media.caption = text
-    await pending.put(media)
     turn = _turn(message, assistant, topic_storage, assistant_storage, state, pending)
-    await route_album(turn, media, charge_text_limit=False)
+    await route_album(turn, media, charge_text_limit=False, pending_claimed=True)
     return True
 
 
 async def route_album(
-    turn: Any, media: PendingMedia, *, charge_text_limit: bool = True
+    turn: Any,
+    media: PendingMedia,
+    *,
+    charge_text_limit: bool = True,
+    pending_claimed: bool = False,
 ) -> None:
     """Скачивает фото, спрашивает роутер и исполняет ветку."""
     message = turn.message
@@ -183,6 +189,8 @@ async def route_album(
     media.topic_id = topic_id
     loaded = await _download(turn, media)
     if loaded is None:
+        if pending_claimed:
+            await turn.pending.put(media)
         return
     images = [{"data": item.data, "mime": item.mime_type} for item in loaded]
     try:
@@ -191,14 +199,26 @@ async def route_album(
         )
         decision = await _decision(turn, media, images, topic_id)
     except BudgetExceededError as exc:
+        if pending_claimed:
+            await turn.pending.put(media)
         await message.answer(exc.message)
         return
     except AssistAIError as exc:
+        if pending_claimed:
+            await turn.pending.put(media)
         await message.answer(exc.message)
         return
     finally:
         await cost_tracker.release_reservation(user_id)
-    await _execute(turn, media, profile, loaded, decision, topic_id)
+    await _execute(
+        turn,
+        media,
+        profile,
+        loaded,
+        decision,
+        topic_id,
+        pending_claimed=pending_claimed,
+    )
 
 
 async def _decision(
@@ -208,6 +228,14 @@ async def _decision(
     topic_id: str,
 ) -> PhotoDecision:
     caption = media.caption.strip()
+    if not caption:
+        # Прошлая правка лежит в истории темы как реплика пользователя.
+        # Без новой подписи роутер принимает её за команду к этому фото.
+        return PhotoDecision(
+            intent="unclear",
+            question_ru="Опишите, что сделать с фото одним сообщением.",
+            confidence=0.0,
+        )
     if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1":
         from app.bot.photo_routing import resolve_roles
 
@@ -236,13 +264,28 @@ async def _execute(
     loaded: list[UserMedia],
     decision: PhotoDecision,
     topic_id: str,
+    *,
+    pending_claimed: bool = False,
 ) -> None:
     message = turn.message
     if decision.intent == "unclear":
+        if pending_claimed:
+            await turn.pending.put(media)
         await _unclear(turn, media, decision)
         return
+    if not pending_claimed:
+        claimed = await turn.pending.pop(
+            media.chat_id, media.assistant_id, media.user_id
+        )
+        if claimed is None:
+            logger.info(
+                "pending_photo_already_claimed",
+                chat_id=media.chat_id,
+                user_id=media.user_id,
+                intent=decision.intent,
+            )
+            return
     if decision.intent == "chat":
-        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         text = media.caption.strip() or (decision.instruction_ru or "")
         if text:
             await R._process_user_message(
@@ -257,7 +300,6 @@ async def _execute(
         return
     if decision.intent in {"analyze", "ocr", "compare"}:
         await _analyze(turn, media, loaded, decision)
-        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await R._reset_flow(turn.state)
         return
     if decision.intent == "generate":
@@ -276,7 +318,9 @@ async def _unclear(turn: Any, media: PendingMedia, decision: PhotoDecision) -> N
         "Опишите, что сделать с фото одним сообщением."
     )
     await turn.message.answer(question)
-    await turn.pending.bump_round(media.chat_id, media.assistant_id, media.user_id, question)
+    await turn.pending.bump_round(
+        media.chat_id, media.assistant_id, media.user_id, question
+    )
 
 
 async def _analyze(
@@ -375,8 +419,12 @@ async def _edit(
                     )
                 await message.answer(exc.message)
                 return
-        for index, image in enumerate(result):
-            await R._send_generated_image(message, image, index)
+        try:
+            for index, image in enumerate(result):
+                await R._send_generated_image(message, image, index)
+        except AssistAIError as exc:
+            await message.answer(exc.message)
+            return
         logger.info("edit_image_done", count=len(result), base_index=base)
         fallback = f"Готово. Основа — фото {base + 1}."
         shown_refs = ", ".join(str(index + 1) for index in refs) or "нет"
@@ -458,11 +506,9 @@ async def _generate(
         if files:
             model = _generate_with_refs_model(generate_model, edit_model)
             edit_size = _edit_size_for_model(size, generate_model, model)
-            complexity = turn.assistant.config.image_complexity_generate
         else:
             model = generate_model
             edit_size = None
-            complexity = None
         with ImageModelScope(model, size), MediaTurnScope():
             # Budget preflight — в generate_image / edit_images.
             if files:
@@ -473,7 +519,6 @@ async def _generate(
                     model=model,
                     labels=labels,
                     size=edit_size,
-                    complexity=complexity,
                 )
             else:
                 result = await job_queue.generate_image(
@@ -482,8 +527,12 @@ async def _generate(
                     model=generate_model,
                     size=size,
                 )
-        for index, image in enumerate(result):
-            await R._send_generated_image(message, image, index)
+        try:
+            for index, image in enumerate(result):
+                await R._send_generated_image(message, image, index)
+        except AssistAIError as exc:
+            await message.answer(exc.message)
+            return
         fallback = "Готово. Это новое изображение по вашему фото."
         user_prompt = (
             f"Пользователь прислал {len(media.items)} фото и попросил: "

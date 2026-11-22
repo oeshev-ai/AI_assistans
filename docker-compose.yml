@@ -29,7 +29,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi',
+          'if [ -n "$$REDIS_PASSWORD" ]; then REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping; else redis-cli ping; fi',
         ]
       interval: 10s
       timeout: 5s

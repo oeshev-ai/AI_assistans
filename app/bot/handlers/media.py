@@ -50,11 +50,7 @@ async def on_upload_cancel(
         return
     user_id = query.from_user.id if query.from_user else chat_id
     session = await store.get(upload_id)
-    if (
-        session is None
-        or session.chat_id != chat_id
-        or session.user_id != user_id
-    ):
+    if session is None or session.chat_id != chat_id or session.user_id != user_id:
         if isinstance(query.message, Message):
             try:
                 await query.message.edit_reply_markup(reply_markup=None)

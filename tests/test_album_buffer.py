@@ -116,8 +116,10 @@ async def test_redis_merges_photos_from_peer_hub(fakeredis_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_take_error_falls_back_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Redis take failure must not drop the local album buffer."""
+async def test_redis_take_error_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With Redis attached, claim errors must not flush local (avoids multi-replica dupes)."""
     hub = AlbumHub(debounce=5)
     hub.attach_redis(object())  # non-None marks Redis mode
     ready: list[list[int]] = []
@@ -136,8 +138,34 @@ async def test_redis_take_error_falls_back_to_local(monkeypatch: pytest.MonkeyPa
 
     await hub.add(1, 10, "g", _photo(3, "подпись"), "svc", on_ready)
     flushed = await hub.flush_text(1, 10, "из локального", on_ready)
+    assert flushed is False
+    assert ready == []
+
+
+@pytest.mark.asyncio
+async def test_append_failure_merges_local_on_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub = AlbumHub(debounce=5)
+    hub.attach_redis(object())
+    ready: list[list[int]] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append([item.message_id for item in built.photos])
+
+    async def take_empty(_key):  # type: ignore[no-untyped-def]
+        return True, []
+
+    async def append_fail(key, _photo) -> None:  # type: ignore[no-untyped-def]
+        hub._append_failed.add(key)
+
+    monkeypatch.setattr(hub, "_redis_take", take_empty)
+    monkeypatch.setattr(hub, "_redis_append", append_fail)
+
+    await hub.add(1, 10, "g", _photo(4, "подпись"), "svc", on_ready)
+    flushed = await hub.flush_text(1, 10, "merge", on_ready)
     assert flushed is True
-    assert ready == [[3]]
+    assert ready == [[4]]
 
 
 @pytest.fixture

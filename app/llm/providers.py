@@ -100,7 +100,7 @@ _DEFAULT_POLZA_BASE = "https://polza.ai/api"
 _DEFAULT_POLZA_CHAT_BASE = "https://polza.ai/api/v1"
 PROXYAPI_CAPABILITIES = frozenset({"chat", "images", "images_edit", "audio", "video"})
 _PROXYAPI_CAPABILITIES = PROXYAPI_CAPABILITIES
-_POLZA_CAPABILITIES = frozenset({"chat", "images", "images_edit"})
+_POLZA_CAPABILITIES = frozenset({"chat", "images", "images_edit", "audio", "video"})
 
 
 def _env(name: str, default: str = "") -> str:
@@ -171,17 +171,29 @@ def load_providers(
 
 
 def load_routes() -> dict[str, str]:
-    """Маршруты операций → id провайдера. Пустые env → proxyapi."""
+    """Маршруты операций → id провайдера. Пустые env → polza."""
     return {
-        "text": _env("TEXT_PROVIDER", "proxyapi") or "proxyapi",
-        "image": _env("IMAGE_PROVIDER", "proxyapi") or "proxyapi",
-        "audio": _env("AUDIO_PROVIDER", "proxyapi") or "proxyapi",
-        "video": _env("VIDEO_PROVIDER", "proxyapi") or "proxyapi",
+        "text": _env("TEXT_PROVIDER", "polza") or "polza",
+        "image": _env("IMAGE_PROVIDER", "polza") or "polza",
+        "audio": _env("AUDIO_PROVIDER", "polza") or "polza",
+        "video": _env("VIDEO_PROVIDER", "polza") or "polza",
     }
 
 
 def load_image_fallback() -> str:
     return _env("IMAGE_PROVIDER_FALLBACK", "proxyapi")
+
+
+def load_text_fallback() -> str:
+    return _env("TEXT_PROVIDER_FALLBACK", "proxyapi")
+
+
+def load_audio_fallback() -> str:
+    return _env("AUDIO_PROVIDER_FALLBACK", "proxyapi")
+
+
+def load_video_fallback() -> str:
+    return _env("VIDEO_PROVIDER_FALLBACK", "proxyapi")
 
 
 class ProviderRegistry:
@@ -193,10 +205,16 @@ class ProviderRegistry:
         routes: dict[str, str] | None = None,
         *,
         image_fallback: str = "",
+        text_fallback: str = "",
+        audio_fallback: str = "",
+        video_fallback: str = "",
     ) -> None:
         self.providers = dict(providers)
-        self.routes = dict(routes or {op: "proxyapi" for op in _ROUTE_OPS})
+        self.routes = dict(routes or {op: "polza" for op in _ROUTE_OPS})
         self.image_fallback = (image_fallback or "").strip()
+        self.text_fallback = (text_fallback or "").strip()
+        self.audio_fallback = (audio_fallback or "").strip()
+        self.video_fallback = (video_fallback or "").strip()
         self._validate()
 
     @classmethod
@@ -210,6 +228,9 @@ class ProviderRegistry:
             load_providers(proxyapi_key=proxyapi_key, polza_key=polza_key),
             load_routes(),
             image_fallback=load_image_fallback(),
+            text_fallback=load_text_fallback(),
+            audio_fallback=load_audio_fallback(),
+            video_fallback=load_video_fallback(),
         )
 
     def _validate(self) -> None:
@@ -220,16 +241,18 @@ class ProviderRegistry:
                     f"Неизвестный провайдер '{provider_id}' в маршруте "
                     f"'{op}'. Зарегистрированы: {known}"
                 )
-        if self.image_fallback and self.image_fallback not in self.providers:
-            # Пустой fallback допустим; непустой неизвестный — ошибка старта.
-            # Но если IMAGE_PROVIDER_FALLBACK=proxyapi при отсутствии ключа
-            # proxyapi — тоже ошибка. Приёмка G1: без новых env только proxyapi,
-            # fallback по умолчанию proxyapi совпадает с основным → ок.
-            known = ", ".join(sorted(self.providers)) or "(пусто)"
-            raise ValueError(
-                f"Неизвестный IMAGE_PROVIDER_FALLBACK "
-                f"'{self.image_fallback}'. Зарегистрированы: {known}"
-            )
+        for label, fallback_id in (
+            ("IMAGE_PROVIDER_FALLBACK", self.image_fallback),
+            ("TEXT_PROVIDER_FALLBACK", self.text_fallback),
+            ("AUDIO_PROVIDER_FALLBACK", self.audio_fallback),
+            ("VIDEO_PROVIDER_FALLBACK", self.video_fallback),
+        ):
+            if fallback_id and fallback_id not in self.providers:
+                # Пустой fallback допустим; непустой неизвестный — ошибка старта.
+                known = ", ".join(sorted(self.providers)) or "(пусто)"
+                raise ValueError(
+                    f"Неизвестный {label} '{fallback_id}'. Зарегистрированы: {known}"
+                )
 
     def get(self, provider_id: str) -> ProviderConfig:
         try:
@@ -240,13 +263,17 @@ class ProviderRegistry:
     def resolve_route(
         self, operation: str
     ) -> tuple[ProviderConfig, ProviderConfig | None]:
-        """Основной провайдер и опциональный fallback (только для image)."""
+        """Основной провайдер и опциональный fallback (image/text/audio/video)."""
         op = operation.strip().casefold()
         # aliases for call sites
         if op in {"images", "images_edit", "image_edit", "edit"}:
             op = "image"
         if op in {"chat", "text"}:
             op = "text"
+        if op in {"speech", "tts", "stt", "transcription", "transcriptions"}:
+            op = "audio"
+        if op in {"videos", "video_gen"}:
+            op = "video"
         if op not in self.routes:
             raise ValueError(f"Неизвестная операция маршрута: {operation}")
         primary_id = self.routes[op]
@@ -254,4 +281,14 @@ class ProviderRegistry:
         fallback: ProviderConfig | None = None
         if op == "image" and self.image_fallback and self.image_fallback != primary_id:
             fallback = self.get(self.image_fallback)
+        elif op == "text" and self.text_fallback and self.text_fallback != primary_id:
+            fallback = self.get(self.text_fallback)
+        elif (
+            op == "audio" and self.audio_fallback and self.audio_fallback != primary_id
+        ):
+            fallback = self.get(self.audio_fallback)
+        elif (
+            op == "video" and self.video_fallback and self.video_fallback != primary_id
+        ):
+            fallback = self.get(self.video_fallback)
         return primary, fallback

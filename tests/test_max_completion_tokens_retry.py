@@ -49,7 +49,9 @@ async def test_chat_completion_retries_with_max_completion_tokens(
     client = AssistAIClient(cfg)
     calls: list[dict[str, Any]] = []
 
-    async def fake_post(_path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def fake_post(
+        _path: str, payload: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
         calls.append(dict(payload))
         if "max_tokens" in payload:
             raise AssistAIError(

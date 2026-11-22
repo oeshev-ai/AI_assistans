@@ -19,7 +19,7 @@ async def test_generate_retries_once_without_rejected_params(
         side_effect=[
             httpx.Response(
                 400,
-                json={"error": {"message": "unknown parameter: complexity"}},
+                json={"error": {"message": "unknown parameter: quality"}},
             ),
             httpx.Response(200, json={"data": [{"url": "https://cdn.example/ok.png"}]}),
         ]
@@ -34,7 +34,7 @@ async def test_generate_retries_once_without_rejected_params(
     first = json.loads(route.calls[0].request.content)
     second = json.loads(route.calls[1].request.content)
     assert first["quality"] == "high"
-    assert "complexity" in first
+    assert "complexity" not in first
     assert "quality" not in second
     assert "complexity" not in second
 

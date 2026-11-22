@@ -76,7 +76,6 @@ from app.bot.constants import (
     httpx,
     image_model_family,
     io,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     is_upload_feature_ready,
     job_queue,
@@ -126,6 +125,7 @@ from app.bot.models import (  # noqa: F401
 from app.bot.states import (
     ImageSG,
 )
+from app.infra.cost_tracker import prefer_cost_rub
 
 
 async def _active_profile(chat_id: int, storage: AssistantStorage) -> AssistantProfile:
@@ -590,31 +590,36 @@ async def _download_image_url(url: str) -> bytes:
     from urllib.parse import urlparse
 
     last_error: Exception | None = None
+    candidates = _image_url_candidates(url)
     async with httpx.AsyncClient(
         timeout=_IMAGE_URL_TIMEOUT, follow_redirects=True
     ) as client:
-        for candidate in _image_url_candidates(url):
-            try:
-                response = await client.get(candidate)
-                response.raise_for_status()
-                raw = response.content
-            except httpx.HTTPError as exc:
-                last_error = exc
-                logger.warning(
-                    "image_cdn_download_failed",
-                    host=urlparse(candidate).netloc,
-                    error=type(exc).__name__,
-                )
-                continue
-            if raw:
-                if candidate != url:
-                    logger.info(
-                        "image_cdn_fallback_used",
-                        from_host=urlparse(url).netloc,
-                        to_host=urlparse(candidate).netloc,
+        # Оба хоста иногда дают один ReadTimeout на свежий объект.
+        # Второй проход забирает файл, который минутой раньше не открылся.
+        for attempt in (1, 2):
+            for candidate in candidates:
+                try:
+                    response = await client.get(candidate)
+                    response.raise_for_status()
+                    raw = response.content
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "image_cdn_download_failed",
+                        host=urlparse(candidate).netloc,
+                        error=type(exc).__name__,
+                        attempt=attempt,
                     )
-                return raw
-            last_error = AssistAIError("CDN провайдера вернул пустое изображение.")
+                    continue
+                if raw:
+                    if candidate != url:
+                        logger.info(
+                            "image_cdn_fallback_used",
+                            from_host=urlparse(url).netloc,
+                            to_host=urlparse(candidate).netloc,
+                        )
+                    return raw
+                last_error = AssistAIError("CDN провайдера вернул пустое изображение.")
     raise AssistAIError(
         "Не удалось скачать изображение с CDN провайдера."
     ) from last_error
@@ -689,6 +694,32 @@ async def _send_extracted_images(
             logger.exception("Не удалось отправить изображение из generate_image")
 
 
+async def _answer_photo_bytes(message: Message, raw: bytes, filename: str) -> None:
+    """Фото, а при ``IMAGE_PROCESS_FAILED`` — повтор и затем документ.
+
+    Telegram отдаёт ``IMAGE_PROCESS_FAILED`` и на валидный файл, который
+    через минуту принимает без изменений. ``sendDocument`` картинку не
+    обрабатывает, поэтому оплаченный результат всё равно доходит.
+    """
+    for attempt in (1, 2):
+        try:
+            await message.answer_photo(
+                photo=BufferedInputFile(raw, filename=filename),
+                request_timeout=120,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "IMAGE_PROCESS_FAILED" not in str(exc):
+                raise
+            logger.warning(
+                "telegram_image_process_failed", attempt=attempt, size=len(raw)
+            )
+    await message.answer_document(
+        document=BufferedInputFile(raw, filename=filename),
+        request_timeout=120,
+    )
+
+
 async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> None:
     """Отправляет файлы из media-tools (видео, аудио, транскрипт, правки)."""
     for item in items:
@@ -696,14 +727,9 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
             if item.kind == "image":
                 if item.url:
                     raw = await _download_image_url(item.url)
-                    await message.answer_photo(
-                        photo=BufferedInputFile(raw, filename=item.filename),
-                        request_timeout=120,
-                    )
+                    await _answer_photo_bytes(message, raw, item.filename)
                 elif item.data:
-                    await message.answer_photo(
-                        photo=BufferedInputFile(item.data, filename=item.filename)
-                    )
+                    await _answer_photo_bytes(message, item.data, item.filename)
             elif item.kind == "audio":
                 if not item.data:
                     continue
@@ -750,10 +776,7 @@ async def _send_generated_image(message: Message, image: str, index: int) -> Non
             ) from exc
     if not raw:
         raise AssistAIError("Провайдер вернул пустое изображение.")
-    await message.answer_photo(
-        photo=BufferedInputFile(raw, filename=filename),
-        request_timeout=120,
-    )
+    await _answer_photo_bytes(message, raw, filename)
 
 
 async def _send_voice_reply(
@@ -774,15 +797,11 @@ async def _send_voice_reply(
         fmt = "opus"
         requested_role = profile.tts_role or assistant.config.speechkit_role
         role = resolve_speechkit_role(voice, requested_role) or None
-    elif is_elevenlabs_tts_model(model):
-        # ProxyAPI ElevenLabs отдаёт MP3; opus/alloy-голоса OpenAI не принимаются.
-        fmt = "mp3"
     user_id = message.from_user.id if message.from_user else message.chat.id
     set_billing_user(user_id)
     try:
-        await cost_tracker.check_budget(
-            user_id, cost_tracker.estimate_tts_cost(tts_text)
-        )
+        estimated = cost_tracker.estimate_tts_cost(tts_text)
+        await cost_tracker.check_budget(user_id, estimated)
         speech = await job_queue.synthesize_speech(
             assistant,
             tts_text,
@@ -791,10 +810,24 @@ async def _send_voice_reply(
             response_format=fmt,
             role=role,
         )
+        amount, source, rub = prefer_cost_rub(
+            [
+                (
+                    getattr(speech, "cost_usd", None),
+                    getattr(speech, "cost_source", None),
+                    getattr(speech, "cost_rub", None),
+                )
+            ],
+            estimated,
+        )
         await cost_tracker.record(
             kind="tts",
-            amount_usd=cost_tracker.estimate_tts_cost(tts_text),
+            amount_usd=amount,
             user_id=user_id,
+            provider=getattr(speech, "provider_id", None),
+            model=getattr(speech, "model", None),
+            source=source,
+            cost_rub=rub,
         )
     except BudgetExceededError as exc:
         await message.answer(exc.message)
@@ -1181,13 +1214,17 @@ def _upload_process_semaphore() -> asyncio.Semaphore:
     if _upload_process_sem is None:
         from app.infra.envparse import env_int
 
-        _upload_process_sem = asyncio.Semaphore(max(1, env_int("UPLOAD_MAX_CONCURRENT", 2)))
+        _upload_process_sem = asyncio.Semaphore(
+            max(1, env_int("UPLOAD_MAX_CONCURRENT", 2))
+        )
     return _upload_process_sem
 
 
 def _estimate_upload_stt_cost(*, file_size: int | None, max_upload_mb: int) -> float:
     """Rough STT estimate from payload size (~4 KB/s), matching media_tools."""
-    size_hint = file_size if file_size and file_size > 0 else max_upload_mb * 1024 * 1024
+    size_hint = (
+        file_size if file_size and file_size > 0 else max_upload_mb * 1024 * 1024
+    )
     return cost_tracker.estimate_stt_cost(max(15.0, size_hint / 4000.0))
 
 
@@ -1280,21 +1317,36 @@ async def _process_s3_upload_session(
         )
         data = None  # free full object before paid STT round-trips
         parts: list[str] = []
+        facts: list[tuple[float | None, str | None, float | None]] = []
+        providers: list[str | None] = []
+        models: list[str | None] = []
         for audio_bytes, chunk_name in chunks:
-            text = await job_queue.transcribe_audio(
+            recognized = await job_queue.transcribe_audio(
                 assistant,
                 audio_bytes,
                 filename=chunk_name,
                 language=None,
                 billing_user_id=user_id,
             )
-            if text:
-                parts.append(text)
+            facts.append(
+                (recognized.cost_usd, recognized.cost_source, recognized.cost_rub)
+            )
+            providers.append(recognized.provider_id)
+            models.append(recognized.model)
+            if recognized.text:
+                parts.append(recognized.text)
         transcript = "\n\n".join(parts).strip()
+        amount, source, rub = prefer_cost_rub(facts, estimated)
+        provider = providers[0] if providers and len(set(providers)) == 1 else None
+        billed_model = models[0] if models and len(set(models)) == 1 else None
         await cost_tracker.record(
             kind="stt",
-            amount_usd=estimated,
+            amount_usd=amount,
             user_id=user_id,
+            provider=provider,
+            model=billed_model,
+            source=source,
+            cost_rub=rub,
         )
         reserved = False
         await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
@@ -1719,8 +1771,6 @@ async def _apply_model_choice(
                 )
             else:
                 fields["tts_role"] = None
-                if is_elevenlabs_tts_model(effective):
-                    fields["tts_format"] = "mp3"
             updated = profile.model_copy(update=fields)
         else:
             updated = profile.model_copy(update={"text_model": selected})
@@ -1843,6 +1893,9 @@ async def _delete_bot_message(message: Message) -> None:
     try:
         await message.delete()
     except TelegramBadRequest as exc:
+        if "message to delete not found" in str(exc):
+            logger.debug("Сообщение уже удалено: %s", exc)
+            return
         logger.warning("Не удалось удалить сообщение: %s", exc)
 
 

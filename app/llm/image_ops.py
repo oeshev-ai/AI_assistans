@@ -92,7 +92,7 @@ _FLUX_ASPECTS: tuple[tuple[int, int], ...] = (
 )
 _PIXEL_SIZE = re.compile(r"(\d+)\s*[xX×]\s*(\d+)")
 _ASPECT_RATIO = re.compile(r"^(\d+)\s*:\s*(\d+)$")
-ImageModelFamily = Literal["openai", "flux", "qwen", "seedream", "recraft"]
+ImageModelFamily = Literal["openai", "flux", "qwen", "seedream", "recraft", "banana"]
 
 
 class ImageModelScope:
@@ -292,6 +292,8 @@ def image_model_family(model: str) -> ImageModelFamily:
         return "seedream"
     if "recraft" in lowered:
         return "recraft"
+    if "nano-banana" in lowered or "gemini-nano-banana" in lowered:
+        return "banana"
     return "openai"
 
 
@@ -473,6 +475,31 @@ def _recraft_size_fields(cleaned: str) -> dict[str, Any]:
     return {"size": cleaned}
 
 
+def _banana_size_fields(cleaned: str) -> dict[str, Any]:
+    """Nano Banana: ``image_resolution`` (1K/2K/4K) и при необходимости aspect."""
+    known = _FLUX_TIER_NAMES.get(cleaned.upper())
+    if known is not None:
+        return {"image_resolution": known}
+    aspect = _normalize_aspect_ratio(cleaned)
+    if aspect is not None:
+        return {"aspect_ratio": aspect, "image_resolution": "1K"}
+    match = _PIXEL_SIZE.fullmatch(cleaned)
+    if match is not None:
+        width = int(match.group(1))
+        height = int(match.group(2))
+        long_side = max(width, height)
+        tier = min(
+            _FLUX_SIZE_TIERS,
+            key=lambda item: (abs(item[0] - long_side), item[0]),
+        )[1]
+        fields: dict[str, Any] = {"image_resolution": tier}
+        ratio = _snap_aspect_ratio(width, height)
+        if ratio != "1:1":
+            fields["aspect_ratio"] = ratio
+        return fields
+    return {"image_resolution": cleaned}
+
+
 _OPENAI_SIZE_ALIASES = {
     "1024x1792": "1024x1536",
     "1792x1024": "1536x1024",
@@ -534,10 +561,11 @@ def _image_generation_body(
     size: str,
     *,
     quality: str | None = None,
-    complexity: str | None = None,
-    send_complexity: bool = True,
 ) -> dict[str, Any]:
-    """Тело ``images/generations`` с учётом семейства модели."""
+    """Тело ``images/generations`` с учётом семейства модели.
+
+    ``complexity`` не отправляется: на ProxyAPI разницы low/high не было.
+    """
     fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
     cleaned = size.strip()
     family = image_model_family(model)
@@ -545,8 +573,6 @@ def _image_generation_body(
         fields["size"] = _OPENAI_SIZE_ALIASES.get(cleaned, cleaned)
         if quality:
             fields["quality"] = quality
-        if complexity and send_complexity:
-            fields["complexity"] = complexity
         return fields
     if family == "flux":
         fields.update(_flux_size_fields(cleaned))
@@ -556,6 +582,9 @@ def _image_generation_body(
         return fields
     if family == "seedream":
         fields.update(_seedream_size_fields(cleaned))
+        return fields
+    if family == "banana":
+        fields.update(_banana_size_fields(cleaned))
         return fields
     fields.update(_recraft_size_fields(cleaned))
     return fields
@@ -875,8 +904,6 @@ class ImageOpsMixin(ProviderTransportMixin):
                 sanitized_prompt,
                 size.strip(),
                 quality=self.config.image_quality,
-                complexity=self.config.image_complexity_generate,
-                send_complexity=self.config.send_complexity,
             )
             read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
             timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
@@ -968,8 +995,6 @@ class ImageOpsMixin(ProviderTransportMixin):
                 sanitized,
                 edit_size,
                 quality=self.config.image_quality,
-                complexity=self.config.image_complexity_edit,
-                send_complexity=self.config.send_complexity,
             )
             form = {key: str(value) for key, value in body.items() if key != "n"}
             files = {
@@ -1026,15 +1051,11 @@ class ImageOpsMixin(ProviderTransportMixin):
         model: str | None = None,
         labels: list[str] | None = None,
         size: str | None = None,
-        complexity: str | None = None,
     ) -> list[str]:
         """Правит несколько фото через multipart ``/images/edits`` или Polza media.
 
         Первый файл — основа. Поле формы — ``image[]``. Размер уходит в полях
         семейства модели, как у ``generate_image``.
-
-        ``complexity`` overrides ``config.image_complexity_edit`` when set (used
-        by photo generate-with-refs to keep generate-tier quality).
         """
         if not files:
             raise ValueError("files не может быть пустым.")
@@ -1047,7 +1068,6 @@ class ImageOpsMixin(ProviderTransportMixin):
 
         selected_model = model or self.config.default_image_edit_model
         edit_size = self._resolve_edit_size(size, files[0][0])
-        edit_complexity = complexity or self.config.image_complexity_edit
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -1084,7 +1104,6 @@ class ImageOpsMixin(ProviderTransportMixin):
                     files=len(prepared),
                     prompt_chars=len(sanitized),
                     provider=provider.id,
-                    complexity=edit_complexity,
                 )
                 if provider.kind == "polza_media":
                     return await self._polza_image(
@@ -1099,8 +1118,6 @@ class ImageOpsMixin(ProviderTransportMixin):
                     sanitized,
                     edit_size,
                     quality=self.config.image_quality,
-                    complexity=edit_complexity,
-                    send_complexity=self.config.send_complexity,
                 )
                 form = {
                     key: str(value) for key, value in body.items() if key not in {"n"}

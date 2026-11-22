@@ -13,7 +13,6 @@ from app.bot.constants import (
     AssistantProfile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     model_hint,
     persona_label,
@@ -133,8 +132,6 @@ def _model_picker_parts(
             else:
                 role_label = "не поддерживается"
             extra = f"Амплуа: {role_label}\nФормат: opus\n"
-        elif is_elevenlabs_tts_model(tts_model):
-            extra = "Формат: mp3\n"
         else:
             fmt = profile.tts_format or assistant.config.default_tts_format
             extra = f"Формат: {fmt}\n"

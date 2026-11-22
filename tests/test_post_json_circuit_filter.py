@@ -29,8 +29,9 @@ async def test_safe_api_call_skips_filtered_failures() -> None:
             await safe_api_call(
                 breaker,
                 bad_request,
-                failure_filter=lambda exc: isinstance(exc, AssistAIError)
-                and counts_toward_circuit(exc),
+                failure_filter=lambda exc: (
+                    isinstance(exc, AssistAIError) and counts_toward_circuit(exc)
+                ),
             )
     assert breaker.state == CircuitState.CLOSED
 
@@ -50,15 +51,17 @@ async def test_safe_api_call_counts_availability_failures() -> None:
         await safe_api_call(
             breaker,
             unavailable,
-            failure_filter=lambda exc: isinstance(exc, AssistAIError)
-            and counts_toward_circuit(exc),
+            failure_filter=lambda exc: (
+                isinstance(exc, AssistAIError) and counts_toward_circuit(exc)
+            ),
         )
     with pytest.raises(AssistAIError):
         await safe_api_call(
             breaker,
             unavailable,
-            failure_filter=lambda exc: isinstance(exc, AssistAIError)
-            and counts_toward_circuit(exc),
+            failure_filter=lambda exc: (
+                isinstance(exc, AssistAIError) and counts_toward_circuit(exc)
+            ),
         )
     assert breaker.state == CircuitState.OPEN
     with pytest.raises(APIUnavailableError):
@@ -66,6 +69,7 @@ async def test_safe_api_call_counts_availability_failures() -> None:
             breaker,
             unavailable,
             user_message="unavailable",
-            failure_filter=lambda exc: isinstance(exc, AssistAIError)
-            and counts_toward_circuit(exc),
+            failure_filter=lambda exc: (
+                isinstance(exc, AssistAIError) and counts_toward_circuit(exc)
+            ),
         )

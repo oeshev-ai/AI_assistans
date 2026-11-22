@@ -145,7 +145,7 @@ async def synthesize_speech_task(
     response_format: str | None,
     role: str | None = None,
     billing_user_id: int | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     assistant: AssistAIClient = ctx["assistant"]
     _bind_billing_user(billing_user_id)
     logger.info(
@@ -166,6 +166,11 @@ async def synthesize_speech_task(
         "audio_b64": base64.b64encode(speech.audio).decode("ascii"),
         "filename": speech.filename,
         "mime_type": speech.mime_type,
+        "cost_usd": speech.cost_usd,
+        "cost_rub": speech.cost_rub,
+        "cost_source": speech.cost_source,
+        "provider_id": speech.provider_id,
+        "model": speech.model,
     }
 
 
@@ -177,17 +182,17 @@ async def edit_image_task(
     labels: list[str] | None,
     size: str | None = None,
     billing_user_id: int | None = None,
-    complexity: str | None = None,
 ) -> list[str]:
-    """Достаёт файлы правки из Redis и вызывает ``edit_images``."""
+    """Достаёт файлы правки из Redis и вызывает ``edit_images``.
+
+    Payload удаляется только после успеха: при crash/restart worker arq может
+    перезапустить job, пока ключ жив (TTL 600s). Обычный AssistAIError не
+    ретраится сам по себе — caller не должен удалять ключ раньше TTL.
+    """
     assistant: AssistAIClient = ctx["assistant"]
     _bind_billing_user(billing_user_id)
     redis = ctx["redis"]
     raw = await redis.get(redis_key)
-    try:
-        await redis.delete(redis_key)
-    except Exception:
-        pass
     if not raw:
         raise ValueError("edit payload missing or expired in Redis")
     text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -212,17 +217,20 @@ async def edit_image_task(
         "job_edit_image",
         files=len(files),
         model=model,
-        complexity=complexity,
         billing_user_id=billing_user_id,
     )
-    return await assistant.edit_images(
+    result = await assistant.edit_images(
         files,
         prompt,
         model=model,
         labels=labels,
         size=size,
-        complexity=complexity,
     )
+    try:
+        await redis.delete(redis_key)
+    except Exception:
+        logger.warning("edit_payload_delete_failed", redis_key=redis_key)
+    return result
 
 
 async def transcribe_audio_task(
@@ -232,15 +240,12 @@ async def transcribe_audio_task(
     model: str | None,
     language: str | None,
     billing_user_id: int | None = None,
-) -> str:
+) -> dict[str, Any]:
+    """STT из Redis; ключ удаляется только после успеха (crash-retry / TTL)."""
     assistant: AssistAIClient = ctx["assistant"]
     _bind_billing_user(billing_user_id)
     redis = ctx["redis"]
     raw = await redis.get(redis_key)
-    try:
-        await redis.delete(redis_key)
-    except Exception:
-        pass
     if not raw:
         raise ValueError("STT payload missing or expired in Redis")
     audio_bytes = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
@@ -250,12 +255,24 @@ async def transcribe_audio_task(
         filename=filename,
         billing_user_id=billing_user_id,
     )
-    return await assistant.transcribe_audio(
+    recognized = await assistant.transcribe_audio(
         bytes(audio_bytes),
         filename=filename,
         model=model,
         language=language,
     )
+    try:
+        await redis.delete(redis_key)
+    except Exception:
+        logger.warning("stt_payload_delete_failed", redis_key=redis_key)
+    return {
+        "text": recognized.text,
+        "cost_usd": recognized.cost_usd,
+        "cost_rub": recognized.cost_rub,
+        "cost_source": recognized.cost_source,
+        "provider_id": recognized.provider_id,
+        "model": recognized.model,
+    }
 
 
 class WorkerSettings:

@@ -43,6 +43,8 @@ class AssistAIError(Exception):
 
     ``error_code`` — нормализованный код (``SERVICE_UNAVAILABLE``, ``TIMEOUT``,
     ``CIRCUIT_OPEN`` …), ``retry_after`` — пауза из заголовка ``Retry-After``.
+    ``job_committed`` — задача уже принята провайдером (poll/download); fallback
+    на другого провайдера запрещён, чтобы не платить дважды.
     """
 
     def __init__(
@@ -52,12 +54,14 @@ class AssistAIError(Exception):
         status_code: int | None = None,
         error_code: str | None = None,
         retry_after: float | None = None,
+        job_committed: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.error_code = error_code
         self.retry_after = retry_after
+        self.job_committed = job_committed
 
 
 def _normalized_code(exc: AssistAIError) -> str:
@@ -74,6 +78,8 @@ def fallback_reason(exc: AssistAIError) -> str | None:
 
     Неизвестные ошибки трактуются консервативно: без fallback.
     """
+    if exc.job_committed:
+        return None
     code = _normalized_code(exc)
     if code.startswith("GUARD_") or code in NO_FALLBACK_CODES:
         return None

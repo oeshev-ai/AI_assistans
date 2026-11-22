@@ -1,6 +1,6 @@
 # AI Assistants — мультимодальный Telegram-бот
 
-> Telegram-бот с персональными AI-ассистентами: стриминг диалога, картинки, голос, Vision и инструменты (погода, валюты, медиа) через ProxyAPI.
+> Telegram-бот с персональными AI-ассистентами: стриминг диалога, картинки, голос, Vision и инструменты (погода, валюты, медиа) через Polza.ai (ProxyAPI — fallback).
 
 ## Проблема
 
@@ -8,11 +8,11 @@
 
 ## Решение
 
-Собран production-ready бот на aiogram 3 и едином клиенте LLM (ProxyAPI): персоны с промптами и моделями, темы в Redis, function calling, Vision, STT/TTS, генерация и правка картинок. Тяжёлые задачи опционально уходят в arq-worker; большие файлы — по одноразовой HTTPS-ссылке в Object Storage. Наблюдаемость — JSON-логи, Prometheus, health, rate limits, circuit breaker, бюджеты LLM.
+Собран production-ready бот на aiogram 3 и едином клиенте LLM (Polza.ai primary, ProxyAPI fallback): персоны с промптами и моделями, темы в Redis, function calling, Vision, STT/TTS, генерация и правка картинок. Тяжёлые задачи опционально уходят в arq-worker; большие файлы — по одноразовой HTTPS-ссылке в Object Storage. Наблюдаемость — JSON-логи, Prometheus, health, rate limits, circuit breaker, бюджеты LLM.
 
 ## Что внутри
 
-- **Технологии:** Python 3.11, aiogram 3, Redis, ProxyAPI (LLM/Vision/STT/картинки), Yandex SpeechKit TTS, Yandex Object Storage, arq, Prometheus, Sentry, Docker Compose, GitHub Actions
+- **Технологии:** Python 3.11, aiogram 3, Redis, Polza.ai + ProxyAPI (LLM/Vision/STT/картинки/видео), Yandex SpeechKit TTS, Yandex Object Storage, arq, Prometheus, Sentry, Docker Compose, GitHub Actions
 - **Архитектура:** пакет `app/` — `bot` (`handlers/` и `screens/` по доменам) → `llm` / `media` → `storage` + `infra`; опционально очередь arq для image/TTS/STT
 - **Деплой:** VPS + Docker Compose + nginx (health/upload на localhost), CI: ruff / mypy / pytest
 
@@ -30,7 +30,7 @@
 
 ### Провайдеры: роутинг, fallback и стоимость
 
-По умолчанию всё идёт через ProxyAPI. Картинки (генерация и правки) можно отправлять на Polza.ai через `POST /v1/media`; ProxyAPI при этом остаётся страховкой. Текст, аудио и видео адресуются отдельными переменными, но остаются на ProxyAPI.
+По умолчанию всё идёт через Polza.ai (`POLZA_API_KEY` обязателен). ProxyAPI — one-shot fallback (`PROXYAPI_API_KEY` тоже обязателен). Вернуть трафик на ProxyAPI: `*_PROVIDER=proxyapi`.
 
 | провайдер | коэф. ₽ за $1 прайса OpenAI | правка 1536×1024 high | постер 1024×1536 high | генерация 1024² low |
 |---|---:|---:|---:|---:|
@@ -38,7 +38,18 @@
 | Polza.ai | ~118.6 | ~6.29 ₽ (расчёт по прайсу) | ~4.97 ₽ (пересчёт) | ~2.94 ₽ (пересчёт) |
 
 ```text
- TEXT/AUDIO/VIDEO_PROVIDER ──► proxyapi
+ TEXT_PROVIDER ──► polza (chat) ──ok──► ответ
+                   │ недоступен: таймаут, 5xx, breaker open, 429, balance…
+                   ▼
+         TEXT_PROVIDER_FALLBACK (proxyapi) — ровно один раз
+ AUDIO_PROVIDER ──► polza (/api/v1/audio/*) ──ok──► TTS/STT
+                   │ недоступен: таймаут, 5xx, breaker open, 429, balance…
+                   ▼
+         AUDIO_PROVIDER_FALLBACK (proxyapi) — ровно один раз
+ VIDEO_PROVIDER ──► polza (/v1/media, seedance-2) ──ok──► mp4
+                   │ недоступен: таймаут, 5xx, breaker open, 429, balance…
+                   ▼
+         VIDEO_PROVIDER_FALLBACK (proxyapi) — ровно один раз
  IMAGE_PROVIDER ──► polza (/v1/media) ──ok──► результат
                         │ недоступен: таймаут, 5xx, SERVICE_UNAVAILABLE,
                         │ BAD_GATEWAY, REQUEST_TIMEOUT, breaker open,
@@ -49,7 +60,7 @@
  400/401/403/404/413 и guard_* — без повторов и fallback
 ```
 
-- Учёт: на Polza факт берётся из `usage.cost_rub / RUB_PER_USD`; если рублей нет — токены × `POLZA_COST_MULTIPLIER`. Единица учёта — прежний «условный USD»: **1 USD ≈ 304 ₽ реального расхода на ProxyAPI**.
+- Учёт: на Polza факт берётся из `usage.cost_rub / RUB_PER_USD` для картинок, видео, chat, STT и TTS; если рублей нет — токены или оценка × `POLZA_COST_MULTIPLIER`. Единица учёта — прежний «условный USD»: **1 USD ≈ 304 ₽ реального расхода на ProxyAPI**.
 - Метрики: `provider_fallback_total{from,to,reason}`, `llm_cost_usd_total{kind,provider,model,source}`; `llm_spend_usd_total{kind}` не менялась.
 - **Потеря точных пикселей на Polza:** размер уходит как `aspect_ratio` (ближайшее из набора Polza) + `size` `WIDTHxHEIGHT`; для `gpt-image-2.6-flare` `image_resolution` не поддерживается (HTTP 400), итог проверен на 3:2 → 1536×1024, но для нестандартных пропорций сетка может отличаться. Вернуть прежнее поведение: `IMAGE_PROVIDER=proxyapi`.
 - **CDN Polza хранит результат 7 дней**; бот сразу отдаёт картинку в Telegram, но ссылки в логах и истории протухнут.
@@ -60,7 +71,10 @@
 ```bash
 git clone https://github.com/oeshev-ai/AI_assistans.git
 cd AI_assistans
-cp .env.example .env   # минимум: TELEGRAM_BOT_TOKEN, PROXYAPI_API_KEY
+cp .env.example .env   # минимум: TELEGRAM_BOT_TOKEN, POLZA_API_KEY, PROXYAPI_API_KEY
+# Compose ставит ENVIRONMENT=production → дополнительно в .env:
+#   TELEGRAM_ALLOWED_USER_IDS=<ваш id>
+#   LLM_USER_DAILY_BUDGET_USD=1.5   # или LLM_DAILY_BUDGET_USD
 docker compose up -d --build
 ```
 
@@ -69,7 +83,7 @@ docker compose up -d --build
 По умолчанию поднимаются `redis` + `bot`; image/TTS/STT выполняются **в процессе бота** (`ARQ_ENABLED=0`). Очередь arq — опционально:
 
 ```bash
-# в .env: ARQ_ENABLED=1
+# в .env: ARQ_ENABLED=1  (без Redis / при сбое пула — SystemExit, не inline)
 docker compose --profile arq up -d --build
 # worker: arq worker.WorkerSettings
 ```

@@ -231,7 +231,9 @@ def test_klein_snaps_resolution_and_omits_max_price() -> None:
 
 
 def test_qwen_alias_and_resolution_fields() -> None:
-    fields = polza_request_fields("qwen/qwen-image-2.1-pro", "1024x1024", quality="high")
+    fields = polza_request_fields(
+        "qwen/qwen-image-2.1-pro", "1024x1024", quality="high"
+    )
     assert fields["model"] == "qwen/image-2.1"
     assert fields["aspect_ratio"] == "1:1"
     assert fields["image_resolution"] == "1K"
@@ -243,6 +245,15 @@ def test_qwen_alias_and_resolution_fields() -> None:
 def test_recraft_unsupported_on_polza() -> None:
     fields = polza_request_fields("recraft/recraft-v4.1", "16:9", quality="high")
     assert fields["unsupported"] is True
+
+
+def test_nano_banana_resolution_fields() -> None:
+    fields = polza_request_fields("google/gemini-nano-banana-2.1", "1K", quality="high")
+    assert fields["unsupported"] is False
+    assert fields["model"] == "google/gemini-nano-banana-2.1"
+    assert fields["image_resolution"] == "1K"
+    assert fields["quality"] is None
+    assert fields["pin_upstream"] is False
 
 
 def test_parse_completed_fixtures(

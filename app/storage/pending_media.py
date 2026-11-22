@@ -236,7 +236,9 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
         self._closed = False
         self._lock = asyncio.Lock()
 
-    def _key(self, chat_id: int, user_id: int, assistant_id: str) -> tuple[int, int, str]:
+    def _key(
+        self, chat_id: int, user_id: int, assistant_id: str
+    ) -> tuple[int, int, str]:
         return chat_id, user_id, assistant_id
 
     async def put(self, media: PendingMedia) -> None:
@@ -340,9 +342,7 @@ class RedisPendingMediaStorage(PendingMediaStorage):
         self._closed = False
 
     def _redis_key(self, chat_id: int, user_id: int, assistant_id: str) -> str:
-        return _KEY.format(
-            chat_id=chat_id, user_id=user_id, assistant_id=assistant_id
-        )
+        return _KEY.format(chat_id=chat_id, user_id=user_id, assistant_id=assistant_id)
 
     async def ping(self) -> None:
         try:
@@ -434,9 +434,7 @@ class RedisPendingMediaStorage(PendingMediaStorage):
             except WatchError:
                 continue
             except RedisError as exc:
-                raise PendingMediaError(
-                    "Не удалось обновить отложенные фото."
-                ) from exc
+                raise PendingMediaError("Не удалось обновить отложенные фото.") from exc
         raise PendingMediaError("Не удалось обновить отложенные фото (конфликт).")
 
     async def close(self) -> None:

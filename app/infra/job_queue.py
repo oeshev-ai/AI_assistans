@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import uuid
 from typing import Any
@@ -16,7 +17,42 @@ from urllib.parse import urlparse
 
 import structlog
 
+from app.llm.media_api import SpeechResult, TranscriptionResult
+
 logger = structlog.get_logger("job_queue")
+
+
+def _optional_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _coerce_transcription(result: Any) -> TranscriptionResult:
+    """Приводит ответ STT к ``TranscriptionResult`` (строка — без цены)."""
+    if isinstance(result, TranscriptionResult):
+        return result
+    if isinstance(result, dict):
+        text = result.get("text")
+        return TranscriptionResult(
+            text=text if isinstance(text, str) else "",
+            cost_usd=_optional_float(result.get("cost_usd")),
+            cost_rub=_optional_float(result.get("cost_rub")),
+            cost_source=_optional_str(result.get("cost_source")),
+            provider_id=_optional_str(result.get("provider_id")),
+            model=_optional_str(result.get("model")),
+        )
+    return TranscriptionResult(text="" if result is None else str(result))
+
 
 _pool: Any | None = None
 _enabled = False
@@ -47,9 +83,9 @@ async def init_job_queue(redis_url: str) -> None:
         logger.info("arq_disabled")
         return
     if not redis_url:
-        logger.warning("arq_enabled_but_no_redis", fallback="inline")
-        _enabled = False
-        return
+        # ARQ_ENABLED=1 without Redis: fail closed (no silent inline OOM risk).
+        logger.error("arq_enabled_but_no_redis")
+        raise SystemExit(1)
     try:
         validate_arq_image_timeout()
     except ValueError as exc:
@@ -63,9 +99,10 @@ async def init_job_queue(redis_url: str) -> None:
     except SystemExit:
         raise
     except Exception as exc:
-        logger.error("arq_pool_failed", error=str(exc), fallback="inline")
+        logger.error("arq_pool_failed", error=str(exc))
         _pool = None
         _enabled = False
+        raise SystemExit(1) from exc
 
 
 async def close_job_queue() -> None:
@@ -115,8 +152,7 @@ def validate_arq_image_timeout() -> None:
             needed=needed,
         )
         raise ValueError(
-            f"ARQ_JOB_TIMEOUT ({arq_timeout}) must be >= POLZA_TOTAL_WAIT+30 "
-            f"({needed})"
+            f"ARQ_JOB_TIMEOUT ({arq_timeout}) must be >= POLZA_TOTAL_WAIT+30 ({needed})"
         )
 
 
@@ -131,13 +167,31 @@ def image_result_timeout(explicit: float | None = None) -> float:
     return _polza_image_wait_needed()
 
 
+def _payload_ttl_seconds() -> int:
+    """Redis TTL for staged ARQ payloads (edit/STT bytes).
+
+    Must outlive queue delay + worker ``ARQ_JOB_TIMEOUT`` so backlog does not
+    expire the body before the job starts.
+    """
+    from app.infra.envparse import env_float
+
+    job_timeout = max(0.0, env_float("ARQ_JOB_TIMEOUT", 300.0))
+    polza_wait = max(0.0, env_float("POLZA_TOTAL_WAIT", 240.0))
+    return int(max(600.0, job_timeout + 120.0, polza_wait + 120.0))
+
+
 def _arq_enqueue_failed(task: str) -> Exception:
     """Очередь включена, но job не принят — не уходим в inline (риск OOM бота)."""
     from app.llm.errors import AssistAIError
 
     logger.error("arq_enqueue_failed_closed", task=task)
+    kind = (
+        "аудио"
+        if "speech" in task or "transcribe" in task or "stt" in task
+        else "изображений"
+    )
     return AssistAIError(
-        "Очередь обработки изображений недоступна. Попробуйте позже.",
+        f"Очередь обработки {kind} недоступна. Попробуйте позже.",
         error_code="SERVICE_UNAVAILABLE",
     )
 
@@ -183,7 +237,6 @@ async def edit_images(
     model: str | None = None,
     labels: list[str] | None = None,
     size: str | None = None,
-    complexity: str | None = None,
     timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> list[str]:
@@ -201,7 +254,7 @@ async def edit_images(
             for data, name, mime in files
         ]
         try:
-            await _pool.set(key, json.dumps(payload), ex=600)
+            await _pool.set(key, json.dumps(payload), ex=_payload_ttl_seconds())
             job = await _pool.enqueue_job(
                 "edit_image_task",
                 key,
@@ -210,7 +263,6 @@ async def edit_images(
                 labels,
                 size,
                 user_id,
-                complexity,
             )
         except Exception as exc:
             logger.warning("arq_edit_enqueue_failed", error=str(exc))
@@ -230,12 +282,9 @@ async def edit_images(
             result = await job.result(timeout=wait)
             return list(result)
         except Exception as exc:
-            # Job was accepted; do not re-run inline (non-idempotent / paid).
+            # Job accepted — do not re-run inline. Leave Redis payload for
+            # worker crash-retry until TTL (worker deletes on success).
             logger.warning("arq_edit_failed", error=str(exc), job_id=job.job_id)
-            try:
-                await _pool.delete(key)
-            except Exception:
-                pass
             raise
     return await assistant.edit_images(
         files,
@@ -243,7 +292,6 @@ async def edit_images(
         model=model,
         labels=labels,
         size=size,
-        complexity=complexity,
     )
 
 
@@ -262,33 +310,34 @@ async def synthesize_speech(
     user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled():
         assert _pool is not None
-        job = await _pool.enqueue_job(
-            "synthesize_speech_task",
-            text,
-            model,
-            voice,
-            response_format,
-            role,
-            user_id,
-        )
-        if job is None:
-            return await assistant.synthesize_speech(
+        try:
+            job = await _pool.enqueue_job(
+                "synthesize_speech_task",
                 text,
-                model=model,
-                voice=voice,
-                response_format=response_format,
-                role=role,
+                model,
+                voice,
+                response_format,
+                role,
+                user_id,
             )
+        except Exception as exc:
+            logger.warning("arq_tts_enqueue_failed", error=str(exc))
+            raise _arq_enqueue_failed("synthesize_speech_task") from exc
+        if job is None:
+            raise _arq_enqueue_failed("synthesize_speech_task")
         logger.info(
             "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
         )
         payload = await job.result(timeout=timeout)
-        from app.llm.media_api import SpeechResult
-
         return SpeechResult(
             audio=base64.b64decode(payload["audio_b64"]),
             filename=payload["filename"],
             mime_type=payload["mime_type"],
+            cost_usd=_optional_float(payload.get("cost_usd")),
+            cost_rub=_optional_float(payload.get("cost_rub")),
+            cost_source=_optional_str(payload.get("cost_source")),
+            provider_id=_optional_str(payload.get("provider_id")),
+            model=_optional_str(payload.get("model")),
         )
     return await assistant.synthesize_speech(
         text,
@@ -308,13 +357,17 @@ async def transcribe_audio(
     language: str | None = None,
     timeout: float = 120.0,
     billing_user_id: int | None = None,
-) -> str:
-    """Run STT via arq (bytes staged in Redis) or inline."""
+) -> TranscriptionResult:
+    """Run STT via arq (bytes staged in Redis) or inline.
+
+    Возвращает ``TranscriptionResult``. Строка от старого воркера или
+    тестового двойника приходит без цены.
+    """
     user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled() and _pool is not None:
         key = f"arq:stt:{uuid.uuid4().hex}"
         try:
-            await _pool.set(key, audio_bytes, ex=600)
+            await _pool.set(key, audio_bytes, ex=_payload_ttl_seconds())
             job = await _pool.enqueue_job(
                 "transcribe_audio_task",
                 key,
@@ -329,34 +382,25 @@ async def transcribe_audio(
                 await _pool.delete(key)
             except Exception:
                 pass
-            return await assistant.transcribe_audio(
-                audio_bytes,
-                filename=filename,
-                model=model,
-                language=language,
-            )
+            raise _arq_enqueue_failed("transcribe_audio_task") from exc
         if job is None:
-            await _pool.delete(key)
-            return await assistant.transcribe_audio(
-                audio_bytes,
-                filename=filename,
-                model=model,
-                language=language,
-            )
-        logger.info("arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id)
-        try:
-            return str(await job.result(timeout=timeout))
-        except Exception as exc:
-            # Job accepted — do not duplicate STT inline after timeout/failure.
-            logger.warning("arq_stt_failed", error=str(exc), job_id=job.job_id)
             try:
                 await _pool.delete(key)
             except Exception:
                 pass
+            raise _arq_enqueue_failed("transcribe_audio_task")
+        logger.info("arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id)
+        try:
+            return _coerce_transcription(await job.result(timeout=timeout))
+        except Exception as exc:
+            # Job accepted — do not duplicate STT inline. Payload TTL covers cleanup.
+            logger.warning("arq_stt_failed", error=str(exc), job_id=job.job_id)
             raise
-    return await assistant.transcribe_audio(
-        audio_bytes,
-        filename=filename,
-        model=model,
-        language=language,
+    return _coerce_transcription(
+        await assistant.transcribe_audio(
+            audio_bytes,
+            filename=filename,
+            model=model,
+            language=language,
+        )
     )

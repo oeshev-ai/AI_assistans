@@ -208,14 +208,18 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
         assistant_storage = await create_assistant_storage(RedisConfig.from_env())
         assistant = AssistAIClient(AssistAIConfig.from_env())
         pending_media = await create_pending_media_storage(redis_url)
-    except ValidationError:
-        logger.exception("bot_config_invalid")
+    except (ValidationError, ValueError) as exc:
+        logger.exception("bot_config_invalid", error=str(exc))
         if pending_media is not None:
             await pending_media.close()
         if assistant_storage is not None:
             await assistant_storage.close()
         if topic_storage is not None:
             await topic_storage.close()
+        try:
+            await job_queue.close_job_queue()
+        except Exception:
+            pass
         if shared_redis is not None:
             await shared_redis.aclose()
         raise

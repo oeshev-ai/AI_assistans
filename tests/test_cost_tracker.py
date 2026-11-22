@@ -55,7 +55,53 @@ async def test_reserve_then_record_does_not_double_count() -> None:
     await tracker.check_budget(1, estimated=0.2)
     await tracker.record(kind="chat", amount_usd=0.15, user_id=1)
     day = tracker._day_key()
+    # Hold remaining 0.05 until release; settled spend visible after release.
+    assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.2)
+    await tracker.release_reservation(1)
     assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
+async def test_multi_round_record_keeps_remaining_hold() -> None:
+    from app.infra import cost_tracker as ct
+
+    tracker = CostTracker()
+    tracker.daily_budget = 1.0
+    tracker.user_daily_budget = 0
+    token = ct._reserved_usd.set(0.0)
+    try:
+        await tracker.check_budget(1, estimated=0.5)
+        await tracker.record(kind="chat", amount_usd=0.2, user_id=1)
+        assert ct._reserved_usd.get() == pytest.approx(0.3)
+        await tracker.record(kind="chat", amount_usd=0.15, user_id=1)
+        assert ct._reserved_usd.get() == pytest.approx(0.15)
+        day = tracker._day_key()
+        # Redis still shows original hold until leftover is released.
+        assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.5)
+        await tracker.release_reservation(1)
+        assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.35)
+        assert ct._reserved_usd.get() == pytest.approx(0.0)
+    finally:
+        ct._reserved_usd.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_settle_pipeline_updates_day_and_user(fakeredis_client) -> None:
+    """MULTI/EXEC settle writes both keys in one round-trip (fakeredis-safe)."""
+    tracker = CostTracker()
+    tracker.attach_redis(fakeredis_client)
+    day = tracker._day_key()
+    day_key = f"cost:day:{day}"
+    user_key = f"cost:user:7:day:{day}"
+    await tracker._settle(
+        day_key=day_key,
+        user_key=user_key,
+        day_delta=0.4,
+        user_delta=0.25,
+        ttl_seconds=86400,
+    )
+    assert float(await fakeredis_client.get(day_key)) == pytest.approx(0.4)
+    assert float(await fakeredis_client.get(user_key)) == pytest.approx(0.25)
 
 
 @pytest.mark.asyncio
@@ -73,13 +119,13 @@ async def test_release_reservation_clears_failed_hold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_release_after_record_is_noop() -> None:
+async def test_release_after_partial_record_clears_remainder() -> None:
     tracker = CostTracker()
     tracker.daily_budget = 1.0
     tracker.user_daily_budget = 0
     await tracker.check_budget(1, estimated=0.2)
     await tracker.record(kind="chat", amount_usd=0.11, user_id=1)
-    assert await tracker.release_reservation(1) == 0.0
+    assert await tracker.release_reservation(1) == pytest.approx(0.09)
     day = tracker._day_key()
     assert await tracker._get(f"cost:day:{day}") == pytest.approx(0.11)
 

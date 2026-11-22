@@ -20,7 +20,7 @@ from app.infra.circuit_breaker import (
     get_breaker,
     safe_api_call,
 )
-from app.infra.metrics import API_CALLS, ERRORS, LATENCY, track_api_call
+from app.infra.metrics import API_CALLS, ERRORS, LATENCY
 from app.llm.config import AssistAIConfig
 from app.llm.errors import AssistAIError, counts_toward_circuit
 from app.llm.openweather import OpenWeatherClient
@@ -71,9 +71,15 @@ def _chat_base(provider: ProviderConfig) -> str:
 
 
 def _request_base(provider: ProviderConfig, path: str) -> str:
-    """База HTTP: chat → ``chat_base_url``, остальное → ``base_url``."""
+    """База HTTP: chat/audio → ``chat_base_url``, остальное → ``base_url``."""
     cleaned = path.lstrip("/")
-    if cleaned == _CHAT_PATH or cleaned.startswith("chat/"):
+    if (
+        cleaned == _CHAT_PATH
+        or cleaned.startswith("chat/")
+        or cleaned == _SPEECH_PATH
+        or cleaned == _TRANSCRIBE_PATH
+        or cleaned.startswith("audio/")
+    ):
         return _chat_base(provider)
     return provider.base_url.rstrip("/")
 
@@ -154,7 +160,11 @@ class ProviderTransportMixin:
     _weather_client: OpenWeatherClient | None
 
     def _build_registry(self) -> ProviderRegistry:
-        """Реестр провайдеров. ProxyAPI всегда берётся из ``base_url``/``proxyapi_key``."""
+        """Реестр провайдеров. ProxyAPI всегда из ``base_url``/``proxyapi_key`` (fallback).
+
+        Дефолтный primary — polza, если провайдер зарегистрирован; иначе proxyapi.
+        Явные ``config.routes`` перекрывают seed.
+        """
         providers = dict(self.config.providers)
         providers["proxyapi"] = ProviderConfig(
             id="proxyapi",
@@ -163,12 +173,16 @@ class ProviderTransportMixin:
             api_key=self.config.proxyapi_key,
             capabilities=PROXYAPI_CAPABILITIES,
         )
-        routes = {op: "proxyapi" for op in ("text", "image", "audio", "video")}
+        default_primary = "polza" if "polza" in providers else "proxyapi"
+        routes = {op: default_primary for op in ("text", "image", "audio", "video")}
         routes.update(self.config.routes)
         registry = ProviderRegistry(
             providers,
             routes,
             image_fallback=self.config.image_provider_fallback,
+            text_fallback=self.config.text_provider_fallback,
+            audio_fallback=self.config.audio_provider_fallback,
+            video_fallback=self.config.video_provider_fallback,
         )
         required = {
             "text": "chat",
@@ -247,14 +261,16 @@ class ProviderTransportMixin:
     async def _iter_chat_chunks(
         self,
         payload: dict[str, Any],
+        *,
+        provider: ProviderConfig | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Читает SSE-поток ``/chat/completions`` и отдаёт JSON каждого ``data:``."""
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
-        provider = self._endpoint("text")
-        label = _provider_label(provider)
-        breaker = get_breaker(provider.id)
+        target = provider or self._endpoint("text")
+        label = _provider_label(target)
+        breaker = get_breaker(target.id)
         try:
             await breaker.ensure_allows_call()
         except CircuitBreakerError as exc:
@@ -263,18 +279,16 @@ class ProviderTransportMixin:
                 error_code="CIRCUIT_OPEN",
             ) from exc
 
-        url = f"{_chat_base(provider)}/{_CHAT_PATH}"
+        url = f"{_chat_base(target)}/{_CHAT_PATH}"
         read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
         timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
-        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH, provider=provider.id)
+        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH, provider=target.id)
         t0 = time.perf_counter()
         try:
-            async with self._client_for(provider).stream(
+            async with self._client_for(target).stream(
                 "POST", url, json=payload, timeout=timeout
             ) as response:
-                await self._raise_for_stream_status(
-                    response, _CHAT_PATH, label=label
-                )
+                await self._raise_for_stream_status(response, _CHAT_PATH, label=label)
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_data(line)
                     if chunk is _SSE_SKIP:
@@ -292,39 +306,41 @@ class ProviderTransportMixin:
                             raise AssistAIError(f"{label}: {message}")
                         yield chunk
             API_CALLS.labels(
-                service="proxy_api", endpoint="chat_stream", status="success"
+                service=target.id, endpoint="chat_stream", status="success"
             ).inc()
             await breaker._on_success()
         except AssistAIError as exc:
             API_CALLS.labels(
-                service="proxy_api", endpoint="chat_stream", status="error"
+                service=target.id, endpoint="chat_stream", status="error"
             ).inc()
-            ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
+            ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
             if counts_toward_circuit(exc):
                 await breaker._on_failure(exc)
             raise
         except httpx.TimeoutException as exc:
             API_CALLS.labels(
-                service="proxy_api", endpoint="chat_stream", status="error"
+                service=target.id, endpoint="chat_stream", status="error"
             ).inc()
-            ERRORS.labels(error_type="TimeoutException", module="proxy_api").inc()
+            ERRORS.labels(error_type="TimeoutException", module=target.id).inc()
             await breaker._on_failure(exc)
             logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
             raise AssistAIError(
-                f"Превышено время ожидания ответа {label} ({_CHAT_PATH})."
+                f"Превышено время ожидания ответа {label} ({_CHAT_PATH}).",
+                error_code="TIMEOUT",
             ) from exc
         except httpx.RequestError as exc:
             API_CALLS.labels(
-                service="proxy_api", endpoint="chat_stream", status="error"
+                service=target.id, endpoint="chat_stream", status="error"
             ).inc()
-            ERRORS.labels(error_type=type(exc).__name__, module="proxy_api").inc()
+            ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
             await breaker._on_failure(exc)
             logger.error("proxy_api_stream_network", path=_CHAT_PATH, error=str(exc))
             raise AssistAIError(
-                f"Сетевая ошибка при обращении к {label}: {exc}"
+                f"Сетевая ошибка при обращении к {label}: {exc}",
+                error_code="NETWORK_ERROR",
             ) from exc
         finally:
-            LATENCY.labels(service="proxy_api", endpoint="chat_stream").observe(
+            LATENCY.labels(service=target.id, endpoint="chat_stream").observe(
                 time.perf_counter() - t0
             )
 
@@ -431,7 +447,6 @@ class ProviderTransportMixin:
             logger.error("llm_unavailable", path=path, error=exc.message)
             raise AssistAIError(exc.message, error_code="CIRCUIT_OPEN") from exc
 
-    @track_api_call(service="proxy_api", endpoint="post_json")
     async def _post_json_raw(
         self,
         path: str,
@@ -441,10 +456,39 @@ class ProviderTransportMixin:
         provider: ProviderConfig | None = None,
     ) -> dict[str, Any]:
         """Фактический HTTP POST без circuit breaker (для метрик и breaker)."""
+        target = provider or self._endpoint("text")
+        service = target.id
+        started = time.perf_counter()
+        try:
+            data = await self._post_json_request(target, path, payload, timeout=timeout)
+        except Exception as exc:
+            API_CALLS.labels(
+                service=service, endpoint="post_json", status="error"
+            ).inc()
+            ERRORS.labels(error_type=type(exc).__name__, module=service).inc()
+            raise
+        else:
+            API_CALLS.labels(
+                service=service, endpoint="post_json", status="success"
+            ).inc()
+            return data
+        finally:
+            LATENCY.labels(service=service, endpoint="post_json").observe(
+                time.perf_counter() - started
+            )
+
+    async def _post_json_request(
+        self,
+        target: ProviderConfig,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
+        """POST JSON без метрик: метки ``service`` ставит ``_post_json_raw``."""
         if self._closed:
             raise AssistAIError("Клиент уже закрыт.")
 
-        target = provider or self._endpoint("text")
         label = _provider_label(target)
         url = f"{_request_base(target, path)}/{path.lstrip('/')}"
         logger.info("proxy_api_post", url=url, path=path, provider=target.id)

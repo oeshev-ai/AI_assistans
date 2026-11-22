@@ -649,11 +649,11 @@ async def test_seedream_uses_size_preset_or_width_height(
 
 
 @pytest.mark.asyncio
-async def test_recraft_size_is_aspect_ratio(
+async def test_nano_banana_size_is_image_resolution(
     assist_client: AssistAIClient,
     respx_mock: MockRouter,
 ) -> None:
-    """Recraft предпочитает size в формате w:h."""
+    """Nano Banana передаёт image_resolution (1K/2K/4K)."""
     route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
         return_value=httpx.Response(
             200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
@@ -662,12 +662,13 @@ async def test_recraft_size_is_aspect_ratio(
 
     await assist_client.generate_image(
         "логотип",
-        model="recraft/recraft-v4.1",
-        size="1:1",
+        model="google/gemini-nano-banana-2.1",
+        size="1K",
     )
 
     body = json.loads(route.calls.last.request.content)
-    assert body["size"] == "1:1"
+    assert body["image_resolution"] == "1K"
+    assert "quality" not in body
 
 
 def test_extract_generated_images_matches_tool_call_id() -> None:

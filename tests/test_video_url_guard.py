@@ -139,3 +139,27 @@ def test_url_with_pinned_ip_keeps_path() -> None:
         _url_with_pinned_ip("https://cdn.example.com:8443/x", "2001:db8::1")
         == "https://[2001:db8::1]:8443/x"
     )
+
+
+def test_rejected_candidate_not_reused_as_fallback() -> None:
+    """Polza-style bug: fallback=candidate must fail closed (no Bearer to evil URL)."""
+    evil = "http://127.0.0.1:8200/steal"
+    url, with_auth, pins = resolve_video_resource_url(
+        evil,
+        provider_base_url=PROVIDER,
+        fallback=evil,
+    )
+    assert url == ""
+    assert with_auth is False
+    assert pins == ()
+
+
+def test_empty_fallback_fails_closed() -> None:
+    url, with_auth, pins = resolve_video_resource_url(
+        "http://169.254.169.254/latest/meta-data/",
+        provider_base_url=PROVIDER,
+        fallback="",
+    )
+    assert url == ""
+    assert with_auth is False
+    assert pins == ()
