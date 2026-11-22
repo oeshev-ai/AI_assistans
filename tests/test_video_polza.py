@@ -48,7 +48,20 @@ def test_build_video_body_seedance() -> None:
     assert body["input"]["duration"] == "8"
     assert body["input"]["resolution"] == "720p"
     assert body["input"]["aspect_ratio"] == "16:9"
+    assert "generate_audio" not in body["input"]
     assert "images" not in body["input"]
+    with_audio = build_video_body(
+        model="bytedance/seedance-2",
+        prompt="сцена",
+        aspect_ratio="9:16",
+        duration=10,
+        resolution="480p",
+        generate_audio=False,
+    )
+    assert with_audio["input"]["aspect_ratio"] == "9:16"
+    assert with_audio["input"]["duration"] == "10"
+    assert with_audio["input"]["resolution"] == "480p"
+    assert with_audio["input"]["generate_audio"] is False
     with_images = build_video_body(
         model="bytedance/seedance-2",
         prompt="сцена",
@@ -95,13 +108,22 @@ async def test_generate_video_polza_success(
             return_value=httpx.Response(200, content=b"mp4-bytes")
         )
         proxy = router.post(_PROXY_VIDEOS).mock(return_value=httpx.Response(200))
-        video = await client.generate_video("кот бежит", duration=5, resolution="720p")
+        video = await client.generate_video(
+            "кот бежит",
+            duration=5,
+            resolution="720p",
+            aspect_ratio="9:16",
+            generate_audio=True,
+        )
     assert video.data == b"mp4-bytes"
     assert video.filename == "video.mp4"
     assert len(create.calls) == 1
     req = json.loads(create.calls[0].request.content.decode())
     assert req["model"] == "bytedance/seedance-2"
     assert req["input"]["duration"] == "5"
+    assert req["input"]["aspect_ratio"] == "9:16"
+    assert req["input"]["resolution"] == "720p"
+    assert req["input"]["generate_audio"] is True
     assert "images" not in req["input"]
     assert status.called
     assert download.called
@@ -220,6 +242,45 @@ async def test_generate_video_polza_rejects_private_content_url(
     assert info.value.error_code == "GUARD_UNSAFE_URL"
     assert not evil_get.called
     assert not proxy.called
+
+
+@pytest.mark.asyncio
+async def test_generate_video_fallback_keeps_persona_settings(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    """И Polza, и запасной ProxyAPI получают настройки ролика персоны."""
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+    )
+    with respx.mock(assert_all_called=False) as router:
+        polza = router.post(_POLZA_MEDIA).mock(return_value=httpx.Response(503))
+        create = router.post(_PROXY_VIDEOS).mock(
+            return_value=httpx.Response(
+                200, json={"id": "job_opts", "status": "completed"}
+            )
+        )
+        router.get(f"{_PROXY_VIDEOS}/job_opts/content").mock(
+            return_value=httpx.Response(200, content=b"proxy-mp4")
+        )
+        video = await client.generate_video(
+            "сцена",
+            aspect_ratio="9:16",
+            duration=12,
+            resolution="480p",
+            generate_audio=True,
+        )
+    assert video.data == b"proxy-mp4"
+    polza_body = json.loads(polza.calls[0].request.content.decode())
+    assert polza_body["input"]["aspect_ratio"] == "9:16"
+    assert polza_body["input"]["duration"] == "12"
+    assert polza_body["input"]["resolution"] == "480p"
+    assert polza_body["input"]["generate_audio"] is True
+    proxy_body = json.loads(create.calls[0].request.content.decode())
+    assert proxy_body["aspect_ratio"] == "9:16"
+    assert proxy_body["duration"] == 12
+    assert proxy_body["resolution"] == "480p"
+    assert proxy_body["generate_audio"] is True
 
 
 @pytest.mark.asyncio

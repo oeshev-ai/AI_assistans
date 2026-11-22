@@ -26,6 +26,7 @@ from app.llm.media_api import (
     safe_image_mime,
 )
 from app.llm.tooling import BaseTool, _error_json, _exception_text
+from app.llm.video_settings import current_video_settings
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
 logger = structlog.get_logger("media_tools")
@@ -432,7 +433,8 @@ class GenerateVideoTool(BaseTool):
             "Если внешность, предмет или место уже есть на фото пользователя "
             "или на кадре из generate_image, передай reference_indexes. "
             "Без них сервис видит только текст. "
-            "Генерация занимает минуты — предупреди об ожидании только кратко."
+            "Генерация занимает минуты — предупреди об ожидании только кратко. "
+            "Формат, длительность, разрешение и звук уже заданы в настройках персоны."
         )
 
     @property
@@ -464,14 +466,6 @@ class GenerateVideoTool(BaseTool):
                     "type": "string",
                     "description": "Модель видео. Необязательно.",
                 },
-                "duration": {
-                    "type": "integer",
-                    "description": "Длительность в секундах (если модель поддерживает).",
-                },
-                "resolution": {
-                    "type": "string",
-                    "description": "Например 720p.",
-                },
             },
             "required": ["prompt"],
             "additionalProperties": False,
@@ -499,17 +493,36 @@ class GenerateVideoTool(BaseTool):
         prompt = security.sanitize_prompt(prompt.strip())
         model = kwargs.get("model")
         selected = model.strip() if isinstance(model, str) and model.strip() else None
-        duration = kwargs.get("duration")
-        resolution = kwargs.get("resolution")
+        scoped = current_video_settings()
+        duration: int | None
+        resolution: str | None
+        aspect_ratio: str | None
+        generate_audio: bool | None
+        if scoped is not None:
+            duration = scoped.duration
+            resolution = scoped.resolution
+            aspect_ratio = scoped.aspect_ratio
+            generate_audio = scoped.generate_audio
+        else:
+            raw_duration = kwargs.get("duration")
+            raw_resolution = kwargs.get("resolution")
+            duration = raw_duration if isinstance(raw_duration, int) else None
+            resolution = raw_resolution if isinstance(raw_resolution, str) else None
+            aspect_ratio = None
+            generate_audio = None
+        call: dict[str, Any] = {
+            "model": selected,
+            "duration": duration,
+            "resolution": resolution,
+            "references": references,
+        }
+        if aspect_ratio is not None:
+            call["aspect_ratio"] = aspect_ratio
+        if generate_audio is not None:
+            call["generate_audio"] = generate_audio
         try:
             # Budget preflight — в AssistAIClient.generate_video.
-            video = await self._client.generate_video(
-                prompt=prompt,
-                model=selected,
-                duration=duration if isinstance(duration, int) else None,
-                resolution=resolution if isinstance(resolution, str) else None,
-                references=references,
-            )
+            video = await self._client.generate_video(prompt, **call)
         except BudgetExceededError as exc:
             return _error_json(exc.message)
         except AssistAIError as exc:

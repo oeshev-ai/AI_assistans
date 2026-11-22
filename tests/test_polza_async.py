@@ -153,6 +153,27 @@ async def test_transient_poll_5xx_is_tolerated(
 
 
 @pytest.mark.asyncio
+async def test_poll_429_retries_until_completed(
+    polza_fixture: Callable[[str], dict[str, Any]], sleeps: list[float]
+) -> None:
+    pending = polza_fixture("async_pending")
+    done = polza_fixture("edit_completed")
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_MEDIA_URL).mock(return_value=httpx.Response(200, json=pending))
+        router.get(f"{_BASE}/v1/media/{pending['id']}").mock(
+            side_effect=[
+                httpx.Response(429, json={"error": {"code": "TOO_MANY_REQUESTS"}}),
+                httpx.Response(200, json=done),
+            ]
+        )
+        async with httpx.AsyncClient() as client:
+            result = await generate(
+                client, make_polza_provider(), model=_MODEL, prompt="x"
+            )
+    assert result.images
+
+
+@pytest.mark.asyncio
 async def test_client_poll_exhaustion_no_fallback(
     multi_client_factory: Callable[..., AssistAIClient],
     polza_fixture: Callable[[str], dict[str, Any]],

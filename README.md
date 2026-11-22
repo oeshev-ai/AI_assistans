@@ -39,7 +39,7 @@ worker.py       точка входа arq: worker.WorkerSettings
 
 ## Провайдеры
 
-Нужны оба ключа: `POLZA_API_KEY` и `PROXYAPI_API_KEY`. По умолчанию текст, картинки, аудио и видео идут на Polza. ProxyAPI — один запасной вызов, если основной недоступен: таймаут, 5xx, открытый circuit breaker, 429, нет баланса, для картинок ещё исчерпан `POLZA_TOTAL_WAIT`. Коды 400, 401, 403, 404, 413 и внутренние `guard_*` не повторяются и на fallback не уходят.
+Нужны оба ключа: `POLZA_API_KEY` и `PROXYAPI_API_KEY`. По умолчанию текст, картинки, аудио и видео идут на Polza. ProxyAPI — один запасной вызов, если основной недоступен: таймаут, 5xx, открытый circuit breaker, 429, нет баланса. Коды 400, 401, 403, 404, 413 и внутренние `guard_*` не повторяются и на fallback не уходят. Исчерпание `POLZA_TOTAL_WAIT` тоже не уходит на запасной провайдер: задача уже принята, бот забирает тот же результат позже.
 
 Вернуть канал на ProxyAPI: соответствующий `*_PROVIDER=proxyapi`.
 
@@ -68,7 +68,7 @@ SpeechKit (`TTS_PROVIDER=speechkit`) ходит в Yandex TTS v3 и в эту с
 
 Кнопки бота берут списки из `app/llm/models_config.py`, каталог провайдера на каждое нажатие не запрашивается. Пустой выбор в профиле — модель из окружения.
 
-Текст: `deepseek/deepseek-v4.1-flash-1017` (дефолт `TEXT_MODEL`), `google/gemini-3.8-flash`, `google/gemini-4-argon`, `anthropic/claude-sonnet-5-5` (на Polza id `claude-sonnet-5.5`), `openai/gpt-6-luna`, `openai/gpt-6.1-terra`, `openai/gpt-6-sol`, `qwen/qwen4-max`.
+Текст: `deepseek/deepseek-v4.1-flash-1017` (дефолт `TEXT_MODEL`), `google/gemini-3.8-flash`, `google/gemini-4-argon`, `anthropic/claude-sonnet-5-5` (на Polza id `anthropic/claude-sonnet-5.5`), `openai/gpt-6-luna`, `openai/gpt-6.1-terra`, `openai/gpt-6-sol`, `qwen/qwen4-max`.
 
 Картинки: `openai/gpt-image-2.6-flare` (дефолт генерации и правки), `black-forest-labs/flux-3-image-klein`, `black-forest-labs/flux-3-image`, `qwen/qwen-image-2.1-pro`, `google/gemini-nano-banana-2.1`.
 
@@ -160,7 +160,7 @@ docker compose up -d --build
 docker compose --profile arq up -d --build
 ```
 
-Воркер — `arq worker.WorkerSettings`. Он выполняет `generate_image_task`, `edit_image_task`, `synthesize_speech_task`, `transcribe_audio_task`. `ARQ_JOB_TIMEOUT` не может быть меньше `POLZA_TOTAL_WAIT + 30`, иначе воркер не стартует. По умолчанию таймаут задачи 300 с, одновременно до `ARQ_MAX_JOBS` (10).
+Воркер — `arq worker.WorkerSettings`. Он выполняет `generate_image_task`, `edit_image_task`, `synthesize_speech_task`, `transcribe_audio_task`. `ARQ_JOB_TIMEOUT` не может быть меньше `180 + POLZA_TOTAL_WAIT + 30` (создание и опрос картинки), иначе воркер не стартует. По умолчанию таймаут задачи 450 с, одна попытка на задачу, одновременно до `ARQ_MAX_JOBS` (10).
 
 Снимок Redis (профиль `backup`, файлы в `./backups/redis`, хранятся 7 дней):
 

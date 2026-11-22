@@ -21,6 +21,10 @@ from app.llm.media_api import SpeechResult, TranscriptionResult
 
 logger = structlog.get_logger("job_queue")
 
+# Создание картинки может занять весь read-timeout, затем опрос — POLZA_TOTAL_WAIT.
+_IMAGE_CREATE_TIMEOUT = 180.0
+_DEFAULT_ARQ_JOB_TIMEOUT = 450.0
+
 
 def _optional_float(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -127,11 +131,11 @@ def _billing_user_id(explicit: int | None = None) -> int | None:
 
 
 def _polza_image_wait_needed() -> float:
-    """Minimum bot wait / worker job timeout for Polza poll + margin."""
+    """Минимум ожидания: таймаут создания плюс опрос Polza и запас."""
     from app.infra.envparse import env_float
 
-    polza_wait = env_float("POLZA_TOTAL_WAIT", 240.0)
-    return max(180.0, polza_wait + 30.0)
+    polza_wait = max(0.0, env_float("POLZA_TOTAL_WAIT", 240.0))
+    return _IMAGE_CREATE_TIMEOUT + polza_wait + 30.0
 
 
 def validate_arq_image_timeout() -> None:
@@ -142,7 +146,7 @@ def validate_arq_image_timeout() -> None:
     """
     from app.infra.envparse import env_float
 
-    arq_timeout = env_float("ARQ_JOB_TIMEOUT", 300.0)
+    arq_timeout = env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT)
     needed = _polza_image_wait_needed()
     if arq_timeout > 0 and arq_timeout < needed:
         logger.error(
@@ -152,19 +156,32 @@ def validate_arq_image_timeout() -> None:
             needed=needed,
         )
         raise ValueError(
-            f"ARQ_JOB_TIMEOUT ({arq_timeout}) must be >= POLZA_TOTAL_WAIT+30 ({needed})"
+            "ARQ_JOB_TIMEOUT "
+            f"({arq_timeout}) must be >= image create + POLZA_TOTAL_WAIT + 30 ({needed})"
         )
 
 
 def image_result_timeout(explicit: float | None = None) -> float:
-    """Wait for queued image jobs at least as long as Polza poll budget.
+    """Бот ждёт задачу не меньше, чем воркеру разрешено её выполнять.
 
-    Never returns below ``POLZA_TOTAL_WAIT + 30``. Misconfigured
-    ``ARQ_JOB_TIMEOUT`` is rejected by ``validate_arq_image_timeout``.
+    Ниже ``image create + POLZA_TOTAL_WAIT + 30`` не опускается.
+    Короткий ``ARQ_JOB_TIMEOUT`` отклоняет ``validate_arq_image_timeout``.
     """
     if explicit is not None:
         return explicit
-    return _polza_image_wait_needed()
+    from app.infra.envparse import env_float
+
+    job_timeout = env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT)
+    return max(_polza_image_wait_needed(), job_timeout)
+
+
+def audio_result_timeout(explicit: float | None = None) -> float:
+    """Ожидание TTS/STT совпадает с таймаутом задачи, чтобы бот не сдался раньше."""
+    if explicit is not None:
+        return explicit
+    from app.infra.envparse import env_float
+
+    return max(120.0, env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT))
 
 
 def _payload_ttl_seconds() -> int:
@@ -175,7 +192,7 @@ def _payload_ttl_seconds() -> int:
     """
     from app.infra.envparse import env_float
 
-    job_timeout = max(0.0, env_float("ARQ_JOB_TIMEOUT", 300.0))
+    job_timeout = max(0.0, env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT))
     polza_wait = max(0.0, env_float("POLZA_TOTAL_WAIT", 240.0))
     return int(max(600.0, job_timeout + 120.0, polza_wait + 120.0))
 
@@ -282,8 +299,7 @@ async def edit_images(
             result = await job.result(timeout=wait)
             return list(result)
         except Exception as exc:
-            # Job accepted — do not re-run inline. Leave Redis payload for
-            # worker crash-retry until TTL (worker deletes on success).
+            # Job accepted — do not re-run inline. Payload stays until TTL.
             logger.warning("arq_edit_failed", error=str(exc), job_id=job.job_id)
             raise
     return await assistant.edit_images(
@@ -303,11 +319,12 @@ async def synthesize_speech(
     voice: str | None = None,
     response_format: str | None = None,
     role: str | None = None,
-    timeout: float = 120.0,
+    timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> Any:
     """Run TTS via arq or inline. Returns ``SpeechResult``-like object."""
     user_id = _billing_user_id(billing_user_id)
+    timeout = audio_result_timeout(timeout)
     if is_queue_enabled():
         assert _pool is not None
         try:
@@ -355,7 +372,7 @@ async def transcribe_audio(
     filename: str = "voice.ogg",
     model: str | None = None,
     language: str | None = None,
-    timeout: float = 120.0,
+    timeout: float | None = None,
     billing_user_id: int | None = None,
 ) -> TranscriptionResult:
     """Run STT via arq (bytes staged in Redis) or inline.
@@ -364,6 +381,7 @@ async def transcribe_audio(
     тестового двойника приходит без цены.
     """
     user_id = _billing_user_id(billing_user_id)
+    timeout = audio_result_timeout(timeout)
     if is_queue_enabled() and _pool is not None:
         key = f"arq:stt:{uuid.uuid4().hex}"
         try:

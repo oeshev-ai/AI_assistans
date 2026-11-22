@@ -91,7 +91,7 @@ async def test_init_fail_closed_without_redis_url(
 ) -> None:
     monkeypatch.setenv("ARQ_ENABLED", "1")
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
-    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
     await job_queue.close_job_queue()
     with pytest.raises(SystemExit):
         await job_queue.init_job_queue("")
@@ -103,7 +103,7 @@ async def test_init_fail_closed_when_pool_create_fails(
 ) -> None:
     monkeypatch.setenv("ARQ_ENABLED", "1")
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
-    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
 
     async def boom(_settings: object) -> None:
         raise ConnectionError("redis down")
@@ -125,9 +125,10 @@ def test_image_result_timeout_covers_polza_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
-    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
-    assert job_queue.image_result_timeout() == pytest.approx(270.0)
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    assert job_queue.image_result_timeout() == pytest.approx(450.0)
     assert job_queue.image_result_timeout(120.0) == pytest.approx(120.0)
+    assert job_queue.audio_result_timeout() == pytest.approx(450.0)
 
 
 def test_image_result_timeout_ignores_short_arq_job_timeout(
@@ -135,7 +136,7 @@ def test_image_result_timeout_ignores_short_arq_job_timeout(
 ) -> None:
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
     monkeypatch.setenv("ARQ_JOB_TIMEOUT", "200")
-    assert job_queue.image_result_timeout() == pytest.approx(270.0)
+    assert job_queue.image_result_timeout() == pytest.approx(450.0)
 
 
 def test_validate_arq_image_timeout_rejects_short_worker(
@@ -151,7 +152,7 @@ def test_validate_arq_image_timeout_ok(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
-    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "300")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
     job_queue.validate_arq_image_timeout()
 
 

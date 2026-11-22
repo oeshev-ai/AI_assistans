@@ -47,22 +47,31 @@ async def handle_text(
     if not security.validate_message_length(user_text):
         await message.answer("⚠️ Сообщение слишком длинное. Максимум 4000 символов.")
         return
-    if pending_media is not None and user_text.casefold() in {
-        "отмена",
-        "стоп",
-        "cancel",
-    }:
+    if user_text.casefold() in {"отмена", "стоп", "cancel"}:
+        from app.bot.album import get_album_hub
         from app.bot.photo_flow import consume_pending_text
 
-        if await consume_pending_text(
-            message,
-            assistant,
-            topic_storage,
-            assistant_storage,
-            state,
-            pending_media,
-            user_text,
-        ):
+        # Слот и ещё не собранный альбом гасятся вместе. Иначе «Отменено»
+        # снимает старые фото, а новый альбом всё равно уходит в работу.
+        hub = get_album_hub()
+        album_cancelled = False
+        if hub.has_pending(message.chat.id, user_id):
+            album_cancelled = await hub.cancel_chat(message.chat.id, user_id)
+        pending_cancelled = False
+        if pending_media is not None:
+            pending_cancelled = await consume_pending_text(
+                message,
+                assistant,
+                topic_storage,
+                assistant_storage,
+                state,
+                pending_media,
+                user_text,
+            )
+        if pending_cancelled:
+            return
+        if album_cancelled:
+            await message.answer("Отменено.")
             return
     sanitized_text = security.sanitize_prompt(user_text)
     from app.bot.album import get_album_hub

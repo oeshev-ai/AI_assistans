@@ -776,6 +776,12 @@ async def _poll(
                 raise _network_error(exc, "poll", medium=medium) from exc
             continue
         except AssistAIError as exc:
+            # Задача уже принята: 429 на GET не бросаем, пока не кончился бюджет.
+            limited = exc.status_code == 429 or (exc.error_code or "").upper() == (
+                "TOO_MANY_REQUESTS"
+            )
+            if limited:
+                continue
             if exc.status_code is not None and exc.status_code >= 500:
                 errors += 1
                 if medium == "video" or errors <= _MAX_POLL_ERRORS:
@@ -929,9 +935,14 @@ def build_video_body(
     duration: int | None = None,
     resolution: str | None = None,
     aspect_ratio: str = "16:9",
+    generate_audio: bool | None = None,
     images: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Тело ``POST /v1/media`` для Seedance и др. видеомоделей Polza."""
+    """Тело ``POST /v1/media`` для Seedance и др. видеомоделей Polza.
+
+    ``generate_audio`` передаётся булевым: каталог приводит строки
+    ``"true"``/``"false"`` к bool, но само поле опционально.
+    """
     media_input: dict[str, Any] = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
@@ -940,6 +951,8 @@ def build_video_body(
         media_input["duration"] = str(duration)
     if isinstance(resolution, str) and resolution.strip():
         media_input["resolution"] = resolution.strip()
+    if generate_audio is not None:
+        media_input["generate_audio"] = bool(generate_audio)
     if images:
         media_input["images"] = images
     return {"model": model, "input": media_input, "async": True}
@@ -954,6 +967,7 @@ async def generate_video(
     duration: int | None = None,
     resolution: str | None = None,
     aspect_ratio: str = "16:9",
+    generate_audio: bool | None = None,
     images: list[dict[str, str]] | None = None,
     poll_interval: float = 5.0,
     total_wait: float = 600.0,
@@ -966,6 +980,7 @@ async def generate_video(
         duration=duration,
         resolution=resolution,
         aspect_ratio=aspect_ratio,
+        generate_audio=generate_audio,
         images=images,
     )
     url = f"{provider.base_url}{_MEDIA_PATH}"
@@ -974,6 +989,8 @@ async def generate_video(
         model=model,
         duration=duration,
         resolution=resolution,
+        aspect_ratio=aspect_ratio,
+        generate_audio=generate_audio,
         prompt_chars=len(prompt),
         images=len(images or []),
     )

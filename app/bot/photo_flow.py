@@ -23,6 +23,7 @@ from app.llm.image_ops import (
     image_model_family,
     supports_multi_image,
 )
+from app.llm.video_settings import video_settings_from
 from app.llm.vision import (
     VisionError,
     build_multimodal_content,
@@ -189,12 +190,14 @@ async def route_album(
         )
     except Exception:
         await R._reply_profile_error(message)
+        if pending_claimed:
+            await _restore_album(turn, media)
         return
     media.topic_id = topic_id
     loaded = await _download(turn, media)
     if loaded is None:
         if pending_claimed:
-            await turn.pending.put(media)
+            await _restore_album(turn, media)
         return
     images = [{"data": item.data, "mime": item.mime_type} for item in loaded]
     try:
@@ -204,12 +207,12 @@ async def route_album(
         decision = await _decision(turn, media, images, topic_id)
     except BudgetExceededError as exc:
         if pending_claimed:
-            await turn.pending.put(media)
+            await _restore_album(turn, media)
         await message.answer(exc.message)
         return
     except AssistAIError as exc:
         if pending_claimed:
-            await turn.pending.put(media)
+            await _restore_album(turn, media)
         await message.answer(exc.message)
         return
     finally:
@@ -286,8 +289,56 @@ def followup_media(media: PendingMedia, file_id: str) -> PendingMedia:
     )
 
 
+def _album_identity(media: PendingMedia) -> tuple[tuple[str, int], ...]:
+    """Пара file_id и message_id: чужой альбом в том же слоте не трогаем."""
+    return tuple((item.file_id, item.message_id) for item in media.items)
+
+
+async def _restore_album(turn: Any, media: PendingMedia) -> None:
+    """Кладёт альбом обратно, если слот пуст или там всё ещё он сам."""
+    try:
+        current = await turn.pending.get(
+            media.chat_id, media.assistant_id, media.user_id
+        )
+    except Exception:
+        logger.info("pending_restore_skipped", chat_id=media.chat_id)
+        return
+    if current is not None and _album_identity(current) != _album_identity(media):
+        return
+    await turn.pending.put(media)
+
+
+async def _release_album(
+    turn: Any, media: PendingMedia, kept_file_id: str | None
+) -> None:
+    """Снимает свой альбом. Альбом, пришедший во время хода, остаётся."""
+    try:
+        current = await turn.pending.get(
+            media.chat_id, media.assistant_id, media.user_id
+        )
+    except Exception:
+        logger.info("pending_release_skipped", chat_id=media.chat_id)
+        return
+    if current is not None and _album_identity(current) != _album_identity(media):
+        return
+    await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
+    if kept_file_id:
+        await _keep_result(turn, media, kept_file_id)
+
+
 async def _keep_result(turn: Any, media: PendingMedia, file_id: str) -> None:
     await turn.pending.put(followup_media(media, file_id))
+
+
+async def _settle_album(
+    turn: Any, media: PendingMedia, kept_file_id: str | None
+) -> None:
+    """Успех оставляет файл результата. Иначе в слот возвращается исходный альбом."""
+    if kept_file_id:
+        await _release_album(turn, media, kept_file_id)
+    else:
+        await _restore_album(turn, media)
+    await R._reset_flow(turn.state)
 
 
 async def _decision(
@@ -394,11 +445,17 @@ async def _execute(
             await turn.pending.put(media)
         return
     if decision.intent in {"analyze", "ocr", "compare"}:
-        await _analyze(turn, media, loaded, decision)
+        try:
+            await _analyze(turn, media, loaded, decision)
+        finally:
+            media.caption = ""
+            media.clarify_rounds = 0
+            media.last_question = None
+            await _restore_album(turn, media)
         await R._reset_flow(turn.state)
         return
     if decision.intent == "video":
-        await _generate_video(turn, media, loaded, decision, topic_id)
+        await _generate_video(turn, media, loaded, decision, topic_id, profile)
         return
     if decision.intent == "generate":
         await _generate(turn, media, profile, loaded, decision, topic_id)
@@ -461,10 +518,12 @@ async def _edit(
         await message.answer(
             f"⏳ Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
         )
+        await _settle_album(turn, media, None)
         return
     instruction = (decision.instruction_en or media.caption or "").strip()
     if not security.validate_prompt_length(instruction):
         await message.answer("⚠️ Запрос слишком длинный.")
+        await _settle_album(turn, media, None)
         return
     base = decision.base_index if decision.base_index is not None else 0
     refs = list(decision.reference_indexes)
@@ -571,10 +630,7 @@ async def _edit(
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
-        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
-        if kept_file_id:
-            await _keep_result(turn, media, kept_file_id)
-        await R._reset_flow(turn.state)
+        await _settle_album(turn, media, kept_file_id)
 
 
 def video_references(loaded: list[UserMedia]) -> list[Any]:
@@ -614,6 +670,7 @@ async def _generate_video(
     loaded: list[UserMedia],
     decision: PhotoDecision,
     topic_id: str,
+    profile: Any | None = None,
 ) -> None:
     """Ролик по присланным фото. Повторный запрос сюда не приходит, пока этот ход жив."""
     from aiogram.types import BufferedInputFile
@@ -625,24 +682,36 @@ async def _generate_video(
         await message.answer(
             f"Слишком много запросов видео. Подождите {int(retry_after) or 60} секунд."
         )
+        await _restore_album(turn, media)
         await R._reset_flow(turn.state)
         return
     instruction = (decision.instruction_en or media.caption or "").strip()
     if not instruction:
         await message.answer("Опишите, что должно происходить в ролике.")
+        await _restore_album(turn, media)
         await R._reset_flow(turn.state)
         return
     refs = video_references(loaded)
     prompt = video_prompt(instruction, len(refs))
     if not prompt.strip():
         await message.answer("Опишите, что должно происходить в ролике.")
+        await _restore_album(turn, media)
         await R._reset_flow(turn.state)
         return
     status = await _status(
         turn, "Запускаю ролик по этим фото. Это займёт несколько минут."
     )
+    delivered = False
     try:
-        video = await turn.assistant.generate_video(prompt, references=refs or None)
+        settings = video_settings_from(profile)
+        video = await turn.assistant.generate_video(
+            prompt,
+            references=refs or None,
+            aspect_ratio=settings.aspect_ratio,
+            duration=settings.duration,
+            resolution=settings.resolution,
+            generate_audio=settings.generate_audio,
+        )
         filename = video.filename or "video.mp4"
         payload = BufferedInputFile(video.data, filename=filename)
         try:
@@ -655,8 +724,22 @@ async def _generate_video(
                 )
             except Exception:
                 logger.exception("photo_video_document_failed", chat_id=media.chat_id)
-                await message.answer("Ролик готов, но отправить его в чат не удалось.")
+                from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
+
+                source = getattr(video, "source_url", None)
+                saved = False
+                if isinstance(source, str) and source:
+                    saved = await note_failed_video(
+                        media.chat_id, user_id, source, filename
+                    )
+                if saved:
+                    await message.answer(VIDEO_KEEP_TEXT)
+                else:
+                    await message.answer(
+                        "Ролик готов, но отправить его в чат не удалось."
+                    )
                 return
+        delivered = True
         await message.answer("Ролик готов.")
         await _remember_pair(
             turn,
@@ -677,7 +760,10 @@ async def _generate_video(
     finally:
         await cost_tracker.release_reservation(user_id)
         await _drop_status(turn, status)
-        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
+        if delivered:
+            await _release_album(turn, media, None)
+        else:
+            await _restore_album(turn, media)
         await R._reset_flow(turn.state)
 
 
@@ -696,10 +782,12 @@ async def _generate(
         await message.answer(
             f"⏳ Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
         )
+        await _settle_album(turn, media, None)
         return
     instruction = (decision.instruction_en or media.caption or "").strip()
     if not security.validate_prompt_length(instruction):
         await message.answer("⚠️ Запрос слишком длинный.")
+        await _settle_album(turn, media, None)
         return
     generate_model = M._image_model_of(profile, turn.assistant, chat_id=media.chat_id)
     size = M._stored_image_size(profile)
@@ -793,10 +881,7 @@ async def _generate(
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
-        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
-        if kept_file_id:
-            await _keep_result(turn, media, kept_file_id)
-        await R._reset_flow(turn.state)
+        await _settle_album(turn, media, kept_file_id)
 
 
 async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) -> None:

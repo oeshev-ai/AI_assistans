@@ -125,6 +125,7 @@ class VideoResult:
     cost_source: str | None = None
     provider_id: str | None = None
     model: str | None = None
+    source_url: str | None = None
 
 
 # Seedance 2.0: до 9 изображений-референсов и на Polza, и на ProxyAPI.
@@ -600,6 +601,8 @@ class MediaApiMixin(ProviderTransportMixin):
         model: str | None = None,
         duration: int | None = None,
         resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        generate_audio: bool | None = None,
         references: list[VideoReference] | None = None,
     ) -> VideoResult:
         """Создаёт видео-задачу, ждёт completion и скачивает mp4."""
@@ -627,6 +630,8 @@ class MediaApiMixin(ProviderTransportMixin):
                         prompt=sanitized_prompt,
                         duration=duration,
                         resolution=resolution,
+                        aspect_ratio=aspect_ratio,
+                        generate_audio=generate_audio,
                         references=checked_refs,
                         timeout=create_timeout,
                     )
@@ -636,6 +641,8 @@ class MediaApiMixin(ProviderTransportMixin):
                     prompt=sanitized_prompt,
                     duration=duration,
                     resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    generate_audio=generate_audio,
                     references=checked_refs,
                     timeout=create_timeout,
                 )
@@ -645,6 +652,10 @@ class MediaApiMixin(ProviderTransportMixin):
                 model=catalog_model,
                 prompt_chars=len(sanitized_prompt),
                 references=len(checked_refs),
+                aspect_ratio=aspect_ratio,
+                duration=duration,
+                resolution=resolution,
+                generate_audio=generate_audio,
             )
             result = await self._video_with_fallback(attempt)
             amount = result.cost_usd if result.cost_usd is not None else VIDEO_USD
@@ -670,6 +681,7 @@ class MediaApiMixin(ProviderTransportMixin):
         cost_rub: float | None = None,
         filename: str = "video.mp4",
         mime_type: str = "video/mp4",
+        source_url: str | None = None,
     ) -> VideoResult:
         """Assemble ``VideoResult`` with optional Polza ``cost_rub`` billing."""
         cost_usd: float | None = None
@@ -686,6 +698,7 @@ class MediaApiMixin(ProviderTransportMixin):
             cost_source=cost_source,
             provider_id=provider.id,
             model=model,
+            source_url=source_url,
         )
 
     async def _generate_video_polza(
@@ -696,6 +709,8 @@ class MediaApiMixin(ProviderTransportMixin):
         prompt: str,
         duration: int | None,
         resolution: str | None,
+        aspect_ratio: str | None,
+        generate_audio: bool | None,
         references: list[VideoReference],
         timeout: httpx.Timeout,
     ) -> VideoResult:
@@ -709,6 +724,8 @@ class MediaApiMixin(ProviderTransportMixin):
             prompt=prompt,
             duration=duration,
             resolution=resolution,
+            aspect_ratio=aspect_ratio or "16:9",
+            generate_audio=generate_audio,
             images=polza_reference_images(references) or None,
             poll_interval=max(
                 float(self.config.polza_poll_interval), _VIDEO_POLL_INTERVAL
@@ -758,7 +775,11 @@ class MediaApiMixin(ProviderTransportMixin):
                 exc.pending_kind = "video"
             raise
         return self._video_result(
-            provider, data=data, model=polza_model, cost_rub=media.cost_rub
+            provider,
+            data=data,
+            model=polza_model,
+            cost_rub=media.cost_rub,
+            source_url=content_url if content_url.startswith("https://") else None,
         )
 
     async def _generate_video_proxyapi(
@@ -769,6 +790,8 @@ class MediaApiMixin(ProviderTransportMixin):
         prompt: str,
         duration: int | None,
         resolution: str | None,
+        aspect_ratio: str | None,
+        generate_audio: bool | None,
         references: list[VideoReference],
         timeout: httpx.Timeout,
     ) -> VideoResult:
@@ -777,10 +800,14 @@ class MediaApiMixin(ProviderTransportMixin):
             "model": catalog_model,
             "prompt": prompt,
         }
+        if isinstance(aspect_ratio, str) and aspect_ratio.strip():
+            payload["aspect_ratio"] = aspect_ratio.strip()
         if isinstance(duration, int) and duration > 0:
             payload["duration"] = duration
         if isinstance(resolution, str) and resolution.strip():
             payload["resolution"] = resolution.strip()
+        if generate_audio is not None:
+            payload["generate_audio"] = bool(generate_audio)
         image_refs = proxy_input_references(references)
         if image_refs:
             payload["input_references"] = image_refs

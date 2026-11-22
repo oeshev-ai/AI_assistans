@@ -25,6 +25,12 @@ from app.llm.models_config import (
     resolve_text_model,
     resolve_tts_model,
 )
+from app.llm.video_settings import (
+    coerce_aspect_ratio,
+    coerce_duration,
+    coerce_generate_audio,
+    coerce_resolution,
+)
 from app.storage.history_storage import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
@@ -76,6 +82,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "Номера приходят в ответе generate_image; фото в сообщении нумеруются с нуля. "
     "В prompt называй их «первая картинка», «вторая картинка» в порядке этих номеров. "
     "Без reference_indexes в сервис уходит только текст. "
+    "Формат, длительность, разрешение и звук ролика берутся из настроек персоны. "
     "Если generate_video вернул ошибку, передай её смысл точно. "
     "Если в ошибке сказано, что попытки скачать готовый ролик продолжатся, "
     "так и скажи: новая генерация не запускается. "
@@ -133,6 +140,10 @@ class AssistantProfile(BaseModel):
     text_model: str | None = None
     image_model: str | None = None
     image_size: str | None = None
+    video_aspect_ratio: str | None = None
+    video_duration: int | None = None
+    video_resolution: str | None = None
+    video_generate_audio: bool | None = None
     vision_model: str | None = None
     voice_mode: Literal["off", "auto", "always"] = "auto"
     tts_model: str | None = None
@@ -146,6 +157,26 @@ class AssistantProfile(BaseModel):
     def _normalize_icon(cls, value: str) -> str:
         cleaned = value.strip() if isinstance(value, str) else ""
         return cleaned or "🤖"
+
+    @field_validator("video_aspect_ratio", mode="before")
+    @classmethod
+    def _video_aspect(cls, value: object) -> str | None:
+        return coerce_aspect_ratio(value)
+
+    @field_validator("video_duration", mode="before")
+    @classmethod
+    def _video_duration(cls, value: object) -> int | None:
+        return coerce_duration(value)
+
+    @field_validator("video_resolution", mode="before")
+    @classmethod
+    def _video_resolution(cls, value: object) -> str | None:
+        return coerce_resolution(value)
+
+    @field_validator("video_generate_audio", mode="before")
+    @classmethod
+    def _video_audio(cls, value: object) -> bool | None:
+        return coerce_generate_audio(value)
 
     @model_validator(mode="after")
     def _alias_legacy_models(self) -> AssistantProfile:

@@ -26,6 +26,7 @@ from app.bot.constants import (
     resolve_speechkit_role,
     speechkit_roles_for,
 )
+from app.llm.video_settings import parse_video_callback
 
 
 async def on_set_text_model(
@@ -83,6 +84,43 @@ async def on_set_text_menu(
 ) -> None:
     """Открывает выбор текстовой модели отдельным сообщением."""
     await R._open_model_menu(query, assistant, assistant_storage, state, kind="text")
+
+
+async def on_video_menu(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Открывает настройки ролика активной персоны отдельным сообщением."""
+    await R._open_model_menu(query, assistant, assistant_storage, state, kind="video")
+
+
+async def on_set_video(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Записывает формат, длину, разрешение или звук ролика активной персоны."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    parsed = parse_video_callback(query.data or "")
+    if parsed is None:
+        await query.answer("Неизвестная настройка", show_alert=True)
+        return
+    field, value, label = parsed
+    try:
+        profile = await R._active_profile(message.chat.id, assistant_storage)
+        updated = profile.model_copy(update={field: value})
+        await assistant_storage.save_assistant(message.chat.id, updated)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer(label)
+    text, markup = screens._model_picker_parts(updated, assistant, "video")
+    await R._edit_or_answer(query, text, markup)
 
 
 async def on_set_image_menu(

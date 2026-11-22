@@ -109,6 +109,11 @@ def test_video_words_are_not_a_still_image() -> None:
     assert asks_for_video("короткий ролик")
     assert not asks_for_video("нарисуй видеокарту")
     assert not asks_for_video("нарисуй в этом стиле")
+    assert not asks_for_video("нарисуй картинку, не видео")
+    assert not asks_for_video("без ролика, просто фото")
+    assert asks_for_video("сделай видео, только без анимации")
+    assert not asks_for_video("не делай видео, просто опиши")
+    assert not asks_for_video("без анимации, просто фото")
 
 
 def test_guard_accepts_video_without_a_base_photo() -> None:
@@ -148,6 +153,60 @@ async def test_still_image_request_stays_generate() -> None:
         ]
     )
     decision = await decide(router, _images(), "нарисуй постер")  # type: ignore[arg-type]
+    assert decision.intent == "generate"
+
+
+@pytest.mark.asyncio
+async def test_negated_video_is_not_forced() -> None:
+    router = _Router(
+        [
+            '{"intent":"generate","base_index":0,"instruction_en":"poster",'
+            '"confidence":0.9,"reference_indexes":[]}'
+        ]
+    )
+    decision = await decide(router, _images(), "нарисуй картинку, не видео")  # type: ignore[arg-type]
+    assert decision.intent == "generate"
+
+
+@pytest.mark.asyncio
+async def test_video_request_survives_a_side_constraint() -> None:
+    router = _Router(
+        [
+            '{"intent":"generate","base_index":0,"instruction_en":"she walks",'
+            '"instruction_ru":"идёт","confidence":0.9,"reference_indexes":[]}'
+        ]
+    )
+    decision = await decide(  # type: ignore[arg-type]
+        router, _images(), "сделай видео, только без анимации"
+    )
+    assert decision.intent == "video"
+
+
+@pytest.mark.asyncio
+async def test_explicit_refusal_drops_a_video_intent() -> None:
+    router = _Router(
+        [
+            '{"intent":"video","instruction_en":"she walks","instruction_ru":"идёт",'
+            '"confidence":0.9,"reference_indexes":[]}'
+        ]
+    )
+    decision = await decide(  # type: ignore[arg-type]
+        router, _images(), "не делай видео, просто опиши"
+    )
+    assert decision.intent == "analyze"
+
+
+@pytest.mark.asyncio
+async def test_refusal_keeps_a_draw_request() -> None:
+    router = _Router(
+        [
+            '{"intent":"video","instruction_en":"poster","instruction_ru":"постер",'
+            '"confidence":0.9,"reference_indexes":[]}'
+        ]
+    )
+    decision = await decide(  # type: ignore[arg-type]
+        router, _images(), "нарисуй картинку, не видео"
+    )
     assert decision.intent == "generate"
 
 
@@ -213,6 +272,7 @@ async def test_photo_video_sends_the_photos_as_references(
 
         async def generate_video(self, prompt: str, **kwargs: Any) -> SimpleNamespace:
             self.prompt = prompt
+            self.kwargs = kwargs
             self.references = list(kwargs.get("references") or [])
             return SimpleNamespace(data=b"mp4-bytes", filename="video.mp4")
 
@@ -256,6 +316,12 @@ async def test_photo_video_sends_the_photos_as_references(
             data=b"jpg-2",
         ),
     ]
+    profile = SimpleNamespace(
+        video_aspect_ratio="9:16",
+        video_duration=12,
+        video_resolution="480p",
+        video_generate_audio=True,
+    )
     await photo_flow._generate_video(
         SimpleNamespace(
             message=message,
@@ -272,6 +338,7 @@ async def test_photo_video_sends_the_photos_as_references(
             confidence=1,
         ),
         "topic",
+        profile,
     )
     assert assistant.references[0].data == b"jpg-1"
     assert assistant.references[1].data == b"jpg-2"
@@ -279,3 +346,7 @@ async def test_photo_video_sends_the_photos_as_references(
     assert "she walks down the street" in assistant.prompt
     assert message.videos == [b"mp4-bytes"]
     assert message.texts[-1] == "Ролик готов."
+    assert assistant.kwargs["aspect_ratio"] == "9:16"
+    assert assistant.kwargs["duration"] == 12
+    assert assistant.kwargs["resolution"] == "480p"
+    assert assistant.kwargs["generate_audio"] is True

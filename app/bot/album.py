@@ -246,8 +246,12 @@ class AlbumHub:
 
     async def _claim_photos(
         self, key: AlbumKey, local: list[IncomingPhoto]
-    ) -> list[IncomingPhoto] | None:
-        """Photos to flush, or ``None`` if a peer already claimed / claim unsafe."""
+    ) -> tuple[list[IncomingPhoto] | None, bool]:
+        """Photos to flush, and whether Redis refused the claim.
+
+        ``(None, False)`` — a peer holds the lock or already flushed.
+        ``(None, True)`` — Redis error: do not deliver a local copy, tell the user.
+        """
         won, remote = await self._redis_take(key)
         append_failed = key in self._append_failed
         self._append_failed.discard(key)
@@ -261,12 +265,12 @@ class AlbumHub:
                     chat_id=key[0],
                     user_id=key[1],
                 )
-                return None
-            return local
+                return None, True
+            return local, False
         if not won:
-            return None
+            return None, False
         if self._redis is None:
-            return local
+            return local, False
         if append_failed:
             merged = self._merge_photos(remote, local)
             logger.warning(
@@ -277,9 +281,9 @@ class AlbumHub:
                 chat_id=key[0],
                 user_id=key[1],
             )
-            return merged
+            return merged, False
         # Redis SoT: empty after a won lock ⇒ peer already flushed.
-        return remote
+        return remote, False
 
     async def _redis_clear(self, key: AlbumKey) -> None:
         if self._redis is None:
@@ -383,7 +387,11 @@ class AlbumHub:
                 batches.append((key, photos, services))
         delivered = False
         for key, photos, services in batches:
-            claimed = await self._claim_photos(key, photos)
+            claimed, failed_closed = await self._claim_photos(key, photos)
+            if failed_closed:
+                await _notify_album_lost(services)
+                delivered = True
+                continue
             if claimed is None or not claimed or services is None:
                 continue
             built = assemble_album(claimed, caption_override=text)
@@ -400,7 +408,10 @@ class AlbumHub:
             photos = self._buf.pop(key, None) or []
             services = self._latest.pop(key, None)
             self._tasks.pop(key, None)
-        claimed = await self._claim_photos(key, photos)
+        claimed, failed_closed = await self._claim_photos(key, photos)
+        if failed_closed:
+            await _notify_album_lost(services)
+            return
         if claimed is None or not claimed or services is None:
             return
         built = assemble_album(claimed)
@@ -416,6 +427,18 @@ class AlbumHub:
             await on_ready(built, services)
         except Exception:
             logger.exception("album_flush_failed", chat_id=key[0], user_id=key[1])
+
+
+async def _notify_album_lost(services: Any) -> None:
+    """Redis не отдал альбом: не молчим и не отдаём локальную копию."""
+    message = getattr(services, "message", None)
+    answer = getattr(message, "answer", None)
+    if answer is None:
+        return
+    try:
+        await answer("Не удалось собрать альбом. Пришлите фото ещё раз.")
+    except Exception:
+        logger.exception("album_claim_notify_failed")
 
 
 _hub: AlbumHub | None = None

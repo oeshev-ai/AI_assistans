@@ -196,8 +196,6 @@ _SCREEN_ASSISTANTS = "screen_assistants"
 _SCREEN_TOPICS = "screen_topics"
 _SCREEN_SETTINGS = "screen_settings"
 _SCREEN_PICKER = "screen_picker"
-_SCREEN_IMAGE = "screen_image"
-_SCREEN_PHOTO = "screen_photo"
 _SCREEN_PRESETS = "screen_presets"
 _MENU_ANCHOR = "menu_anchor"
 _CHROME = "chrome_ids"
@@ -208,8 +206,6 @@ _SCREEN_KEYS = (
     _SCREEN_TOPICS,
     _SCREEN_SETTINGS,
     _SCREEN_PICKER,
-    _SCREEN_IMAGE,
-    _SCREEN_PHOTO,
     _SCREEN_PRESETS,
 )
 _VOICE_MODE_LABELS: dict[str, str] = {
@@ -220,7 +216,6 @@ _VOICE_MODE_LABELS: dict[str, str] = {
 MSG_UNAVAILABLE = "⚠️ Сервис временно недоступен. Попробуйте позже."
 MSG_TIMEOUT = "⚠️ Превышено время ожидания."
 MSG_INTERNAL = "❌ Произошла внутренняя ошибка."
-MSG_IMAGE_FAILED = "Не удалось сгенерировать изображение."
 MSG_UPLOAD_PROCESS_FAILED = "Не удалось обработать загруженный файл."
 MSG_HISTORY = "⚠️ Временные проблемы с историей диалога. Попробуйте позже."
 MSG_PROFILE = "⚠️ Не удалось прочитать профиль ассистента. Попробуйте позже."
@@ -228,7 +223,6 @@ MSG_PROFILE = "⚠️ Не удалось прочитать профиль ас
 
 from app.bot.states import (
     EditAssistantSG,
-    ImageSG,
     NewAssistantSG,
     NewTopicSG,
     RenameTopicSG,

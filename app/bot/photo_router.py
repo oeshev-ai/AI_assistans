@@ -69,6 +69,16 @@ _VIDEO_ASK = re.compile(
     r"(?:видео|ролик|клип|анимац\w*|анимир\w*|ожив(?:и(?:ть|те)?|ить)|мультик)"
     r"(?![0-9a-zа-яё])"
 )
+# Отказ относится только к ближайшему слову: «не делай видео», «без ролика».
+# «без анимации» рядом с отдельным «видео» это ограничение, а не отказ от ролика.
+_VIDEO_NEGATED_WORD = (
+    r"(?:видео|ролик\w*|клип\w*|анимац\w*|анимир\w*|ожив\w*|мультик\w*)"
+)
+_VIDEO_NEGATION = re.compile(
+    rf"(?i)(?<![0-9a-zа-яё])(?:не|без)"
+    rf"(?:\s+(?!{_VIDEO_NEGATED_WORD})[0-9a-zа-яё]+){{0,2}}"
+    rf"\s+{_VIDEO_NEGATED_WORD}(?![0-9a-zа-яё])"
+)
 
 
 class PhotoDecision(BaseModel):
@@ -242,9 +252,41 @@ async def decide(
     return guarded
 
 
+def _negated_video_spans(text: str) -> list[tuple[int, int]]:
+    return [(match.start(), match.end()) for match in _VIDEO_NEGATION.finditer(text)]
+
+
 def asks_for_video(caption: str) -> bool:
-    """Подпись прямо просит ролик, а не неподвижную картинку."""
-    return _VIDEO_ASK.search(caption or "") is not None
+    """Подпись прямо просит ролик, а не неподвижную картинку.
+
+    Отрицание гасит только своё слово. «Сделай видео без анимации» остаётся
+    просьбой о ролике, «не делай видео» — нет.
+    """
+    text = caption or ""
+    covered = _negated_video_spans(text)
+    for match in _VIDEO_ASK.finditer(text):
+        if any(start <= match.start() < end for start, end in covered):
+            continue
+        return True
+    return False
+
+
+def rejects_video(caption: str) -> bool:
+    """Пользователь отказался от ролика и отдельно его не просил."""
+    text = caption or ""
+    return bool(_negated_video_spans(text)) and not asks_for_video(text)
+
+
+def _intent_instead_of_video(caption: str) -> str:
+    """Чем заменить ошибочный ``video``, если ролик прямо отвергнут."""
+    folded = caption.casefold()
+    if any(token in folded for token in ("опиши", "описать", "разбер", "посмотри")):
+        return "analyze"
+    if any(token in folded for token in ("нарисуй", "сгенерир", "постер", "картинк")):
+        return "generate"
+    if any(token in folded for token in ("измени", "поправь", "замени", "убери")):
+        return "edit"
+    return "analyze"
 
 
 def prefer_video(decision: PhotoDecision, caption: str) -> PhotoDecision:
@@ -252,7 +294,12 @@ def prefer_video(decision: PhotoDecision, caption: str) -> PhotoDecision:
 
     Роутер часто отвечает ``generate`` с высокой уверенностью.
     Слова «видео», «ролик», «клип», «анимация», «оживи» важнее этого ответа.
+    Прямой отказ («не видео», «не делай ролик») наоборот снимает ``video``.
     """
+    if rejects_video(caption) and decision.intent == "video":
+        return decision.model_copy(
+            update={"intent": _intent_instead_of_video(caption), "question_ru": None}
+        )
     if not asks_for_video(caption):
         return decision
     text = caption.strip()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -138,7 +139,7 @@ async def test_redis_take_error_fails_closed(
 
     await hub.add(1, 10, "g", _photo(3, "подпись"), "svc", on_ready)
     flushed = await hub.flush_text(1, 10, "из локального", on_ready)
-    assert flushed is False
+    assert flushed is True
     assert ready == []
 
 
@@ -166,6 +167,82 @@ async def test_append_failure_merges_local_on_claim(
     flushed = await hub.flush_text(1, 10, "merge", on_ready)
     assert flushed is True
     assert ready == [[4]]
+
+
+@pytest.mark.asyncio
+async def test_cancel_drops_open_album_when_pending_slot_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """«Отмена» гасит и слот, и альбом, который ещё собирается."""
+    import app.bot.album as album_module
+    from app.bot.handlers.chat import handle_text
+    from app.storage.pending_media import (
+        InMemoryPendingMediaStorage,
+        PendingMedia,
+        PendingMediaItem,
+    )
+
+    store = InMemoryPendingMediaStorage(ttl_seconds=30)
+    await store.put(
+        PendingMedia(
+            chat_id=7,
+            user_id=42,
+            assistant_id="asst",
+            items=[PendingMediaItem(file_id="kept", message_id=1)],
+        )
+    )
+    hub = AlbumHub(debounce=30)
+    ready: list[int] = []
+
+    async def on_ready(built, _services) -> None:  # type: ignore[no-untyped-def]
+        ready.append(len(built.photos))
+
+    previous = album_module._hub
+    album_module._hub = hub
+
+    async def _profile(_chat_id: int, _storage: object) -> SimpleNamespace:
+        return SimpleNamespace(id="asst")
+
+    async def _reset(_state: object) -> None:
+        return None
+
+    monkeypatch.setattr("app.bot.runtime._active_profile", _profile)
+    monkeypatch.setattr("app.bot.runtime._reset_flow", _reset)
+
+    class _Message:
+        text = "отмена"
+
+        class chat:
+            id = 7
+
+        class from_user:
+            id = 42
+
+        def __init__(self) -> None:
+            self.answers: list[str] = []
+
+        async def answer(self, text: str) -> None:
+            self.answers.append(text)
+
+    message = _Message()
+    try:
+        await hub.add(7, 42, "group", _photo(3), "svc", on_ready)
+        await handle_text(
+            message,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            store,
+        )
+        assert message.answers == ["Отменено."]
+        assert hub.has_pending(7, 42) is False
+        assert await store.get(7, "asst", 42) is None
+        await asyncio.sleep(0.05)
+        assert ready == []
+    finally:
+        album_module._hub = previous
+        await store.close()
 
 
 @pytest.fixture

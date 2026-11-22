@@ -13,7 +13,6 @@ from app.bot.constants import (
     _MENU_ASSISTANTS,
     _MENU_TOPICS,
     _SCREEN_ASSISTANTS,
-    _SCREEN_IMAGE,
     _SCREEN_KEYS,
     _SCREEN_PICKER,
     _SCREEN_SETTINGS,
@@ -22,7 +21,6 @@ from app.bot.constants import (
     DEFAULT_ASSISTANT_NAME,
     MAX_MEDIA_SIZE_MB,
     MSG_HISTORY,
-    MSG_IMAGE_FAILED,
     MSG_INTERNAL,
     MSG_PROFILE,
     MSG_TIMEOUT,
@@ -122,10 +120,8 @@ from app.bot.models import (  # noqa: F401
     _tts_voices_for,
     _vision_model_of,
 )
-from app.bot.states import (
-    ImageSG,
-)
 from app.infra.cost_tracker import prefer_cost_rub
+from app.llm.video_settings import VideoSettingsScope, video_settings_from
 
 
 async def _active_profile(chat_id: int, storage: AssistantStorage) -> AssistantProfile:
@@ -708,6 +704,9 @@ async def _answer_photo_bytes(
     Возвращает отправленное сообщение: из него берут ``file_id`` для
     следующей правки.
     """
+    from app.bot.image_retry import telegram_photo_needs_document
+
+    last_error: TelegramBadRequest | None = None
     for attempt in (1, 2):
         try:
             return await message.answer_photo(
@@ -715,11 +714,17 @@ async def _answer_photo_bytes(
                 request_timeout=120,
             )
         except TelegramBadRequest as exc:
-            if "IMAGE_PROCESS_FAILED" not in str(exc):
-                raise
-            logger.warning(
-                "telegram_image_process_failed", attempt=attempt, size=len(raw)
-            )
+            last_error = exc
+            if "IMAGE_PROCESS_FAILED" in str(exc) and attempt == 1:
+                logger.warning(
+                    "telegram_image_process_failed", attempt=attempt, size=len(raw)
+                )
+                continue
+            break
+    if last_error is None or not telegram_photo_needs_document(last_error):
+        if last_error is not None:
+            raise last_error
+        return None
     return await message.answer_document(
         document=BufferedInputFile(raw, filename=filename),
         request_timeout=120,
@@ -1014,12 +1019,13 @@ async def _process_user_message_locked(
     shown = ""
     last_edit = 0.0
     scope = ImageModelScope(profile.image_model, profile.image_size)
+    video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
     try:
         if message.bot is not None:
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, media_scope:
+        with scope, video_scope, media_scope:
             async for delta in assistant.stream_chat(
                 messages=history_copy, model=text_model
             ):
@@ -1615,12 +1621,13 @@ async def _process_vision_message_locked(
     shown = ""
     last_edit = 0.0
     scope = ImageModelScope(profile.image_model, profile.image_size)
+    video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
     try:
         if message.bot is not None:
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, media_scope:
+        with scope, video_scope, media_scope:
             async for delta in assistant.stream_chat(
                 messages=history_copy, model=vision_model
             ):
@@ -2210,68 +2217,6 @@ async def _open_topics(
     await _upsert_screen(message, state, _SCREEN_TOPICS, text, markup)
 
 
-async def _generate_and_send(
-    message: Message,
-    assistant: AssistAIClient,
-    prompt: str,
-    model: str | None,
-    size: str = "1024x1024",
-    *,
-    reply_markup: ReplyKeyboardMarkup | None = None,
-) -> None:
-    """Просит ProxyAPI нарисовать картинку и отправляет её в чат."""
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    bind_request_context(user_id=user_id, chat_id=message.chat.id)
-    note_active_user(user_id)
-    logger.info(
-        "image_generation",
-        model=model or assistant.config.default_image_model,
-        size=size,
-        prompt_chars=len(prompt),
-    )
-    set_billing_user(user_id)
-    keep = _KEEP_OUTGOING.set(True)
-    try:
-        progress = await message.answer("Генерирую изображение…")
-    finally:
-        _KEEP_OUTGOING.reset(keep)
-    try:
-        # Budget preflight живёт в AssistAIClient.generate_image (без двойной резервации).
-        images = await job_queue.generate_image(assistant, prompt, model, size)
-        await _delete_bot_message(progress)
-        if not images:
-            await message.answer(MSG_IMAGE_FAILED, reply_markup=reply_markup)
-            return
-        for index, image in enumerate(images):
-            await _send_generated_image(message, image, index)
-    except BudgetExceededError as exc:
-        await _delete_bot_message(progress)
-        await message.answer(exc.message, reply_markup=reply_markup)
-    except AssistAIError as exc:
-        logger.error("AssistAI ошибка: %s", exc.message)
-        await _delete_bot_message(progress)
-        from app.bot.image_retry import (
-            IMAGE_KEEP_TEXT,
-            IMAGE_RETRY_TEXT,
-            image_failure_reply,
-        )
-
-        text = await image_failure_reply(message.chat.id, user_id, exc)
-        if text not in {IMAGE_RETRY_TEXT, IMAGE_KEEP_TEXT}:
-            text = MSG_IMAGE_FAILED
-        await message.answer(text, reply_markup=reply_markup)
-    except httpx.TimeoutException:
-        logger.error("Таймаут генерации изображения")
-        await _delete_bot_message(progress)
-        await message.answer(MSG_TIMEOUT, reply_markup=reply_markup)
-    except Exception:
-        logger.exception("Непредвиденная ошибка генерации изображения")
-        await _delete_bot_message(progress)
-        await message.answer(MSG_INTERNAL, reply_markup=reply_markup)
-    finally:
-        await cost_tracker.release_reservation(user_id)
-
-
 async def _open_settings(
     message: Message,
     assistant: AssistAIClient,
@@ -2347,29 +2292,6 @@ async def _finish_topic_delete(
     text, markup = await _topics_screen(chat_id, assistant_id, topic_storage)
     menu = await _menu_for(chat_id, assistant_storage, topic_storage)
     return text, markup, menu
-
-
-async def _refresh_image_screen(
-    query: CallbackQuery, state: FSMContext, assistant: AssistAIClient
-) -> None:
-    """Обновляет экран картинки после выбора модели или размера."""
-    message = _query_message(query)
-    if message is None:
-        await query.answer()
-        return
-    data = await state.get_data()
-    selected = M._optional_model(data.get("image_model"))
-    model_id = selected or assistant.config.default_image_model
-    size = data.get("image_size")
-    allowed = M._size_choices(model_id)
-    if not isinstance(size, str) or size not in allowed:
-        size = M._default_image_size(model_id)
-        await state.update_data(image_size=size)
-    await state.set_state(ImageSG.config)
-    await query.answer()
-    text, markup = screens._image_view(selected, size, assistant)
-    await _edit_inline(message, text, markup)
-    await state.update_data({_SCREEN_IMAGE: message.message_id})
 
 
 async def _open_model_menu(

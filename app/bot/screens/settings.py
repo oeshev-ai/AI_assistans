@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from app.bot import models as M
 from app.bot.constants import (
     _VOICE_MODE_LABELS,
@@ -19,6 +21,100 @@ from app.bot.constants import (
     resolve_speechkit_role,
     speechkit_roles_for,
 )
+from app.llm.video_settings import (
+    VIDEO_ASPECT_RATIOS,
+    VIDEO_DURATIONS,
+    VIDEO_RESOLUTIONS,
+    video_settings_from,
+    video_settings_summary,
+)
+
+
+def _choice_rows(
+    items: tuple[object, ...],
+    selected: object,
+    *,
+    prefix: str,
+    label_of: Callable[[object], str],
+    per_row: int,
+) -> list[list[InlineKeyboardButton]]:
+    """Ряды кнопок выбора. Текущее значение помечено галочкой."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for item in items:
+        mark = "✅ " if item == selected else ""
+        row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{label_of(item)}",
+                callback_data=f"{prefix}{item}",
+            )
+        )
+        if len(row) >= per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+def _video_picker_parts(
+    profile: AssistantProfile,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран формата, длины, разрешения и звука ролика активной персоны."""
+    settings = video_settings_from(profile)
+    sound = "вкл" if settings.generate_audio else "выкл"
+    rows = _choice_rows(
+        VIDEO_ASPECT_RATIOS,
+        settings.aspect_ratio,
+        prefix="video:aspect:",
+        label_of=str,
+        per_row=3,
+    )
+    rows.extend(
+        _choice_rows(
+            VIDEO_DURATIONS,
+            settings.duration,
+            prefix="video:dur:",
+            label_of=lambda item: f"{item}с",
+            per_row=6,
+        )
+    )
+    rows.extend(
+        _choice_rows(
+            VIDEO_RESOLUTIONS,
+            settings.resolution,
+            prefix="video:res:",
+            label_of=str,
+            per_row=2,
+        )
+    )
+    audio_row: list[InlineKeyboardButton] = []
+    for enabled, label in ((False, "Без звука"), (True, "Со звуком")):
+        mark = "✅ " if settings.generate_audio is enabled else ""
+        flag = "1" if enabled else "0"
+        audio_row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{label}",
+                callback_data=f"video:audio:{flag}",
+            )
+        )
+    rows.append(audio_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово", callback_data="picker:done", style="success"
+            )
+        ]
+    )
+    text = (
+        f"Видео — «{profile.name}»\n"
+        f"Формат: {settings.aspect_ratio}\n"
+        f"Длительность: {settings.duration} с\n"
+        f"Разрешение: {settings.resolution}\n"
+        f"Звук: {sound}\n\n"
+        "Выберите формат, длительность, разрешение или звук."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _model_picker_parts(
@@ -26,6 +122,8 @@ def _model_picker_parts(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Текст и кнопки выбора модели активной персоны."""
     rows: list[list[InlineKeyboardButton]] = []
+    if kind == "video":
+        return _video_picker_parts(profile)
     if kind == "image":
         current = M._chosen_model_line(
             profile.image_model, assistant.config.default_image_model
@@ -224,6 +322,7 @@ def _settings_persona_view(
     lines.extend(
         [
             f"Размер картинки: {shown_size}",
+            f"Видео: {video_settings_summary(video_settings_from(profile))}",
             (
                 "TTS модель: "
                 f"{M._chosen_model_line(profile.tts_model, assistant.config.default_tts_model)}"
@@ -256,6 +355,12 @@ def _settings_persona_view(
             InlineKeyboardButton(
                 text="Модель изображений",
                 callback_data="set_image_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Видео",
+                callback_data="video_menu",
             )
         ],
         [

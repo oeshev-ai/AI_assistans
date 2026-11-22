@@ -185,9 +185,8 @@ async def edit_image_task(
 ) -> list[str]:
     """Достаёт файлы правки из Redis и вызывает ``edit_images``.
 
-    Payload удаляется только после успеха: при crash/restart worker arq может
-    перезапустить job, пока ключ жив (TTL 600s). Обычный AssistAIError не
-    ретраится сам по себе — caller не должен удалять ключ раньше TTL.
+    Payload удаляется только после успеха. ``max_tries=1``: падение воркера
+    не запускает вторую платную задачу. Ключ доживает до TTL и потом исчезает.
     """
     assistant: AssistAIClient = ctx["assistant"]
     _bind_billing_user(billing_user_id)
@@ -288,4 +287,6 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = redis_settings()
     max_jobs = env_int("ARQ_MAX_JOBS", 10)
-    job_timeout = env_int("ARQ_JOB_TIMEOUT", 300)
+    # Одна попытка: повтор после падения создал бы вторую платную задачу.
+    max_tries = 1
+    job_timeout = env_int("ARQ_JOB_TIMEOUT", 450)

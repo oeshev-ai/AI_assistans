@@ -30,18 +30,3 @@ class RenameTopicSG(StatesGroup):
     """Шаг ввода нового названия темы."""
 
     name = State()
-
-
-class ImageSG(StatesGroup):
-    """Экран выбора модели и размера, затем описание картинки."""
-
-    config = State()
-    prompt = State()
-
-
-class PhotoSG(StatesGroup):
-    """Фото: экран действия, инструкция правки или вопрос."""
-
-    action = State()
-    edit_instruction = State()
-    question = State()

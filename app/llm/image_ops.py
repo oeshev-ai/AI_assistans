@@ -234,10 +234,13 @@ class GenerateImageTool(BaseTool):
         if selected_model is None:
             selected_model = _REQUEST_IMAGE_MODEL.get()
         try:
-            images = await self._client.generate_image(
-                prompt=prompt.strip(),
-                model=selected_model,
-                size=size.strip(),
+            import app.infra.job_queue as job_queue
+
+            images = await job_queue.generate_image(
+                self._client,
+                prompt.strip(),
+                selected_model,
+                size.strip(),
             )
         except BudgetExceededError as exc:
             logger.warning("generate_image_budget_exceeded", error=exc.message)

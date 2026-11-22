@@ -38,6 +38,23 @@ IMAGE_EXPIRED_TEXT = (
 )
 IMAGE_LATE_CAPTION = "Готовая картинка. Файл с сервера дошёл не сразу."
 
+_PHOTO_DOCUMENT_MARKERS = (
+    "IMAGE_PROCESS_FAILED",
+    "PHOTO_INVALID_DIMENSIONS",
+    "PHOTO_SAVE_FILE_INVALID",
+    "PHOTO_INVALID",
+    "FILE_PARTS_INVALID",
+    "FILE IS TOO BIG",
+    "WRONG TYPE",
+    "CAN'T PARSE",
+)
+
+
+def telegram_photo_needs_document(exc: BaseException) -> bool:
+    """Telegram не принял sendPhoto: файл ещё можно отдать документом."""
+    text = str(exc).upper()
+    return any(marker in text for marker in _PHOTO_DOCUMENT_MARKERS)
+
 Download = Callable[[str], Awaitable[bytes]]
 Resume = Callable[[str, str], Awaitable[bytes]]
 _STOP_CODES = frozenset({"FAILED", "NOT_FOUND", "BAD_REQUEST"})
@@ -246,7 +263,7 @@ async def _send_bytes(bot: Bot, chat_id: int, raw: bytes, filename: str) -> None
             request_timeout=120,
         )
     except TelegramBadRequest as exc:
-        if "IMAGE_PROCESS_FAILED" not in str(exc):
+        if not telegram_photo_needs_document(exc):
             raise
         await bot.send_document(
             chat_id,

@@ -10,6 +10,7 @@ from app.bot.image_retry import (
     IMAGE_RETRY_TEXT,
     bind_image_delivery,
     deliver_due,
+    telegram_photo_needs_document,
 )
 from app.bot.runtime import _send_generated_image
 from app.llm.errors import AssistAIError
@@ -189,3 +190,10 @@ async def test_redis_roundtrip_keeps_ttl_from_the_first_save() -> None:
     assert redis.ttl["image_delivery:3:4"] == IMAGE_DELIVERY_TTL_SECONDS - 100
     await store.delete(3, 4)
     assert await store.due(10**12) == []
+
+
+def test_photo_size_and_type_errors_fall_back_to_document() -> None:
+    assert telegram_photo_needs_document(RuntimeError("IMAGE_PROCESS_FAILED"))
+    assert telegram_photo_needs_document(RuntimeError("PHOTO_INVALID_DIMENSIONS"))
+    assert telegram_photo_needs_document(RuntimeError("file is too big"))
+    assert not telegram_photo_needs_document(RuntimeError("bot was blocked by the user"))
