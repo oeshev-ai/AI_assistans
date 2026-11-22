@@ -285,14 +285,14 @@ async def edit_images(
             logger.warning("arq_edit_enqueue_failed", error=str(exc))
             try:
                 await _pool.delete(key)
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.debug("arq_edit_payload_cleanup_failed", error=str(cleanup_exc))
             raise _arq_enqueue_failed("edit_image_task") from exc
         if job is None:
             try:
                 await _pool.delete(key)
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.debug("arq_edit_payload_cleanup_failed", error=str(cleanup_exc))
             raise _arq_enqueue_failed("edit_image_task")
         logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
         try:
@@ -398,14 +398,14 @@ async def transcribe_audio(
             logger.warning("arq_stt_enqueue_failed", error=str(exc))
             try:
                 await _pool.delete(key)
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.debug("arq_stt_payload_cleanup_failed", error=str(cleanup_exc))
             raise _arq_enqueue_failed("transcribe_audio_task") from exc
         if job is None:
             try:
                 await _pool.delete(key)
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                logger.debug("arq_stt_payload_cleanup_failed", error=str(cleanup_exc))
             raise _arq_enqueue_failed("transcribe_audio_task")
         logger.info("arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id)
         try:

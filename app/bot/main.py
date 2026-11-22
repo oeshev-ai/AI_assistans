@@ -101,7 +101,14 @@ def init_sentry() -> None:
     """Initialize Sentry when ``SENTRY_DSN`` is present."""
     dsn = os.getenv("SENTRY_DSN", "").strip()
     if not dsn:
-        logger.warning("sentry_disabled", reason="SENTRY_DSN not set")
+        if is_production():
+            logger.error(
+                "sentry_disabled",
+                reason="SENTRY_DSN not set",
+                hint="Set SENTRY_DSN in .env for production error tracking",
+            )
+        else:
+            logger.warning("sentry_disabled", reason="SENTRY_DSN not set")
         return
     sentry_sdk.init(
         dsn=dsn,
@@ -118,6 +125,18 @@ def init_sentry() -> None:
     logger.info(
         "sentry_initialized",
         environment=os.getenv("ENVIRONMENT", "development"),
+    )
+
+
+def warn_polza_user_hash_secret() -> None:
+    """In production, plain SHA256 user hashes are dictionary-guessable."""
+    if not is_production():
+        return
+    if (os.getenv("POLZA_USER_HASH_SECRET") or "").strip():
+        return
+    logger.error(
+        "polza_user_hash_secret_missing",
+        hint="Set POLZA_USER_HASH_SECRET in .env for HMAC aliases to Polza",
     )
 
 
@@ -218,8 +237,8 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
             await topic_storage.close()
         try:
             await job_queue.close_job_queue()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("job_queue_close_failed", error=str(exc))
         if shared_redis is not None:
             await shared_redis.aclose()
         raise
@@ -420,6 +439,7 @@ async def main() -> None:
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     load_dotenv()
     init_sentry()
+    warn_polza_user_hash_secret()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         logger.error("telegram_token_missing")

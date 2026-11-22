@@ -67,8 +67,12 @@ async def on_upload_cancel(
         if isinstance(query.message, Message):
             try:
                 await query.message.edit_reply_markup(reply_markup=None)
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "upload_cancel_markup_gone",
+                    chat_id=chat_id,
+                    error=str(exc),
+                )
         await bot.send_message(chat_id, "Ссылка уже недействительна или устарела.")
         return
     if session.status not in {"pending"}:

@@ -1,8 +1,8 @@
-"""Списки моделей ProxyAPI для кнопок бота.
+"""Каталог моделей для кнопок бота (общие id Polza / ProxyAPI).
 
-Идентификаторы взяты из каталога https://proxyapi.ru/models/browse.
-Каталог не запрашивается при каждом нажатии. Пустой выбор в профиле
-означает модель по умолчанию из ``AssistAIConfig``.
+Списки статичны: каталог провайдера при нажатии не запрашивается.
+Пустой выбор в профиле → модель по умолчанию из ``AssistAIConfig``.
+Часть id на Polza подменяется через ``POLZA_*_MODEL_ALIASES``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
     "qwen/qwen4-max",
 )
 
-# Картинки: GPT Image 2.6 — основная; FLUX, Qwen и Recraft — свои поля размера.
+# Картинки: GPT Image 2.6 — основная; FLUX, Qwen и Nano Banana — свои поля размера.
 AVAILABLE_IMAGE_MODELS: tuple[str, ...] = (
     "openai/gpt-image-2.6-flare",
     "black-forest-labs/flux-3-image-klein",

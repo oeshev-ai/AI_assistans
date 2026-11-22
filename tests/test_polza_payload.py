@@ -118,6 +118,17 @@ def test_user_is_hashed_and_bounded() -> None:
     assert _body(user=hashed)["user"] == hashed
 
 
+def test_user_hash_uses_hmac_when_secret_set(monkeypatch) -> None:
+    monkeypatch.delenv("POLZA_USER_HASH_SECRET", raising=False)
+    plain = hash_user_id(123456789)
+    monkeypatch.setenv("POLZA_USER_HASH_SECRET", "unit-test-secret")
+    hmac_digest = hash_user_id(123456789)
+    assert hmac_digest is not None
+    assert hmac_digest != plain
+    assert "123456789" not in hmac_digest
+    assert len(hmac_digest) <= 256
+
+
 @pytest.mark.parametrize(
     ("size", "expected"),
     [

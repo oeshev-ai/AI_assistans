@@ -16,6 +16,7 @@ from redis.exceptions import RedisError
 
 from app.llm.media_api import paid_job_id, polza_cdn_url
 from app.storage.image_delivery import retry_delay_seconds
+from app.storage.redis_await import await_redis
 
 logger = structlog.get_logger("video_delivery")
 
@@ -235,7 +236,7 @@ class RedisVideoDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
             return True
         except RedisError:
             logger.warning("video_delivery_store_failed", chat_id=chat_id)
@@ -243,7 +244,7 @@ class RedisVideoDeliveryStore:
 
     async def due(self, now: float) -> list[VideoDelivery]:
         try:
-            keys = await self._redis.smembers(_INDEX_KEY)
+            keys = await await_redis(self._redis.smembers(_INDEX_KEY))
         except RedisError:
             logger.warning("video_delivery_index_failed")
             return []
@@ -257,9 +258,13 @@ class RedisVideoDeliveryStore:
                 continue
             if record is None:
                 try:
-                    await self._redis.srem(_INDEX_KEY, text_key)
-                except RedisError:
-                    pass
+                    await await_redis(self._redis.srem(_INDEX_KEY, text_key))
+                except RedisError as exc:
+                    logger.debug(
+                        "video_delivery_index_prune_failed",
+                        key=text_key,
+                        error=str(exc),
+                    )
                 continue
             if record.expired(now) or record.not_before <= now:
                 found.append(record)
@@ -274,7 +279,7 @@ class RedisVideoDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
         except RedisError:
             logger.warning("video_delivery_store_failed", chat_id=record.chat_id)
 
@@ -305,7 +310,7 @@ class RedisVideoDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
             return True
         except RedisError:
             logger.warning("video_delivery_store_failed", chat_id=chat_id)
@@ -315,7 +320,7 @@ class RedisVideoDeliveryStore:
         key = self._key(chat_id, user_id)
         try:
             await self._redis.delete(key)
-            await self._redis.srem(_INDEX_KEY, key)
+            await await_redis(self._redis.srem(_INDEX_KEY, key))
         except RedisError:
             logger.warning("video_delivery_delete_failed", chat_id=chat_id)
 

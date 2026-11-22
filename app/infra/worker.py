@@ -1,4 +1,4 @@
-"""arq worker process for heavy ProxyAPI jobs.
+"""arq worker for heavy media jobs (images / TTS / STT).
 
 Run (Docker Compose / repo root shim ``worker.py``)::
 
@@ -8,8 +8,9 @@ Equivalent package path::
 
     arq app.infra.worker.WorkerSettings
 
-Requires ``REDIS_URL`` and ``PROXYAPI_API_KEY``. Enable with ``ARQ_ENABLED=1``
-and ``docker compose --profile arq up -d``.
+Needs ``REDIS_URL`` and provider keys from ``.env`` (``POLZA_API_KEY`` and
+``PROXYAPI_API_KEY`` with the default Polza + fallback layout). Enable with
+``ARQ_ENABLED=1`` and ``docker compose --profile arq up -d --build``.
 """
 
 from __future__ import annotations
@@ -27,12 +28,24 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 
+from app.infra.access import is_production
 from app.infra.envparse import env_int
 from app.infra.logging_setup import configure_logging
 from app.llm.assist_ai import AssistAIClient, AssistAIConfig
 
 configure_logging()
 logger = structlog.get_logger("worker")
+
+
+def _warn_polza_user_hash_secret() -> None:
+    if not is_production():
+        return
+    if (os.getenv("POLZA_USER_HASH_SECRET") or "").strip():
+        return
+    logger.error(
+        "polza_user_hash_secret_missing",
+        hint="Set POLZA_USER_HASH_SECRET in .env for HMAC aliases to Polza",
+    )
 
 
 def redis_settings() -> Any:
@@ -94,6 +107,7 @@ async def startup(ctx: dict[str, Any]) -> None:
         logger.error("arq_timeout_misconfigured", error=str(exc))
         raise SystemExit(1) from exc
 
+    _warn_polza_user_hash_secret()
     ctx["assistant"] = AssistAIClient(AssistAIConfig.from_env())
     cost_tracker.require_llm_budgets_configured()
     redis_url = os.getenv("REDIS_URL", "").strip()

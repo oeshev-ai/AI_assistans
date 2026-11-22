@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app.llm.media_api import paid_job_id, public_https_image_url
+from app.storage.redis_await import await_redis
 
 logger = structlog.get_logger("image_delivery")
 
@@ -240,7 +241,7 @@ class RedisImageDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
             return True
         except RedisError:
             logger.warning("image_delivery_store_failed", chat_id=chat_id)
@@ -248,7 +249,7 @@ class RedisImageDeliveryStore:
 
     async def due(self, now: float) -> list[ImageDelivery]:
         try:
-            keys = await self._redis.smembers(_INDEX_KEY)
+            keys = await await_redis(self._redis.smembers(_INDEX_KEY))
         except RedisError:
             logger.warning("image_delivery_index_failed")
             return []
@@ -262,9 +263,13 @@ class RedisImageDeliveryStore:
                 continue
             if record is None:
                 try:
-                    await self._redis.srem(_INDEX_KEY, text_key)
-                except RedisError:
-                    pass
+                    await await_redis(self._redis.srem(_INDEX_KEY, text_key))
+                except RedisError as exc:
+                    logger.debug(
+                        "image_delivery_index_prune_failed",
+                        key=text_key,
+                        error=str(exc),
+                    )
                 continue
             if record.expired(now) or record.not_before <= now:
                 found.append(record)
@@ -279,7 +284,7 @@ class RedisImageDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
         except RedisError:
             logger.warning("image_delivery_store_failed", chat_id=record.chat_id)
 
@@ -310,7 +315,7 @@ class RedisImageDeliveryStore:
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
-            await self._redis.sadd(_INDEX_KEY, key)
+            await await_redis(self._redis.sadd(_INDEX_KEY, key))
             return True
         except RedisError:
             logger.warning("image_delivery_store_failed", chat_id=chat_id)
@@ -320,7 +325,7 @@ class RedisImageDeliveryStore:
         key = self._key(chat_id, user_id)
         try:
             await self._redis.delete(key)
-            await self._redis.srem(_INDEX_KEY, key)
+            await await_redis(self._redis.srem(_INDEX_KEY, key))
         except RedisError:
             logger.warning("image_delivery_delete_failed", chat_id=chat_id)
 

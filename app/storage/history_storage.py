@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Awaitable
@@ -387,11 +388,17 @@ class RedisChatHistoryStorage(ChatHistoryStorage):
 
 
 async def create_storage(config: RedisConfig) -> ChatHistoryStorage:
-    """Возвращает Redis, если ``REDIS_URL`` задан и сервер отвечает.
+    """Legacy flat history factory (bot does not call this).
 
-    Пустой URL или недоступный Redis дают память процесса вне production.
-    В production — fail-closed (как темы и FSM), без тихой деградации.
+    Prefer ``topic_history.create_topic_storage``. Kept for ``RedisConfig``,
+    ``trim_messages``, and fail-closed tests. Empty/unreachable Redis →
+    in-memory outside production; production stays fail-closed.
     """
+    warnings.warn(
+        "create_storage is legacy; use TopicHistoryStorage / create_topic_storage",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     from app.infra.access import is_production
 
     if not config.redis_url:

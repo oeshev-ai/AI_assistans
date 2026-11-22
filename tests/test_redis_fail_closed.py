@@ -17,6 +17,11 @@ from app.storage.history_storage import (
 from app.storage.pending_media import create_pending_media_storage
 from app.storage.topic_history import create_topic_storage
 
+# create_storage is legacy and emits DeprecationWarning on purpose.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:create_storage is legacy:DeprecationWarning"
+)
+
 
 @pytest.mark.asyncio
 async def test_pending_media_empty_url_fatal_in_production(

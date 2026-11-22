@@ -414,8 +414,13 @@ async def sg_new_assistant_prompt(
     if isinstance(prev_id, int) and bot is not None:
         try:
             await bot.delete_message(chat_id=message.chat.id, message_id=prev_id)
-        except TelegramBadRequest:
-            pass
+        except TelegramBadRequest as exc:
+            logger.debug(
+                "draft_screen_delete_gone",
+                chat_id=message.chat.id,
+                message_id=prev_id,
+                error=str(exc),
+            )
         await R._forget_message_screens(state, prev_id)
     data = await state.get_data()
     sent = await message.answer(
