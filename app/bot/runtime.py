@@ -690,31 +690,37 @@ async def _send_extracted_images(
             continue
         try:
             await _send_generated_image(message, value, index)
+        except AssistAIError as exc:
+            logger.warning("generated_image_not_delivered", chat_id=message.chat.id)
+            await message.answer(exc.message)
         except Exception:
             logger.exception("Не удалось отправить изображение из generate_image")
 
 
-async def _answer_photo_bytes(message: Message, raw: bytes, filename: str) -> None:
+async def _answer_photo_bytes(
+    message: Message, raw: bytes, filename: str
+) -> Message | None:
     """Фото, а при ``IMAGE_PROCESS_FAILED`` — повтор и затем документ.
 
     Telegram отдаёт ``IMAGE_PROCESS_FAILED`` и на валидный файл, который
     через минуту принимает без изменений. ``sendDocument`` картинку не
     обрабатывает, поэтому оплаченный результат всё равно доходит.
+    Возвращает отправленное сообщение: из него берут ``file_id`` для
+    следующей правки.
     """
     for attempt in (1, 2):
         try:
-            await message.answer_photo(
+            return await message.answer_photo(
                 photo=BufferedInputFile(raw, filename=filename),
                 request_timeout=120,
             )
-            return
         except TelegramBadRequest as exc:
             if "IMAGE_PROCESS_FAILED" not in str(exc):
                 raise
             logger.warning(
                 "telegram_image_process_failed", attempt=attempt, size=len(raw)
             )
-    await message.answer_document(
+    return await message.answer_document(
         document=BufferedInputFile(raw, filename=filename),
         request_timeout=120,
     )
@@ -726,7 +732,25 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
         try:
             if item.kind == "image":
                 if item.url:
-                    raw = await _download_image_url(item.url)
+                    try:
+                        raw = await _download_image_url(item.url)
+                    except AssistAIError:
+                        from app.bot.image_retry import (
+                            IMAGE_RETRY_TEXT,
+                            note_failed_image,
+                        )
+
+                        user_id = (
+                            message.from_user.id
+                            if message.from_user
+                            else message.chat.id
+                        )
+                        if await note_failed_image(
+                            message.chat.id, user_id, item.url, item.filename
+                        ):
+                            await message.answer(IMAGE_RETRY_TEXT)
+                            continue
+                        raise
                     await _answer_photo_bytes(message, raw, item.filename)
                 elif item.data:
                     await _answer_photo_bytes(message, item.data, item.filename)
@@ -741,9 +765,13 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
             elif item.kind == "video":
                 if not item.data:
                     continue
-                await message.answer_video(
-                    video=BufferedInputFile(item.data, filename=item.filename)
-                )
+                payload = BufferedInputFile(item.data, filename=item.filename)
+                try:
+                    await message.answer_video(video=payload)
+                except TelegramBadRequest:
+                    await message.answer_document(
+                        document=BufferedInputFile(item.data, filename=item.filename)
+                    )
             elif item.kind == "document":
                 if not item.data:
                     continue
@@ -756,7 +784,9 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
             )
 
 
-async def _send_generated_image(message: Message, image: str, index: int) -> None:
+async def _send_generated_image(
+    message: Message, image: str, index: int
+) -> Message | None:
     """URL сначала качается ботом, затем уходит файлом; base64 — сразу файлом.
 
     Сырой URL Telegram часто не достаёт (``failed to get HTTP URL content``).
@@ -766,7 +796,15 @@ async def _send_generated_image(message: Message, image: str, index: int) -> Non
     """
     filename = "image.png" if index == 0 else f"image_{index + 1}.png"
     if _is_http_url(image):
-        raw = await _download_image_url(image)
+        try:
+            raw = await _download_image_url(image)
+        except AssistAIError:
+            from app.bot.image_retry import IMAGE_RETRY_TEXT, note_failed_image
+
+            user_id = message.from_user.id if message.from_user else message.chat.id
+            if await note_failed_image(message.chat.id, user_id, image, filename):
+                raise AssistAIError(IMAGE_RETRY_TEXT) from None
+            raise
     else:
         try:
             raw = base64.b64decode(image, validate=False)
@@ -776,7 +814,7 @@ async def _send_generated_image(message: Message, image: str, index: int) -> Non
             ) from exc
     if not raw:
         raise AssistAIError("Провайдер вернул пустое изображение.")
-    await _answer_photo_bytes(message, raw, filename)
+    return await _answer_photo_bytes(message, raw, filename)
 
 
 async def _send_voice_reply(
@@ -2212,7 +2250,16 @@ async def _generate_and_send(
     except AssistAIError as exc:
         logger.error("AssistAI ошибка: %s", exc.message)
         await _delete_bot_message(progress)
-        await message.answer(MSG_IMAGE_FAILED, reply_markup=reply_markup)
+        from app.bot.image_retry import (
+            IMAGE_KEEP_TEXT,
+            IMAGE_RETRY_TEXT,
+            image_failure_reply,
+        )
+
+        text = await image_failure_reply(message.chat.id, user_id, exc)
+        if text not in {IMAGE_RETRY_TEXT, IMAGE_KEEP_TEXT}:
+            text = MSG_IMAGE_FAILED
+        await message.answer(text, reply_markup=reply_markup)
     except httpx.TimeoutException:
         logger.error("Таймаут генерации изображения")
         await _delete_bot_message(progress)

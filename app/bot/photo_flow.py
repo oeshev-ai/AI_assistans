@@ -9,7 +9,7 @@ import structlog
 
 from app.bot import models as M
 from app.bot import runtime as R
-from app.bot.photo_router import PhotoDecision, decide
+from app.bot.photo_router import PhotoDecision, asks_for_video, decide
 from app.infra.cost_tracker import (
     BudgetExceededError,
     cost_tracker,
@@ -36,7 +36,11 @@ from app.media.media_tools import (
     set_user_media,
 )
 from app.storage.assistant_storage import compose_system_prompt
-from app.storage.pending_media import PendingMedia, PendingMediaStorage
+from app.storage.pending_media import (
+    PendingMedia,
+    PendingMediaItem,
+    PendingMediaStorage,
+)
 
 logger = structlog.get_logger("photo_flow")
 
@@ -221,6 +225,71 @@ async def route_album(
     )
 
 
+def result_file_id(sent: Any) -> str | None:
+    """``file_id`` самого крупного фото или документа отправленного результата."""
+    photos = getattr(sent, "photo", None)
+    if photos:
+        file_id = getattr(photos[-1], "file_id", None)
+        if isinstance(file_id, str) and file_id:
+            return file_id
+    document = getattr(sent, "document", None)
+    file_id = getattr(document, "file_id", None) if document is not None else None
+    if isinstance(file_id, str) and file_id:
+        return file_id
+    return None
+
+
+def caption_from_resend(context: list[dict[str, Any]]) -> str | None:
+    """Прошлая просьба, если ассистент просил прислать фото снова.
+
+    ``[Альбом: …]`` и обычный диалог без такой просьбы не становятся подписью.
+    """
+    last_user = ""
+    last_assistant = ""
+    for item in context:
+        role = item.get("role")
+        content = item.get("content")
+        if not isinstance(content, str):
+            continue
+        if role == "user":
+            last_user = content.strip()
+        elif role == "assistant":
+            last_assistant = content.strip()
+    if not last_user or last_user.startswith("[Альбом") or not last_assistant:
+        return None
+    folded = last_assistant.casefold()
+    asks = any(
+        hint in folded for hint in ("недоступ", "пришлите", "прислать", "пришли")
+    )
+    mentions = "фото" in folded or "картинк" in folded
+    if asks and mentions:
+        return last_user
+    return None
+
+
+def followup_media(media: PendingMedia, file_id: str) -> PendingMedia:
+    """Одно фото результата с пустой подписью — база для следующей фразы."""
+    return PendingMedia(
+        chat_id=media.chat_id,
+        user_id=media.user_id,
+        assistant_id=media.assistant_id,
+        items=[
+            PendingMediaItem(
+                file_id=file_id,
+                message_id=0,
+                filename="result.png",
+                mime_type="image/png",
+            )
+        ],
+        caption="",
+        topic_id=media.topic_id,
+    )
+
+
+async def _keep_result(turn: Any, media: PendingMedia, file_id: str) -> None:
+    await turn.pending.put(followup_media(media, file_id))
+
+
 async def _decision(
     turn: Any,
     media: PendingMedia,
@@ -228,15 +297,26 @@ async def _decision(
     topic_id: str,
 ) -> PhotoDecision:
     caption = media.caption.strip()
+    context: list[dict[str, Any]] | None = None
     if not caption:
         # Прошлая правка лежит в истории темы как реплика пользователя.
-        # Без новой подписи роутер принимает её за команду к этому фото.
-        return PhotoDecision(
-            intent="unclear",
-            question_ru="Опишите, что сделать с фото одним сообщением.",
-            confidence=0.0,
+        # Без новой подписи роутер принимает её за команду к этому фото,
+        # кроме случая, когда ассистент только что просил прислать снимок снова.
+        context = await _text_context(
+            turn.topic_storage, media.chat_id, media.assistant_id, topic_id
         )
-    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1":
+        reused = caption_from_resend(context)
+        if not reused:
+            return PhotoDecision(
+                intent="unclear",
+                question_ru="Опишите, что сделать с фото одним сообщением.",
+                confidence=0.0,
+            )
+        caption = reused
+        media.caption = reused
+    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1" and not asks_for_video(
+        caption
+    ):
         from app.bot.photo_routing import resolve_roles
 
         roles = resolve_roles(caption, len(images), base_override=media.base_override)
@@ -251,10 +331,19 @@ async def _decision(
                 instruction_ru=caption,
                 confidence=1.0,
             )
-    context = await _text_context(
-        turn.topic_storage, media.chat_id, media.assistant_id, topic_id
+    if context is None:
+        context = await _text_context(
+            turn.topic_storage, media.chat_id, media.assistant_id, topic_id
+        )
+    # Ответ на уже заданный вопрос не отбрасываем из-за низкой уверенности.
+    answered = media.clarify_rounds >= 1
+    return await decide(
+        turn.assistant,
+        images,
+        caption,
+        context,
+        min_confidence=0.0 if answered else None,
     )
-    return await decide(turn.assistant, images, caption, context)
 
 
 async def _execute(
@@ -287,20 +376,29 @@ async def _execute(
             return
     if decision.intent == "chat":
         text = media.caption.strip() or (decision.instruction_ru or "")
-        if text:
-            await R._process_user_message(
-                message,
-                turn.assistant,
-                turn.topic_storage,
-                turn.assistant_storage,
-                turn.state,
-                user_text=security.sanitize_prompt(text),
-                input_kind="text",
-            )
+        try:
+            if text:
+                await R._process_user_message(
+                    message,
+                    turn.assistant,
+                    turn.topic_storage,
+                    turn.assistant_storage,
+                    turn.state,
+                    user_text=security.sanitize_prompt(text),
+                    input_kind="text",
+                )
+        finally:
+            media.caption = ""
+            media.clarify_rounds = 0
+            media.last_question = None
+            await turn.pending.put(media)
         return
     if decision.intent in {"analyze", "ocr", "compare"}:
         await _analyze(turn, media, loaded, decision)
         await R._reset_flow(turn.state)
+        return
+    if decision.intent == "video":
+        await _generate_video(turn, media, loaded, decision, topic_id)
         return
     if decision.intent == "generate":
         await _generate(turn, media, profile, loaded, decision, topic_id)
@@ -393,6 +491,7 @@ async def _edit(
     )
     status = await _status(turn, "Правлю изображение…")
     token = set_user_media(ordered)
+    kept_file_id: str | None = None
     try:
         import app.infra.job_queue as job_queue
 
@@ -417,13 +516,22 @@ async def _edit(
                         model=model,
                         count=len(files),
                     )
-                await message.answer(exc.message)
+                from app.bot.image_retry import image_failure_reply
+
+                await message.answer(
+                    await image_failure_reply(media.chat_id, user_id, exc)
+                )
                 return
         try:
+            sent_last = None
             for index, image in enumerate(result):
-                await R._send_generated_image(message, image, index)
+                sent_last = await R._send_generated_image(message, image, index)
+            if sent_last is not None:
+                kept_file_id = result_file_id(sent_last)
         except AssistAIError as exc:
-            await message.answer(exc.message)
+            from app.bot.image_retry import image_failure_reply
+
+            await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
             return
         logger.info("edit_image_done", count=len(result), base_index=base)
         fallback = f"Готово. Основа — фото {base + 1}."
@@ -464,6 +572,112 @@ async def _edit(
         reset_user_media(token)
         await _drop_status(turn, status)
         await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
+        if kept_file_id:
+            await _keep_result(turn, media, kept_file_id)
+        await R._reset_flow(turn.state)
+
+
+def video_references(loaded: list[UserMedia]) -> list[Any]:
+    """Все фото альбома по порядку, не больше лимита Seedance."""
+    from app.llm.media_api import (
+        VIDEO_MAX_REFERENCE_IMAGES,
+        VideoReference,
+        safe_image_mime,
+    )
+
+    refs: list[VideoReference] = []
+    for item in loaded:
+        if item.kind != "image" or not item.data:
+            continue
+        refs.append(
+            VideoReference(data=item.data, mime_type=safe_image_mime(item.mime_type))
+        )
+        if len(refs) >= VIDEO_MAX_REFERENCE_IMAGES:
+            break
+    return refs
+
+
+def video_prompt(instruction: str, count: int) -> str:
+    """Промпт ролика и порядок кадров: первая картинка = фото 1."""
+    text = security.sanitize_prompt(instruction.strip())
+    if count <= 0:
+        return text
+    order = ", ".join(
+        f"image {index + 1} is photo {index + 1}" for index in range(count)
+    )
+    return f"{text}\nAttached reference images, in order: {order}."
+
+
+async def _generate_video(
+    turn: Any,
+    media: PendingMedia,
+    loaded: list[UserMedia],
+    decision: PhotoDecision,
+    topic_id: str,
+) -> None:
+    """Ролик по присланным фото. Повторный запрос сюда не приходит, пока этот ход жив."""
+    from aiogram.types import BufferedInputFile
+
+    message = turn.message
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not await rate_limiter.check_media_limit(user_id):
+        retry_after = await rate_limiter.get_retry_after(user_id, "media")
+        await message.answer(
+            f"Слишком много запросов видео. Подождите {int(retry_after) or 60} секунд."
+        )
+        await R._reset_flow(turn.state)
+        return
+    instruction = (decision.instruction_en or media.caption or "").strip()
+    if not instruction:
+        await message.answer("Опишите, что должно происходить в ролике.")
+        await R._reset_flow(turn.state)
+        return
+    refs = video_references(loaded)
+    prompt = video_prompt(instruction, len(refs))
+    if not prompt.strip():
+        await message.answer("Опишите, что должно происходить в ролике.")
+        await R._reset_flow(turn.state)
+        return
+    status = await _status(
+        turn, "Запускаю ролик по этим фото. Это займёт несколько минут."
+    )
+    try:
+        video = await turn.assistant.generate_video(prompt, references=refs or None)
+        filename = video.filename or "video.mp4"
+        payload = BufferedInputFile(video.data, filename=filename)
+        try:
+            await message.answer_video(video=payload)
+        except Exception:
+            logger.exception("photo_video_send_failed", chat_id=media.chat_id)
+            try:
+                await message.answer_document(
+                    document=BufferedInputFile(video.data, filename=filename)
+                )
+            except Exception:
+                logger.exception("photo_video_document_failed", chat_id=media.chat_id)
+                await message.answer("Ролик готов, но отправить его в чат не удалось.")
+                return
+        await message.answer("Ролик готов.")
+        await _remember_pair(
+            turn,
+            topic_id,
+            f"[Альбом: {len(loaded)} фото] {decision.instruction_ru or media.caption}".strip(),
+            "Ролик готов.",
+        )
+        logger.info("photo_video_done", chat_id=media.chat_id, references=len(refs))
+    except BudgetExceededError as exc:
+        await message.answer(exc.message)
+    except AssistAIError as exc:
+        from app.bot.video_retry import video_failure_reply
+
+        await message.answer(await video_failure_reply(media.chat_id, user_id, exc))
+    except Exception:
+        logger.exception("photo_video_failed", chat_id=media.chat_id)
+        await message.answer("Ролик запустить не удалось.")
+    finally:
+        await cost_tracker.release_reservation(user_id)
+        await _drop_status(turn, status)
+        await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
         await R._reset_flow(turn.state)
 
 
@@ -500,6 +714,7 @@ async def _generate(
         )
     status = await _status(turn, "Рисую изображение…")
     token = set_user_media(loaded)
+    kept_file_id: str | None = None
     try:
         import app.infra.job_queue as job_queue
 
@@ -528,10 +743,15 @@ async def _generate(
                     size=size,
                 )
         try:
+            sent_last = None
             for index, image in enumerate(result):
-                await R._send_generated_image(message, image, index)
+                sent_last = await R._send_generated_image(message, image, index)
+            if sent_last is not None:
+                kept_file_id = result_file_id(sent_last)
         except AssistAIError as exc:
-            await message.answer(exc.message)
+            from app.bot.image_retry import image_failure_reply
+
+            await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
             return
         fallback = "Готово. Это новое изображение по вашему фото."
         user_prompt = (
@@ -566,12 +786,16 @@ async def _generate(
     except BudgetExceededError as exc:
         await message.answer(exc.message)
     except AssistAIError as exc:
-        await message.answer(exc.message)
+        from app.bot.image_retry import image_failure_reply
+
+        await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
     finally:
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
         await _drop_status(turn, status)
         await turn.pending.pop(media.chat_id, media.assistant_id, media.user_id)
+        if kept_file_id:
+            await _keep_result(turn, media, kept_file_id)
         await R._reset_flow(turn.state)
 
 

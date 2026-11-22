@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable
 
@@ -13,6 +14,7 @@ from prometheus_client import REGISTRY
 
 from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
+from app.llm.media_api import VideoReference
 from app.llm.models_config import resolve_polza_video_model
 from app.llm.polza_media import build_video_body
 
@@ -46,6 +48,15 @@ def test_build_video_body_seedance() -> None:
     assert body["input"]["duration"] == "8"
     assert body["input"]["resolution"] == "720p"
     assert body["input"]["aspect_ratio"] == "16:9"
+    assert "images" not in body["input"]
+    with_images = build_video_body(
+        model="bytedance/seedance-2",
+        prompt="сцена",
+        images=[{"type": "url", "data": "https://cdn.example/girl.png"}],
+    )
+    assert with_images["input"]["images"] == [
+        {"type": "url", "data": "https://cdn.example/girl.png"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -91,9 +102,82 @@ async def test_generate_video_polza_success(
     req = json.loads(create.calls[0].request.content.decode())
     assert req["model"] == "bytedance/seedance-2"
     assert req["input"]["duration"] == "5"
+    assert "images" not in req["input"]
     assert status.called
     assert download.called
     assert not proxy.called
+
+
+@pytest.mark.asyncio
+async def test_generate_video_sends_reference_images(
+    multi_client_factory: Callable[..., AssistAIClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polza получает images, ProxyAPI при fallback — input_references."""
+    monkeypatch.setattr(
+        "app.llm.media_api.resolve_video_resource_url",
+        lambda candidate, **_k: (candidate or _CDN, False, ()),
+    )
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+        polza_total_wait=8.0,
+        polza_poll_interval=0.01,
+    )
+    refs = [
+        VideoReference(url="https://cdn.example/girl.png"),
+        VideoReference(data=b"png-bytes", mime_type="image/png"),
+    ]
+    with respx.mock(assert_all_called=False) as router:
+        create = router.post(_POLZA_MEDIA).mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "vid_ref", "status": "pending"},
+            )
+        )
+        router.get(f"{_POLZA_MEDIA}/vid_ref").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "vid_ref", "status": "completed", "data": [{"url": _CDN}]},
+            )
+        )
+        router.get(_CDN).mock(return_value=httpx.Response(200, content=b"mp4"))
+        await client.generate_video("девушка с первой картинки", references=refs)
+    body = json.loads(create.calls[0].request.content.decode())
+    images = body["input"]["images"]
+    assert images[0] == {"type": "url", "data": "https://cdn.example/girl.png"}
+    assert images[1]["type"] == "base64"
+    assert base64.b64decode(images[1]["data"]) == b"png-bytes"
+
+
+@pytest.mark.asyncio
+async def test_generate_video_proxy_fallback_keeps_references(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+    )
+    refs = [VideoReference(url="https://cdn.example/girl.png")]
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_POLZA_MEDIA).mock(return_value=httpx.Response(503))
+        create = router.post(_PROXY_VIDEOS).mock(
+            return_value=httpx.Response(
+                200, json={"id": "job_ref", "status": "completed"}
+            )
+        )
+        router.get(f"{_PROXY_VIDEOS}/job_ref/content").mock(
+            return_value=httpx.Response(200, content=b"proxy-mp4")
+        )
+        video = await client.generate_video("сцена", references=refs)
+    assert video.data == b"proxy-mp4"
+    payload = json.loads(create.calls[0].request.content.decode())
+    assert payload["input_references"] == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://cdn.example/girl.png"},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -227,16 +311,58 @@ async def test_generate_video_poll_timeout_no_fallback(
             await client.generate_video("сцена")
     assert info.value.error_code == "POLL_TIMEOUT"
     assert info.value.job_committed is True
+    assert info.value.pending_provider == "polza"
+    assert info.value.pending_job_id == "vid_stuck"
+    assert info.value.pending_kind == "video"
     assert "видео" in info.value.message.casefold()
     assert len(polza.calls) == 1
     assert not proxy.called
 
 
 @pytest.mark.asyncio
+async def test_proxyapi_poll_survives_connection_blip(
+    multi_client_factory: Callable[..., AssistAIClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Оплаченная задача ProxyAPI не бросается на первом обрыве опроса."""
+    monkeypatch.setattr("app.llm.media_api._VIDEO_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr("app.llm.media_api._VIDEO_RETRY_PAUSE", 0.0)
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+    )
+    status_url = f"{_PROXY_VIDEOS}/job_retry"
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_POLZA_MEDIA).mock(return_value=httpx.Response(503))
+        create = router.post(_PROXY_VIDEOS).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "job_retry",
+                    "status": "pending",
+                    "polling_url": status_url,
+                },
+            )
+        )
+        router.get(status_url).mock(
+            side_effect=[
+                httpx.ConnectError("All connection attempts failed"),
+                httpx.Response(200, json={"id": "job_retry", "status": "completed"}),
+            ]
+        )
+        router.get(f"{status_url}/content").mock(
+            return_value=httpx.Response(200, content=b"ready-mp4")
+        )
+        video = await client.generate_video("сцена")
+    assert video.data == b"ready-mp4"
+    assert len(create.calls) == 1
+
+
 async def test_generate_video_download_fail_no_fallback(
     multi_client_factory: Callable[..., AssistAIClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("app.llm.media_api._VIDEO_RETRY_PAUSE", 0.0)
     monkeypatch.setattr(
         "app.llm.media_api.resolve_video_resource_url",
         lambda candidate, **_k: (candidate or _CDN, False, ()),
@@ -274,4 +400,121 @@ async def test_generate_video_download_fail_no_fallback(
             await client.generate_video("сцена")
     assert info.value.error_code == "NETWORK_ERROR"
     assert info.value.job_committed is True
+    assert info.value.pending_url is None
     assert not proxy.called
+
+
+@pytest.mark.asyncio
+async def test_polza_video_downloads_from_cdn_mirror(
+    multi_client_factory: Callable[..., AssistAIClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """s3.polza.ai часто не открывается: тот же объект берётся с зеркала."""
+    monkeypatch.setattr("app.llm.media_api._VIDEO_RETRY_PAUSE", 0.0)
+    monkeypatch.setattr(
+        "app.llm.media_api.resolve_video_resource_url",
+        lambda candidate, **_k: (candidate or "", False, ()),
+    )
+    primary = "https://s3.polza.ai/media/clip.mp4"
+    mirror = "https://s3-alt.polza.ai/media/clip.mp4"
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+        polza_total_wait=8.0,
+        polza_poll_interval=0.01,
+    )
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_POLZA_MEDIA).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "vid_mirror",
+                    "status": "completed",
+                    "data": [{"url": primary}],
+                },
+            )
+        )
+        mirrored = router.get(mirror).mock(
+            return_value=httpx.Response(200, content=b"from-alt")
+        )
+        proxy = router.post(_PROXY_VIDEOS).mock(return_value=httpx.Response(200))
+        video = await client.generate_video("сцена")
+    assert video.data == b"from-alt"
+    assert mirrored.called
+    assert not proxy.called
+
+
+@pytest.mark.asyncio
+async def test_polza_video_download_keeps_cdn_url(
+    multi_client_factory: Callable[..., AssistAIClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.llm.media_api._VIDEO_RETRY_PAUSE", 0.0)
+    monkeypatch.setattr(
+        "app.llm.media_api.resolve_video_resource_url",
+        lambda candidate, **_k: (candidate or "", False, ()),
+    )
+    primary = "https://s3.polza.ai/media/clip.mp4"
+    mirror = "https://s3-alt.polza.ai/media/clip.mp4"
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="proxyapi",
+        polza_total_wait=8.0,
+        polza_poll_interval=0.01,
+    )
+    with respx.mock(assert_all_called=False) as router:
+        router.post(_POLZA_MEDIA).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "vid_keep",
+                    "status": "completed",
+                    "data": [{"url": primary}],
+                },
+            )
+        )
+        router.get(mirror).mock(side_effect=httpx.ConnectError("boom"))
+        router.get(primary).mock(side_effect=httpx.ConnectError("boom"))
+        proxy = router.post(_PROXY_VIDEOS).mock(return_value=httpx.Response(200))
+        with pytest.raises(AssistAIError) as info:
+            await client.generate_video("сцена")
+    assert info.value.pending_url == primary
+    assert info.value.pending_provider == "polza"
+    assert info.value.pending_job_id == "vid_keep"
+    assert info.value.job_committed is True
+    assert "://" not in info.value.message
+    assert not proxy.called
+
+
+@pytest.mark.asyncio
+async def test_proxy_video_download_keeps_the_job(
+    multi_client_factory: Callable[..., AssistAIClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Оплаченная задача ProxyAPI остаётся в очереди, если файл не скачался."""
+    monkeypatch.setattr("app.llm.media_api._VIDEO_POLL_INTERVAL", 0.0)
+    monkeypatch.setattr("app.llm.media_api._VIDEO_RETRY_PAUSE", 0.0)
+    monkeypatch.setattr("app.llm.media_api._VIDEO_POLL_MAX_SECONDS", 5.0)
+    client = multi_client_factory(
+        routes={"video": "proxyapi", "image": "proxyapi"},
+    )
+    status_url = f"{_PROXY_VIDEOS}/job_paid"
+    with respx.mock(assert_all_called=False) as router:
+        create = router.post(_PROXY_VIDEOS).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "job_paid",
+                    "status": "completed",
+                    "polling_url": status_url,
+                },
+            )
+        )
+        router.get(f"{status_url}/content").mock(side_effect=httpx.ConnectError("boom"))
+        with pytest.raises(AssistAIError) as info:
+            await client.generate_video("сцена")
+    assert info.value.pending_provider == "proxyapi"
+    assert info.value.pending_job_id == "job_paid"
+    assert info.value.pending_kind == "video"
+    assert info.value.job_committed is True
+    assert len(create.calls) == 1

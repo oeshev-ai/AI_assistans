@@ -633,6 +633,14 @@ def _raise_for_response(
     )
 
 
+def _remember_polza_job(exc: AssistAIError, media_id: str, *, medium: str) -> None:
+    """Уже принятая задача: бот заберёт файл позже, без второй оплаты."""
+    exc.job_committed = True
+    exc.pending_provider = "polza"
+    exc.pending_job_id = media_id
+    exc.pending_kind = "video" if medium == "video" else "image"
+
+
 def _items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     data = payload.get("data")
     if isinstance(data, dict):
@@ -739,7 +747,14 @@ async def _poll(
                 waited=total_wait,
                 medium=medium,
             )
-            raise AssistAIError(messages["POLL_TIMEOUT"], error_code="POLL_TIMEOUT")
+            raise AssistAIError(
+                messages["POLL_TIMEOUT"],
+                error_code="POLL_TIMEOUT",
+                job_committed=True,
+                pending_provider="polza",
+                pending_job_id=media_id,
+                pending_kind="video" if medium == "video" else "image",
+            )
         sleep_for = (
             min(interval, remaining_sleep, remaining_wall) if interval > 0 else 0.0
         )
@@ -756,13 +771,14 @@ async def _poll(
             body = response.json()
         except httpx.RequestError as exc:
             errors += 1
-            if errors > _MAX_POLL_ERRORS:
+            # Видео уже оплачено: сетевой сбой не бросает задачу до конца ожидания.
+            if medium != "video" and errors > _MAX_POLL_ERRORS:
                 raise _network_error(exc, "poll", medium=medium) from exc
             continue
         except AssistAIError as exc:
             if exc.status_code is not None and exc.status_code >= 500:
                 errors += 1
-                if errors <= _MAX_POLL_ERRORS:
+                if medium == "video" or errors <= _MAX_POLL_ERRORS:
                     continue
             raise
         except ValueError as exc:
@@ -861,14 +877,18 @@ async def generate(
             and media_id
         ):
             logger.info("polza_media_async", media_id=media_id, status=status)
-            payload = await _poll(
-                client,
-                provider,
-                media_id,
-                poll_interval=poll_interval,
-                total_wait=total_wait,
-                timeout=timeout,
-            )
+            try:
+                payload = await _poll(
+                    client,
+                    provider,
+                    media_id,
+                    poll_interval=poll_interval,
+                    total_wait=total_wait,
+                    timeout=timeout,
+                )
+            except AssistAIError as exc:
+                _remember_polza_job(exc, media_id, medium="image")
+                raise
             status = str(payload.get("status") or "").casefold()
 
         if status in _FAILED_STATUSES or (payload.get("error") and not _items(payload)):
@@ -909,6 +929,7 @@ def build_video_body(
     duration: int | None = None,
     resolution: str | None = None,
     aspect_ratio: str = "16:9",
+    images: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Тело ``POST /v1/media`` для Seedance и др. видеомоделей Polza."""
     media_input: dict[str, Any] = {
@@ -919,6 +940,8 @@ def build_video_body(
         media_input["duration"] = str(duration)
     if isinstance(resolution, str) and resolution.strip():
         media_input["resolution"] = resolution.strip()
+    if images:
+        media_input["images"] = images
     return {"model": model, "input": media_input, "async": True}
 
 
@@ -931,6 +954,7 @@ async def generate_video(
     duration: int | None = None,
     resolution: str | None = None,
     aspect_ratio: str = "16:9",
+    images: list[dict[str, str]] | None = None,
     poll_interval: float = 5.0,
     total_wait: float = 600.0,
     timeout: httpx.Timeout | None = None,
@@ -942,6 +966,7 @@ async def generate_video(
         duration=duration,
         resolution=resolution,
         aspect_ratio=aspect_ratio,
+        images=images,
     )
     url = f"{provider.base_url}{_MEDIA_PATH}"
     logger.info(
@@ -950,6 +975,7 @@ async def generate_video(
         duration=duration,
         resolution=resolution,
         prompt_chars=len(prompt),
+        images=len(images or []),
     )
     try:
         response = await client.post(url, json=body, timeout=timeout)
@@ -983,15 +1009,19 @@ async def generate_video(
             and media_id
         ):
             logger.info("polza_video_async", media_id=media_id, status=status)
-            payload = await _poll(
-                client,
-                provider,
-                media_id,
-                poll_interval=poll_interval,
-                total_wait=total_wait,
-                timeout=timeout,
-                medium="video",
-            )
+            try:
+                payload = await _poll(
+                    client,
+                    provider,
+                    media_id,
+                    poll_interval=poll_interval,
+                    total_wait=total_wait,
+                    timeout=timeout,
+                    medium="video",
+                )
+            except AssistAIError as exc:
+                _remember_polza_job(exc, media_id, medium="video")
+                raise
             status = str(payload.get("status") or "").casefold()
 
         if status in _FAILED_STATUSES or (payload.get("error") and not _items(payload)):

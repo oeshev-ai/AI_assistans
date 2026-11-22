@@ -156,7 +156,7 @@ WELCOME = (
     "(или напишите «нужна ссылка на загрузку»).\n\n"
     "Внизу кнопки: персоны и темы.\n"
     "Каталог готовых персон — в /settings.\n"
-    "Меню (☰): /settings — настройки, /help — справка, /cancel — отмена мастера"
+    "Меню (☰): /settings — настройки, /help — справка"
 )
 InputKind = Literal["text", "voice"]
 MAX_VOICE_DURATION_SECONDS = 600

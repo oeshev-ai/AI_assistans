@@ -17,13 +17,22 @@ def test_text_model_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.default_text_model == "openai/gpt-6-luna"
 
 
+def test_photo_router_defaults_to_flash_1017(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *_args, **_kwargs: False)
+    monkeypatch.setenv("PROXYAPI_API_KEY", "test-key")
+    monkeypatch.setenv("POLZA_API_KEY", "test-polza-key")
+    monkeypatch.delenv("PHOTO_ROUTER_MODEL", raising=False)
+    config = AssistAIConfig.from_env()
+    assert config.photo_router_model == "deepseek/deepseek-v4.1-flash-1017"
+
+
 def test_text_model_default_when_env_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.llm.config.load_dotenv", lambda *_args, **_kwargs: False)
     monkeypatch.setenv("PROXYAPI_API_KEY", "test-key")
     monkeypatch.setenv("POLZA_API_KEY", "test-polza-key")
     monkeypatch.setenv("TEXT_MODEL", "  ")
     config = AssistAIConfig.from_env()
-    assert config.default_text_model == "deepseek/deepseek-v4.1-flash"
+    assert config.default_text_model == "deepseek/deepseek-v4.1-flash-1017"
 
 
 def test_legacy_text_model_from_env_aliased(monkeypatch: pytest.MonkeyPatch) -> None:

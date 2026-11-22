@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 
 import pytest
@@ -125,6 +126,72 @@ async def test_standard_assistant_cannot_be_deleted(
     active = await storage.get_active_assistant(4)
     assert active is not None
     assert active.id == DEFAULT_ASSISTANT_ID
+
+
+async def test_legacy_model_ids_are_written_back(
+    redis_storage: RedisAssistantStorage,
+) -> None:
+    profile_id = "legacy01"
+    raw = json.dumps(
+        {
+            "id": profile_id,
+            "name": "Старый",
+            "icon": "🤖",
+            "system_prompt": "Ты полезный ассистент и отвечаешь кратко.",
+            "text_model": "qwen/qwen3.8-max-0902",
+            "image_model": "openai/gpt-image-1.5",
+            "vision_model": "google/gemini-3.5-flash-lite",
+            "tts_model": "elevenlabs/eleven-multilingual-v2",
+            "voice_mode": "auto",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    await redis_storage._redis.hset("chat:9:assistants", profile_id, raw)
+    await redis_storage._redis.set("chat:9:active_assistant", profile_id)
+
+    active = await redis_storage.get_active_assistant(9)
+
+    assert active is not None
+    assert active.text_model == "qwen/qwen4-max"
+    assert active.image_model == "openai/gpt-image-2.6-flare"
+    assert active.vision_model == "google/gemini-3.8-flash"
+    assert active.tts_model == "openai/gpt-4o-mini-tts"
+    stored = json.loads(
+        await redis_storage._redis.hget("chat:9:assistants", profile_id)
+    )
+    assert stored["text_model"] == active.text_model
+    assert stored["image_model"] == active.image_model
+    assert stored["vision_model"] == active.vision_model
+    assert stored["tts_model"] == active.tts_model
+    snapshot = await redis_storage._redis.hget("chat:9:assistants", profile_id)
+    await redis_storage.get_active_assistant(9)
+    assert await redis_storage._redis.hget("chat:9:assistants", profile_id) == snapshot
+
+
+async def test_current_model_ids_stay_untouched(
+    redis_storage: RedisAssistantStorage,
+) -> None:
+    profile_id = "current1"
+    raw = json.dumps(
+        {
+            "id": profile_id,
+            "name": "Текущий",
+            "icon": "🤖",
+            "system_prompt": "Ты полезный ассистент и отвечаешь кратко.",
+            "text_model": "qwen/qwen4-max",
+            "image_model": "openai/gpt-image-2.6-flare",
+            "voice_mode": "auto",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    await redis_storage._redis.hset("chat:11:assistants", profile_id, raw)
+    await redis_storage._redis.set("chat:11:active_assistant", profile_id)
+
+    await redis_storage.get_active_assistant(11)
+
+    assert await redis_storage._redis.hget("chat:11:assistants", profile_id) == raw
 
 
 async def test_redis_profile_ttl_is_set(redis_storage: RedisAssistantStorage) -> None:

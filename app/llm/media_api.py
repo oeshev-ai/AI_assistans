@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import re
 import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
 import structlog
@@ -42,9 +43,28 @@ _T = TypeVar("_T")
 
 logger = structlog.get_logger("AssistAI.media")
 
-_VIDEO_FAILED_USER = "Генерация видео завершилась ошибкой. Попробуйте позже."
-_VIDEO_POLL_USER = "Не удалось опросить статус видео. Попробуйте позже."
-_VIDEO_DOWNLOAD_USER = "Не удалось скачать видео. Попробуйте позже."
+_VIDEO_FAILED_USER = (
+    "Видео не получилось, в чат оно не придёт. "
+    "Если попросить ещё раз, начнётся новая генерация."
+)
+_VIDEO_POLL_USER = (
+    "Видео в этот чат не придёт: задача ушла в сервис, "
+    "но готовность проверить не удалось. "
+    "Если попросить ещё раз, начнётся новая генерация."
+)
+_VIDEO_DOWNLOAD_USER = (
+    "Видео в этот чат не придёт: файл не скачался. "
+    "Если попросить ещё раз, начнётся новая генерация."
+)
+_VIDEO_RETRY_PAUSE = 1.0
+
+
+def _video_poll_retryable(exc: httpx.HTTPError) -> bool:
+    """Сеть, 429 и 5xx не отменяют уже оплаченную задачу."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code == 429 or code >= 500
+    return True
 
 
 def video_user_error(kind: str) -> str:
@@ -105,6 +125,130 @@ class VideoResult:
     cost_source: str | None = None
     provider_id: str | None = None
     model: str | None = None
+
+
+# Seedance 2.0: до 9 изображений-референсов и на Polza, и на ProxyAPI.
+VIDEO_MAX_REFERENCE_IMAGES = 9
+VIDEO_REFERENCE_MAX_BYTES = 10 * 1024 * 1024
+_IMAGE_MIME = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+    "image/gif": "image/gif",
+}
+
+
+@dataclass(frozen=True)
+class VideoReference:
+    """Картинка-референс для видео: байты или публичный https URL."""
+
+    data: bytes | None = None
+    url: str | None = None
+    mime_type: str = "image/png"
+
+
+def safe_image_mime(mime: str | None) -> str:
+    """MIME для data-URI референса. Неизвестный тип становится ``image/png``."""
+    cleaned = (mime or "").split(";", 1)[0].strip().casefold()
+    return _IMAGE_MIME.get(cleaned, "image/png")
+
+
+def public_https_image_url(url: str) -> bool:
+    """True для https-ссылки, которую можно отдать видеосервису как референс."""
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    return not _host_is_non_public(parsed.hostname)
+
+
+def decode_image_b64(value: str) -> tuple[bytes, str]:
+    """Сырой base64 или data-URI → байты и MIME. Пустой результат — битые данные."""
+    mime = "image/png"
+    raw = value.strip()
+    if raw.startswith("data:"):
+        header, _, payload = raw.partition(",")
+        declared = header[5:].split(";", 1)[0].strip()
+        if declared:
+            mime = safe_image_mime(declared)
+        raw = payload
+    try:
+        data = base64.b64decode(raw, validate=False)
+    except Exception:
+        return b"", mime
+    return data, mime
+
+
+def checked_video_references(
+    references: list[VideoReference] | None,
+) -> list[VideoReference]:
+    """Проверяет референсы до платного create. Ошибка не открывает fallback."""
+    if not references:
+        return []
+    if len(references) > VIDEO_MAX_REFERENCE_IMAGES:
+        raise AssistAIError(
+            f"Можно передать не больше {VIDEO_MAX_REFERENCE_IMAGES} референсов.",
+            error_code="BAD_REQUEST",
+        )
+    checked: list[VideoReference] = []
+    for ref in references:
+        if ref.url:
+            url = ref.url.strip()
+            if not public_https_image_url(url):
+                raise AssistAIError(
+                    "Референс-картинка недоступна: нужна публичная https-ссылка.",
+                    error_code="BAD_REQUEST",
+                )
+            checked.append(
+                VideoReference(url=url, mime_type=safe_image_mime(ref.mime_type))
+            )
+            continue
+        if not ref.data:
+            raise AssistAIError("Референс-картинка пустая.", error_code="BAD_REQUEST")
+        if len(ref.data) > VIDEO_REFERENCE_MAX_BYTES:
+            raise AssistAIError(
+                "Референс-картинка слишком большая для запроса видео.",
+                error_code="PAYLOAD_TOO_LARGE",
+            )
+        checked.append(
+            VideoReference(data=ref.data, mime_type=safe_image_mime(ref.mime_type))
+        )
+    return checked
+
+
+def polza_reference_images(references: list[VideoReference]) -> list[dict[str, str]]:
+    """``input.images`` для Polza Seedance: url или сырой base64."""
+    images: list[dict[str, str]] = []
+    for ref in references:
+        if ref.url:
+            images.append({"type": "url", "data": ref.url})
+        elif ref.data:
+            images.append(
+                {
+                    "type": "base64",
+                    "data": base64.b64encode(ref.data).decode("ascii"),
+                }
+            )
+    return images
+
+
+def proxy_input_references(references: list[VideoReference]) -> list[dict[str, Any]]:
+    """``input_references`` ProxyAPI. Байты уходят data-URI: своего хранилища нет."""
+    items: list[dict[str, Any]] = []
+    for ref in references:
+        if ref.url:
+            url = ref.url
+        elif ref.data:
+            mime = safe_image_mime(ref.mime_type)
+            payload = base64.b64encode(ref.data).decode("ascii")
+            url = f"data:{mime};base64,{payload}"
+        else:
+            continue
+        items.append({"type": "image_url", "image_url": {"url": url}})
+    return items
 
 
 def _audio_mime(filename: str) -> str:
@@ -255,6 +399,152 @@ def resolve_video_resource_url(
     return raw, False, pinned
 
 
+_POLZA_CDN_HOSTS = frozenset({"s3.polza.ai", "s3-alt.polza.ai"})
+_POLZA_CDN_MIRRORS: dict[str, tuple[str, ...]] = {
+    "s3.polza.ai": ("s3-alt.polza.ai",),
+    "s3-alt.polza.ai": ("s3.polza.ai",),
+}
+
+
+_PAID_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def paid_job_id(value: str) -> bool:
+    """Id задачи Polza или ProxyAPI, который можно снова запросить."""
+    return isinstance(value, str) and _PAID_JOB_ID.fullmatch(value) is not None
+
+
+def polza_cdn_url(url: str) -> bool:
+    """Публичный https на CDN Polza. Файл там живёт 7 дней."""
+    if not isinstance(url, str) or not public_https_image_url(url):
+        return False
+    host = (urlparse(url.strip()).hostname or "").casefold()
+    return host in _POLZA_CDN_HOSTS
+
+
+def cdn_download_candidates(url: str) -> list[str]:
+    """Сначала зеркало CDN, затем исходный URL. Чужой хост — только он сам."""
+    raw = url.strip()
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").casefold()
+    ordered = [
+        urlunparse(parsed._replace(netloc=mirror))
+        for mirror in _POLZA_CDN_MIRRORS.get(host, ())
+    ]
+    if raw not in ordered:
+        ordered.append(raw)
+    return ordered
+
+
+async def download_public_video(
+    url: str, *, timeout: httpx.Timeout, attempts: int = 2
+) -> bytes:
+    """Скачивает уже готовый ролик с публичного CDN.
+
+    ``s3.polza.ai`` с этой сети часто не открывается, зеркало отдаёт тот же
+    объект. Если оба хоста молчат, ошибка несёт ``pending_url`` — бот повторит
+    скачивание без новой генерации.
+    """
+    candidates = cdn_download_candidates(url) if isinstance(url, str) else []
+    last_code = "NETWORK_ERROR"
+    permanent = False
+    attempted = False
+    for candidate in candidates:
+        resolved, with_auth, pins = resolve_video_resource_url(
+            candidate,
+            provider_base_url="https://polza.ai",
+            fallback="",
+        )
+        if not resolved or with_auth:
+            logger.warning(
+                "video_cdn_url_rejected",
+                host=urlparse(candidate).hostname if isinstance(candidate, str) else "",
+            )
+            continue
+        attempted = True
+        try:
+            data = await _fetch_public_video(resolved, pins, timeout, attempts=attempts)
+        except AssistAIError as exc:
+            last_code = exc.error_code or last_code
+            if exc.error_code == "NOT_FOUND" and candidate == url.strip():
+                permanent = True
+            logger.warning(
+                "video_cdn_download_failed",
+                host=urlparse(candidate).hostname,
+                error_code=exc.error_code,
+            )
+            continue
+        if data:
+            if candidate != url.strip():
+                logger.info(
+                    "video_cdn_fallback_used",
+                    host=urlparse(candidate).hostname,
+                )
+            return data
+    keep = isinstance(url, str) and polza_cdn_url(url) and not permanent
+    if not attempted and not keep:
+        last_code = "GUARD_UNSAFE_URL"
+    raise AssistAIError(
+        video_user_error("download"),
+        error_code=last_code,
+        job_committed=True,
+        pending_url=url.strip() if keep and isinstance(url, str) else None,
+    )
+
+
+async def _fetch_public_video(
+    url: str,
+    pinned_ips: tuple[str, ...],
+    timeout: httpx.Timeout,
+    *,
+    attempts: int = 2,
+) -> bytes:
+    """GET без ключа провайдера. Приватный адрес сюда не доходит."""
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").strip()
+    request_url = url
+    headers = {"User-Agent": "AssistAIClient/1.0"}
+    extensions: dict[str, Any] = {}
+    if pinned_ips and hostname:
+        request_url = _url_with_pinned_ip(url, pinned_ips[0])
+        headers["Host"] = hostname
+        extensions["sni_hostname"] = hostname
+    last: httpx.HTTPError | None = None
+    tries = max(1, attempts)
+    for attempt in range(1, tries + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers=headers,
+            ) as anon:
+                response = await anon.get(request_url, extensions=extensions or None)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in {403, 404, 410}:
+                raise AssistAIError(
+                    video_user_error("download"),
+                    error_code="NOT_FOUND",
+                    job_committed=True,
+                ) from exc
+            last = exc
+        except httpx.HTTPError as exc:
+            last = exc
+        else:
+            if response.content:
+                return bytes(response.content)
+        if attempt < tries:
+            logger.warning("generate_video_download_retry", attempt=attempt)
+            await asyncio.sleep(_VIDEO_RETRY_PAUSE)
+    raise AssistAIError(
+        video_user_error("download"),
+        error_code="NETWORK_ERROR",
+        job_committed=True,
+    ) from last
+
+
 def _url_with_pinned_ip(url: str, ip: str) -> str:
     """Rewrite ``url`` netloc to ``ip`` (keep path/query); Host/SNI stay original."""
     parsed = urlparse(url)
@@ -310,6 +600,7 @@ class MediaApiMixin(ProviderTransportMixin):
         model: str | None = None,
         duration: int | None = None,
         resolution: str | None = None,
+        references: list[VideoReference] | None = None,
     ) -> VideoResult:
         """Создаёт видео-задачу, ждёт completion и скачивает mp4."""
         if not isinstance(prompt, str) or not prompt.strip():
@@ -326,6 +617,7 @@ class MediaApiMixin(ProviderTransportMixin):
 
         await cost_tracker.check_budget(estimated=VIDEO_USD)
         try:
+            checked_refs = checked_video_references(references)
 
             async def attempt(provider: ProviderConfig) -> VideoResult:
                 if provider.kind == "polza_media":
@@ -335,6 +627,7 @@ class MediaApiMixin(ProviderTransportMixin):
                         prompt=sanitized_prompt,
                         duration=duration,
                         resolution=resolution,
+                        references=checked_refs,
                         timeout=create_timeout,
                     )
                 return await self._generate_video_proxyapi(
@@ -343,6 +636,7 @@ class MediaApiMixin(ProviderTransportMixin):
                     prompt=sanitized_prompt,
                     duration=duration,
                     resolution=resolution,
+                    references=checked_refs,
                     timeout=create_timeout,
                 )
 
@@ -350,6 +644,7 @@ class MediaApiMixin(ProviderTransportMixin):
                 "generate_video_create",
                 model=catalog_model,
                 prompt_chars=len(sanitized_prompt),
+                references=len(checked_refs),
             )
             result = await self._video_with_fallback(attempt)
             amount = result.cost_usd if result.cost_usd is not None else VIDEO_USD
@@ -401,6 +696,7 @@ class MediaApiMixin(ProviderTransportMixin):
         prompt: str,
         duration: int | None,
         resolution: str | None,
+        references: list[VideoReference],
         timeout: httpx.Timeout,
     ) -> VideoResult:
         polza_model = resolve_polza_video_model(catalog_model) or catalog_model
@@ -413,6 +709,7 @@ class MediaApiMixin(ProviderTransportMixin):
             prompt=prompt,
             duration=duration,
             resolution=resolution,
+            images=polza_reference_images(references) or None,
             poll_interval=max(
                 float(self.config.polza_poll_interval), _VIDEO_POLL_INTERVAL
             ),
@@ -448,45 +745,18 @@ class MediaApiMixin(ProviderTransportMixin):
                 error_code="SERVICE_UNAVAILABLE",
                 job_committed=True,
             )
-        # No provider-hosted content URL for Polza CDN — fail closed on reject.
-        url, with_auth, pins = resolve_video_resource_url(
-            content_url,
-            provider_base_url=provider.base_url,
-            fallback="",
-        )
-        if not url:
-            logger.warning(
-                "generate_video_url_rejected",
-                provider=provider.id,
-            )
-            raise AssistAIError(
-                video_user_error("download"),
-                error_code="GUARD_UNSAFE_URL",
-                job_committed=True,
-            )
         try:
-            response = await self._video_get(
-                provider,
-                url,
-                with_auth=with_auth,
-                pinned_ips=pins,
-                timeout=timeout,
+            data = await download_public_video(
+                content_url,
+                timeout=httpx.Timeout(45.0, connect=15.0),
+                attempts=1,
             )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.warning("generate_video_download_failed", error=str(exc))
-            raise AssistAIError(
-                video_user_error("download"),
-                error_code="NETWORK_ERROR",
-                job_committed=True,
-            ) from exc
-        data = response.content
-        if not data:
-            raise AssistAIError(
-                video_user_error("download"),
-                error_code="BAD_GATEWAY",
-                job_committed=True,
-            )
+        except AssistAIError as exc:
+            if media.media_id:
+                exc.pending_provider = "polza"
+                exc.pending_job_id = media.media_id
+                exc.pending_kind = "video"
+            raise
         return self._video_result(
             provider, data=data, model=polza_model, cost_rub=media.cost_rub
         )
@@ -499,6 +769,7 @@ class MediaApiMixin(ProviderTransportMixin):
         prompt: str,
         duration: int | None,
         resolution: str | None,
+        references: list[VideoReference],
         timeout: httpx.Timeout,
     ) -> VideoResult:
         label = _provider_label(provider)
@@ -510,14 +781,19 @@ class MediaApiMixin(ProviderTransportMixin):
             payload["duration"] = duration
         if isinstance(resolution, str) and resolution.strip():
             payload["resolution"] = resolution.strip()
+        image_refs = proxy_input_references(references)
+        if image_refs:
+            payload["input_references"] = image_refs
 
         created = await self._post_json(
             _VIDEOS_PATH, payload, timeout=timeout, provider=provider
         )
         # Create succeeded — poll/download errors must not open another provider.
+        job_id: str | None = None
+        recoverable = True
         try:
-            job_id = created.get("id")
-            if not isinstance(job_id, str) or not job_id:
+            job_id = created.get("id") if isinstance(created.get("id"), str) else None
+            if not job_id:
                 raise AssistAIError(
                     f"{label} не вернул id видео-задачи.",
                     error_code="BAD_GATEWAY",
@@ -545,6 +821,7 @@ class MediaApiMixin(ProviderTransportMixin):
                 if status in {"completed", "succeeded", "success"}:
                     break
                 if status in {"failed", "error", "cancelled"}:
+                    recoverable = False
                     logger.warning(
                         "generate_video_failed",
                         status=status,
@@ -568,22 +845,37 @@ class MediaApiMixin(ProviderTransportMixin):
                     response.raise_for_status()
                     body = response.json()
                 except httpx.HTTPError as exc:
-                    logger.warning("generate_video_poll_failed", error=str(exc))
-                    raise AssistAIError(
-                        video_user_error("poll"),
-                        error_code="NETWORK_ERROR",
-                        job_committed=True,
-                    ) from exc
-                if not isinstance(body, dict):
-                    raise AssistAIError(
-                        "Некорректный статус видео-задачи.",
-                        error_code="BAD_GATEWAY",
-                        job_committed=True,
+                    if not _video_poll_retryable(exc):
+                        logger.warning(
+                            "generate_video_poll_failed",
+                            error=str(exc),
+                            job_id=job_id,
+                        )
+                        raise AssistAIError(
+                            video_user_error("poll"),
+                            error_code="NETWORK_ERROR",
+                            job_committed=True,
+                        ) from exc
+                    logger.warning(
+                        "generate_video_poll_retry",
+                        error=str(exc),
+                        job_id=job_id,
                     )
+                    continue
+                except ValueError:
+                    logger.warning(
+                        "generate_video_poll_retry", reason="bad_json", job_id=job_id
+                    )
+                    continue
+                if not isinstance(body, dict):
+                    logger.warning(
+                        "generate_video_poll_retry", reason="bad_body", job_id=job_id
+                    )
+                    continue
                 status_payload = body
             else:
                 raise AssistAIError(
-                    "Таймаут ожидания генерации видео.",
+                    video_user_error("poll"),
                     error_code="POLL_TIMEOUT",
                     job_committed=True,
                 )
@@ -608,23 +900,13 @@ class MediaApiMixin(ProviderTransportMixin):
                     error_code="BAD_GATEWAY",
                     job_committed=True,
                 )
-            try:
-                response = await self._video_get(
-                    provider,
-                    content_url,
-                    with_auth=content_with_auth,
-                    pinned_ips=content_pins,
-                    timeout=timeout,
-                )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                logger.warning("generate_video_download_failed", error=str(exc))
-                raise AssistAIError(
-                    video_user_error("download"),
-                    error_code="NETWORK_ERROR",
-                    job_committed=True,
-                ) from exc
-            data = response.content
+            data = await self._download_video_bytes(
+                provider,
+                content_url,
+                with_auth=content_with_auth,
+                pinned_ips=content_pins,
+                timeout=timeout,
+            )
             if not data:
                 raise AssistAIError(
                     f"{label} вернул пустой видеофайл.",
@@ -634,7 +916,216 @@ class MediaApiMixin(ProviderTransportMixin):
             return self._video_result(provider, data=data, model=catalog_model)
         except AssistAIError as exc:
             exc.job_committed = True
+            if recoverable and job_id:
+                exc.pending_provider = provider.id
+                exc.pending_job_id = job_id
+                exc.pending_kind = "video"
             raise
+
+    async def _download_video_bytes(
+        self,
+        provider: ProviderConfig,
+        url: str,
+        *,
+        with_auth: bool,
+        pinned_ips: tuple[str, ...],
+        timeout: httpx.Timeout,
+    ) -> bytes:
+        """Несколько попыток скачать уже оплаченный ролик."""
+        last: httpx.HTTPError | None = None
+        for attempt in range(1, 4):
+            try:
+                response = await self._video_get(
+                    provider,
+                    url,
+                    with_auth=with_auth,
+                    pinned_ips=pinned_ips,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                last = exc
+                if attempt == 3 or not _video_poll_retryable(exc):
+                    logger.warning("generate_video_download_failed", error=str(exc))
+                    raise AssistAIError(
+                        video_user_error("download"),
+                        error_code="NETWORK_ERROR",
+                        job_committed=True,
+                    ) from exc
+                logger.warning(
+                    "generate_video_download_retry",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(_VIDEO_RETRY_PAUSE)
+                continue
+            data = response.content
+            if data:
+                return data
+        logger.warning(
+            "generate_video_download_failed",
+            error=str(last) if last else "empty",
+        )
+        return b""
+
+    async def recover_paid_file(
+        self, provider_id: str, job_id: str, *, kind: str
+    ) -> bytes:
+        """Забирает уже оплаченный файл по id задачи. ``NOT_READY`` — ещё не готов."""
+        if provider_id not in {"polza", "proxyapi"} or not paid_job_id(job_id):
+            raise AssistAIError(
+                video_user_error("failed") if kind == "video" else "Файл не найден.",
+                error_code="BAD_REQUEST",
+                job_committed=True,
+            )
+        try:
+            provider = self._registry.get(provider_id)
+        except KeyError as exc:
+            raise AssistAIError(
+                video_user_error("failed") if kind == "video" else "Файл не найден.",
+                error_code="FAILED",
+                job_committed=True,
+            ) from exc
+        if provider_id == "polza":
+            return await self._recover_polza_file(provider, job_id, kind=kind)
+        if kind != "video":
+            raise AssistAIError(
+                "Файл не найден.",
+                error_code="FAILED",
+                job_committed=True,
+            )
+        return await self._recover_proxy_video(provider, job_id)
+
+    async def _recover_polza_file(
+        self, provider: ProviderConfig, job_id: str, *, kind: str
+    ) -> bytes:
+        url = f"{provider.base_url.rstrip('/')}/v1/media/{quote(job_id, safe='')}"
+        timeout = httpx.Timeout(30.0, connect=15.0)
+        try:
+            response = await self._client_for(provider).get(url, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AssistAIError(
+                video_user_error("poll")
+                if kind == "video"
+                else "Файл ещё не скачался.",
+                error_code="NOT_READY",
+                job_committed=True,
+            ) from exc
+        if not isinstance(body, dict):
+            raise AssistAIError(
+                video_user_error("poll"),
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        status = str(body.get("status") or "").casefold()
+        logger.info("paid_file_status", provider="polza", job_id=job_id, status=status)
+        if status in polza_media._PENDING_STATUSES:
+            raise AssistAIError(
+                video_user_error("poll") if kind == "video" else "Файл ещё не готов.",
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        if status in polza_media._FAILED_STATUSES:
+            raise AssistAIError(
+                video_user_error("failed")
+                if kind == "video"
+                else "Картинка не получилась.",
+                error_code="FAILED",
+                job_committed=True,
+            )
+        result = polza_media.parse_media_payload(body)
+        if not result.images:
+            raise AssistAIError(
+                video_user_error("download")
+                if kind == "video"
+                else "Файл ещё не готов.",
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        first = result.images[0]
+        if first.get("type") == "base64":
+            try:
+                data = base64.b64decode(first.get("value") or "", validate=False)
+            except Exception as exc:
+                raise AssistAIError(
+                    video_user_error("download"),
+                    error_code="NOT_READY",
+                    job_committed=True,
+                ) from exc
+            if not data:
+                raise AssistAIError(
+                    video_user_error("download"),
+                    error_code="NOT_READY",
+                    job_committed=True,
+                )
+            return data
+        content_url = first.get("value") or ""
+        return await download_public_video(
+            content_url,
+            timeout=httpx.Timeout(45.0, connect=15.0),
+            attempts=1,
+        )
+
+    async def _recover_proxy_video(
+        self, provider: ProviderConfig, job_id: str
+    ) -> bytes:
+        status_url = f"{provider.base_url.rstrip('/')}/{_VIDEOS_PATH}/{job_id}"
+        timeout = httpx.Timeout(30.0, connect=15.0)
+        try:
+            response = await self._video_get(
+                provider,
+                status_url,
+                with_auth=True,
+                pinned_ips=(),
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AssistAIError(
+                video_user_error("poll"),
+                error_code="NOT_READY",
+                job_committed=True,
+            ) from exc
+        if not isinstance(body, dict):
+            raise AssistAIError(
+                video_user_error("poll"),
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        status = str(body.get("status") or "").casefold()
+        logger.info(
+            "paid_file_status", provider=provider.id, job_id=job_id, status=status
+        )
+        if status in {"failed", "error", "cancelled"}:
+            raise AssistAIError(
+                video_user_error("failed"),
+                error_code="FAILED",
+                job_committed=True,
+            )
+        if status not in {"completed", "succeeded", "success"}:
+            raise AssistAIError(
+                video_user_error("poll"),
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        content_url = f"{status_url}/content"
+        data = await self._download_video_bytes(
+            provider,
+            content_url,
+            with_auth=True,
+            pinned_ips=(),
+            timeout=httpx.Timeout(45.0, connect=15.0),
+        )
+        if not data:
+            raise AssistAIError(
+                video_user_error("download"),
+                error_code="NOT_READY",
+                job_committed=True,
+            )
+        return data
 
     async def _video_get(
         self,

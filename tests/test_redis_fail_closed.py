@@ -9,6 +9,11 @@ import pytest
 from app.bot.main import _open_shared_redis
 from app.infra.worker import attach_worker_billing_redis
 from app.storage.assistant_storage import create_assistant_storage
+from app.storage.history_storage import (
+    InMemoryChatHistoryStorage,
+    RedisConfig,
+    create_storage,
+)
 from app.storage.pending_media import create_pending_media_storage
 from app.storage.topic_history import create_topic_storage
 
@@ -30,6 +35,36 @@ async def test_topic_empty_url_fatal_in_production(
     config = SimpleNamespace(redis_url="", max_history_length=20)
     with pytest.raises(SystemExit):
         await create_topic_storage(config)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_history_empty_url_fatal_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    config = RedisConfig(redis_url="")
+    with pytest.raises(SystemExit):
+        await create_storage(config)
+
+
+@pytest.mark.asyncio
+async def test_history_unreachable_fatal_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    config = RedisConfig(redis_url="redis://127.0.0.1:1/0")
+    with pytest.raises(SystemExit):
+        await create_storage(config)
+
+
+@pytest.mark.asyncio
+async def test_history_empty_url_ok_outside_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    storage = await create_storage(RedisConfig(redis_url=""))
+    assert isinstance(storage, InMemoryChatHistoryStorage)
+    await storage.close()
 
 
 @pytest.mark.asyncio

@@ -12,8 +12,19 @@ import structlog
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker, prefer_cost_rub
 from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
-from app.llm.image_ops import _get_generation_ids, note_generation_id
-from app.llm.media_api import SpeechResult, TranscriptionResult
+from app.llm.image_ops import (
+    _get_generation_ids,
+    generated_image_records,
+    note_generation_id,
+)
+from app.llm.media_api import (
+    VIDEO_MAX_REFERENCE_IMAGES,
+    SpeechResult,
+    TranscriptionResult,
+    VideoReference,
+    decode_image_b64,
+    safe_image_mime,
+)
 from app.llm.tooling import BaseTool, _error_json, _exception_text
 from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
 
@@ -246,6 +257,16 @@ class EditImageTool(BaseTool):
         except BudgetExceededError as exc:
             return _error_json(exc.message)
         except AssistAIError as exc:
+            from app.bot.image_retry import image_failure_reply
+            from app.infra.cost_tracker import get_billing_user
+            from app.storage.upload_sessions import get_upload_request_context
+
+            ctx = get_upload_request_context()
+            billed = get_billing_user()
+            user_id = ctx.user_id if ctx is not None else billed
+            chat_id = ctx.chat_id if ctx is not None else user_id
+            if chat_id is not None and user_id is not None:
+                return _error_json(await image_failure_reply(chat_id, user_id, exc))
             return _error_json(exc.message)
         except (TypeError, ValueError) as exc:
             return _error_json(_exception_text(exc))
@@ -345,6 +366,54 @@ def _int_list(value: Any) -> list[int] | None:
     return result
 
 
+def video_reference_catalog() -> list[VideoReference]:
+    """Фото пользователя, затем кадры generate_image этого хода. Индексы с нуля."""
+    items: list[VideoReference] = []
+    for media in get_user_media():
+        if media.kind == "image" and media.data:
+            items.append(
+                VideoReference(
+                    data=media.data, mime_type=safe_image_mime(media.mime_type)
+                )
+            )
+    for record in generated_image_records():
+        if record["type"] == "url":
+            items.append(VideoReference(url=record["value"]))
+            continue
+        data, mime = decode_image_b64(record["value"])
+        items.append(VideoReference(data=data, mime_type=mime))
+    return items
+
+
+def resolve_video_references(
+    raw: Any,
+) -> tuple[list[VideoReference] | None, str | None]:
+    """Индексы → референсы. Пустой список оставляет текстовый ролик.
+
+    Ошибка возвращается до вызова провайдера, чтобы не открывать платную задачу.
+    """
+    if raw is None:
+        return None, None
+    indexes = _int_list(raw)
+    if indexes is None:
+        return None, "reference_indexes должен быть списком целых чисел."
+    if not indexes:
+        return None, None
+    if len(indexes) > VIDEO_MAX_REFERENCE_IMAGES:
+        return None, (
+            f"Можно передать не больше {VIDEO_MAX_REFERENCE_IMAGES} референсов."
+        )
+    if len(set(indexes)) != len(indexes):
+        return None, "reference_indexes не должен повторять один и тот же номер."
+    catalog = video_reference_catalog()
+    if any(index < 0 or index >= len(catalog) for index in indexes):
+        return None, (
+            "Номер референса вне диапазона. "
+            f"Сейчас доступно картинок: {len(catalog)} (номера с 0)."
+        )
+    return [catalog[index] for index in indexes], None
+
+
 class GenerateVideoTool(BaseTool):
     """Генерация видео через ``/v1/videos`` с polling."""
 
@@ -358,8 +427,11 @@ class GenerateVideoTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Сгенерировать короткое видео по текстовому описанию. "
+            "Сгенерировать короткое видео по описанию и картинкам-референсам. "
             "Вызывай, когда пользователь просит ролик, клип или анимацию. "
+            "Если внешность, предмет или место уже есть на фото пользователя "
+            "или на кадре из generate_image, передай reference_indexes. "
+            "Без них сервис видит только текст. "
             "Генерация занимает минуты — предупреди об ожидании только кратко."
         )
 
@@ -370,7 +442,23 @@ class GenerateVideoTool(BaseTool):
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Описание сцены и движения камеры.",
+                    "description": (
+                        "Описание сцены и движения. Если переданы референсы, "
+                        "называй их «первая картинка», «вторая картинка» "
+                        "в порядке reference_indexes."
+                    ),
+                },
+                "reference_indexes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Номера картинок-референсов. Сначала фото пользователя "
+                        "в этом сообщении (0, 1, …), затем кадры generate_image "
+                        "этого хода — их номера в поле reference_indexes ответа. "
+                        "Порядок массива совпадает с «первая картинка» в prompt. "
+                        f"Не больше {VIDEO_MAX_REFERENCE_IMAGES}. "
+                        "Без поля уходит только текст."
+                    ),
                 },
                 "model": {
                     "type": "string",
@@ -393,6 +481,11 @@ class GenerateVideoTool(BaseTool):
         prompt = kwargs.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return _error_json("Параметр prompt обязателен.")
+        references, ref_error = resolve_video_references(
+            kwargs.get("reference_indexes")
+        )
+        if ref_error:
+            return _error_json(ref_error)
         from app.infra.cost_tracker import BudgetExceededError, get_billing_user
         from app.infra.rate_limiter import rate_limiter
         from app.infra.security import security
@@ -415,10 +508,19 @@ class GenerateVideoTool(BaseTool):
                 model=selected,
                 duration=duration if isinstance(duration, int) else None,
                 resolution=resolution if isinstance(resolution, str) else None,
+                references=references,
             )
         except BudgetExceededError as exc:
             return _error_json(exc.message)
         except AssistAIError as exc:
+            from app.bot.video_retry import video_failure_reply
+            from app.storage.upload_sessions import get_upload_request_context
+
+            ctx = get_upload_request_context()
+            user_id = ctx.user_id if ctx is not None else get_billing_user()
+            chat_id = ctx.chat_id if ctx is not None else user_id
+            if chat_id is not None and user_id is not None:
+                return _error_json(await video_failure_reply(chat_id, user_id, exc))
             return _error_json(exc.message)
         except Exception as exc:
             logger.exception("generate_video_failed")
@@ -434,11 +536,13 @@ class GenerateVideoTool(BaseTool):
                     data=video.data,
                 )
             )
+        sent = 0 if references is None else len(references)
         return json.dumps(
             {
                 "status": "success",
                 "filename": video.filename,
                 "bytes": len(video.data),
+                "references": sent,
                 "note": (
                     "Видео уже отправляется пользователю в Telegram. "
                     "Кратко подтверди готовность."

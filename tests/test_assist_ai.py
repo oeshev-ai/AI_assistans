@@ -468,6 +468,7 @@ async def test_generate_image_tool_packs_url_and_base64(
     assert payload["prompt"] == "кот в шляпе"
     assert payload["image_count"] == 2
     assert payload["images"] == [{"type": "url"}, {"type": "base64"}]
+    assert payload["reference_indexes"] == [0, 1]
     assert "aGVsbG8=" not in json.dumps(payload)
     assert scope.images == [
         {"type": "url", "value": "https://cdn.example/cat.png"},

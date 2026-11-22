@@ -227,6 +227,38 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["assistant_storage"] = assistant_storage
     dispatcher.workflow_data["assistant"] = assistant
     dispatcher.workflow_data["pending_media"] = pending_media
+    from app.bot.image_retry import bind_image_delivery, image_delivery_loop
+    from app.storage.image_delivery import open_image_delivery_store
+
+    image_store = open_image_delivery_store(shared_redis)
+    bind_image_delivery(image_store)
+    async def _resume_image(provider: str, job_id: str) -> bytes:
+        return await assistant.recover_paid_file(provider, job_id, kind="image")
+
+    image_task = asyncio.create_task(
+        image_delivery_loop(
+            bot, image_store, R._download_image_url, resume=_resume_image
+        )
+    )
+    dispatcher.workflow_data["image_delivery_task"] = image_task
+    from app.bot.video_retry import (
+        bind_video_delivery,
+        download_video_for_retry,
+        video_delivery_loop,
+    )
+    from app.storage.video_delivery import open_video_delivery_store
+
+    video_store = open_video_delivery_store(shared_redis)
+    bind_video_delivery(video_store)
+    async def _resume_video(provider: str, job_id: str) -> bytes:
+        return await assistant.recover_paid_file(provider, job_id, kind="video")
+
+    video_task = asyncio.create_task(
+        video_delivery_loop(
+            bot, video_store, download_video_for_retry, resume=_resume_video
+        )
+    )
+    dispatcher.workflow_data["video_delivery_task"] = video_task
 
     from app.infra.envparse import env_int
 
@@ -296,7 +328,6 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
             [
                 BotCommand(command="settings", description="Настройки персоны"),
                 BotCommand(command="help", description="Что умеет бот"),
-                BotCommand(command="cancel", description="Отмена мастера"),
             ]
         )
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -306,6 +337,26 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
 
 async def on_shutdown(dispatcher: Dispatcher) -> None:
     """Закрывает клиент LLM, темы и профили, если startup успел их создать."""
+    image_task = dispatcher.workflow_data.get("image_delivery_task")
+    if isinstance(image_task, asyncio.Task):
+        image_task.cancel()
+        try:
+            await image_task
+        except asyncio.CancelledError:
+            pass
+    from app.bot.image_retry import bind_image_delivery
+
+    bind_image_delivery(None)
+    video_task = dispatcher.workflow_data.get("video_delivery_task")
+    if isinstance(video_task, asyncio.Task):
+        video_task.cancel()
+        try:
+            await video_task
+        except asyncio.CancelledError:
+            pass
+    from app.bot.video_retry import bind_video_delivery
+
+    bind_video_delivery(None)
     health_runner = dispatcher.workflow_data.get("health_runner")
     if health_runner is not None:
         app = getattr(health_runner, "app", None)

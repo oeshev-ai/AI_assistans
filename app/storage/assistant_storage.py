@@ -71,6 +71,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "Если пользователь просит нарисовать, сгенерировать или создать изображение, схему или иллюстрацию, вызови generate_image и не отказывайся. "
     "Если нужно изменить уже присланную картинку — вызови edit_image. "
     "Если просят ролик, клип или видео — вызови generate_video. "
+    "Если у ролика есть референсы — фото пользователя или кадры из generate_image — "
+    "передай их номера в generate_video параметром reference_indexes. "
+    "Номера приходят в ответе generate_image; фото в сообщении нумеруются с нуля. "
+    "В prompt называй их «первая картинка», «вторая картинка» в порядке этих номеров. "
+    "Без reference_indexes в сервис уходит только текст. "
+    "Если generate_video вернул ошибку, передай её смысл точно. "
+    "Если в ошибке сказано, что попытки скачать готовый ролик продолжатся, "
+    "так и скажи: новая генерация не запускается. "
+    "Если сказано, что ролик не придёт, повтори это и не предлагай просто подождать. "
     "Если просят расшифровать аудио/видео или сделать транскрипт — вызови transcribe_media "
     "(полный текст уйдёт пользователю файлом, не копируй его целиком в ответ). "
     "Если файл слишком большой для Telegram (~20 МБ), не влезает, пользователь просит "
@@ -171,6 +180,9 @@ def _dump_profile(profile: AssistantProfile) -> str:
     return json.dumps(profile.model_dump(), ensure_ascii=False, separators=(",", ":"))
 
 
+_MODEL_FIELDS = ("text_model", "image_model", "vision_model", "tts_model")
+
+
 def _load_profile(raw: str) -> AssistantProfile | None:
     try:
         payload = json.loads(raw)
@@ -181,6 +193,26 @@ def _load_profile(raw: str) -> AssistantProfile | None:
     except (ValueError, TypeError):
         logger.error("Пропущен повреждённый профиль ассистента")
         return None
+
+
+def _aliased_model_fields(
+    raw: str, profile: AssistantProfile
+) -> dict[str, dict[str, str | None]]:
+    """Поля моделей, которые валидатор переписал относительно JSON в Redis."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    drift: dict[str, dict[str, str | None]] = {}
+    for field in _MODEL_FIELDS:
+        before = payload.get(field)
+        stored = before if isinstance(before, str) or before is None else None
+        current = getattr(profile, field)
+        if stored != current:
+            drift[field] = {"old": stored, "new": current}
+    return drift
 
 
 async def _redis_value(value: Awaitable[_T] | _T) -> _T:
@@ -381,6 +413,7 @@ class RedisAssistantStorage(AssistantStorage):
             ) from exc
 
         profiles: dict[str, AssistantProfile] = {}
+        rewritten: list[tuple[str, AssistantProfile]] = []
         if isinstance(raw_map, dict):
             for field, payload in raw_map.items():
                 text = payload if isinstance(payload, str) else str(payload)
@@ -389,6 +422,27 @@ class RedisAssistantStorage(AssistantStorage):
                     continue
                 profile_id = field if isinstance(field, str) else str(field)
                 profiles[profile_id] = loaded
+                if _aliased_model_fields(text, loaded):
+                    rewritten.append((profile_id, loaded))
+        if rewritten:
+            try:
+                pipe = self._redis.pipeline(transaction=True)
+                for profile_id, profile in rewritten:
+                    pipe.hset(hash_key, profile_id, _dump_profile(profile))
+                await pipe.execute()
+            except RedisError as exc:
+                logger.exception(
+                    "Ошибка Redis при записи актуальных моделей, chat_id=%s",
+                    chat_id,
+                )
+                raise AssistantStorageError(
+                    "Профили ассистентов временно недоступны."
+                ) from exc
+            logger.info(
+                "legacy_models_persisted",
+                chat_id=chat_id,
+                profiles=len(rewritten),
+            )
 
         if DEFAULT_ASSISTANT_ID not in profiles:
             default = default_assistant_profile()

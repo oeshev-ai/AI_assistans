@@ -55,6 +55,10 @@ class AssistAIError(Exception):
         error_code: str | None = None,
         retry_after: float | None = None,
         job_committed: bool = False,
+        pending_url: str | None = None,
+        pending_provider: str | None = None,
+        pending_job_id: str | None = None,
+        pending_kind: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -62,6 +66,11 @@ class AssistAIError(Exception):
         self.error_code = error_code
         self.retry_after = retry_after
         self.job_committed = job_committed
+        # Уже оплаченный файл. Ссылка и id задачи в текст ошибки и в лог не попадают.
+        self.pending_url = pending_url
+        self.pending_provider = pending_provider
+        self.pending_job_id = pending_job_id
+        self.pending_kind = pending_kind
 
 
 def _normalized_code(exc: AssistAIError) -> str:

@@ -43,6 +43,7 @@ async def test_router_request_has_schema_and_numbered_photos() -> None:
     assert kwargs["use_tools"] is False
     assert "tool_choice" not in kwargs
     assert kwargs["temperature"] == 0
+    assert kwargs["reasoning"] == {"effort": "none"}
     assert kwargs["response_format"]["type"] == "json_schema"
     schema = kwargs["response_format"]["json_schema"]
     assert schema["strict"] is True

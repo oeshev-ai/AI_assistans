@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
-    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4.1-flash-1017",
     "google/gemini-3.8-flash",
     "google/gemini-4-argon",
     "anthropic/claude-sonnet-5-5",
@@ -41,7 +41,7 @@ OPENAI_TTS_VOICES: tuple[str, ...] = ("alloy", "verse", "nova", "shimmer")
 
 MODEL_HINTS: dict[str, str] = {
     # Текст
-    "deepseek/deepseek-v4.1-flash": "Дёшево: логика, код, математика, чёткая структура",
+    "deepseek/deepseek-v4.1-flash-1017": "Дёшево: логика, код, математика, чёткая структура",
     "openai/gpt-6-luna": "Универсальный ассистент, аккуратно вызывает инструменты",
     "qwen/qwen4-max": "Сложные тексты, аналитика, переводы со стилем",
     "google/gemini-3.8-flash": "Баланс: длинный контекст, документы, обучение",
@@ -71,9 +71,10 @@ LEGACY_IMAGE_MODEL_ALIASES: dict[str, str] = {
 }
 
 LEGACY_TEXT_MODEL_ALIASES: dict[str, str] = {
-    "qwen/qwen3.8-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash-1017",
+    "qwen/qwen3.8-flash": "deepseek/deepseek-v4.1-flash-1017",
     "qwen/qwen3.8-max-0902": "qwen/qwen4-max",
-    "z-ai/glm-5.3-flash": "deepseek/deepseek-v4.1-flash",
+    "z-ai/glm-5.3-flash": "deepseek/deepseek-v4.1-flash-1017",
     "google/gemini-3.1-flash-lite": "google/gemini-3.8-flash",
     "google/gemini-3.5-flash-lite": "google/gemini-3.8-flash",
     "anthropic/claude-haiku-5-5": "google/gemini-3.8-flash",

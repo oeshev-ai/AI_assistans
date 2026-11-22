@@ -68,6 +68,25 @@ def _get_generation_ids() -> list[str | None]:
     return list(value) if value else []
 
 
+def generated_image_records() -> list[dict[str, str]]:
+    """Картинки generate_image этого хода, без служебных generation_id."""
+    bucket = _REQUEST_IMAGES.get() or []
+    records: list[dict[str, str]] = []
+    for item in bucket:
+        kind = item.get("type")
+        value = item.get("value")
+        if kind in {"url", "base64"} and isinstance(value, str) and value:
+            records.append({"type": kind, "value": value})
+    return records
+
+
+def _user_photo_count() -> int:
+    """Фото пользователя в текущем ходе. Импорт локальный: media_tools → image_ops."""
+    from app.media.media_tools import get_user_media
+
+    return sum(1 for item in get_user_media() if item.kind == "image" and item.data)
+
+
 # FLUX принимает ярус разрешения, а не пиксели вроде 1024x1024.
 _FLUX_SIZE_TIERS: tuple[tuple[int, str], ...] = (
     (768, "768"),
@@ -225,6 +244,16 @@ class GenerateImageTool(BaseTool):
             return _error_json(exc.message)
         except AssistAIError as exc:
             logger.error("generate_image: %s", exc.message)
+            from app.bot.image_retry import image_failure_reply
+            from app.infra.cost_tracker import get_billing_user
+            from app.storage.upload_sessions import get_upload_request_context
+
+            ctx = get_upload_request_context()
+            billed = get_billing_user()
+            user_id = ctx.user_id if ctx is not None else billed
+            chat_id = ctx.chat_id if ctx is not None else user_id
+            if chat_id is not None and user_id is not None:
+                return _error_json(await image_failure_reply(chat_id, user_id, exc))
             return _error_json(exc.message)
         except (TypeError, ValueError) as exc:
             logger.error("generate_image: %s", exc)
@@ -248,27 +277,36 @@ class GenerateImageTool(BaseTool):
                     item["generation_id"] = generation_id
             packed.append(item)
         bucket = _REQUEST_IMAGES.get()
+        reference_indexes: list[int] = []
         if bucket is None:
             logger.warning(
                 "generate_image: нет ImageModelScope, картинки некому отдать в чат"
             )
         else:
+            prior = sum(
+                1
+                for item in bucket
+                if item.get("type") in {"url", "base64"} and item.get("value")
+            )
+            start = _user_photo_count() + prior
+            reference_indexes = list(range(start, start + len(packed)))
             bucket.extend(packed)
         logger.info("generate_image: получено изображений=%s", len(packed))
-        return json.dumps(
-            {
-                "status": "success",
-                "image_count": len(packed),
-                "images": [{"type": item["type"]} for item in packed],
-                "prompt": prompt.strip(),
-                "note": (
-                    "Изображение уже передаётся пользователю в Telegram. "
-                    "Не вставляй base64 и не вызывай инструмент повторно. "
-                    "Кратко подтверди, что картинка готова."
-                ),
-            },
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "status": "success",
+            "image_count": len(packed),
+            "images": [{"type": item["type"]} for item in packed],
+            "prompt": prompt.strip(),
+            "note": (
+                "Изображение уже передаётся пользователю в Telegram. "
+                "Если это референс для ролика, передай reference_indexes "
+                "в generate_video. Не вставляй base64 и не вызывай инструмент "
+                "повторно. Кратко подтверди, что картинка готова."
+            ),
+        }
+        if reference_indexes:
+            payload["reference_indexes"] = reference_indexes
+        return json.dumps(payload, ensure_ascii=False)
 
 
 def note_generation_id(generation_id: str | None) -> None:

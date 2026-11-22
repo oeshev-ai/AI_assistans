@@ -166,7 +166,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "предложениями, без вступлений и рассуждений вслух. Уточняющие вопросы "
             "задавай только при крайней необходимости."
         ),
-        text_model="deepseek/deepseek-v4.1-flash",
+        text_model="deepseek/deepseek-v4.1-flash-1017",
         image_model="black-forest-labs/flux-3-image-klein",
         image_size="1K",
         voice_mode="off",

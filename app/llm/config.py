@@ -138,7 +138,7 @@ class AssistAIConfig(BaseModel):
     openweather_api_key: str = Field(default="", repr=False)
     exchangerate_api_key: str = Field(default="", repr=False)
     base_url: str = "https://api.proxyapi.ru/v1"
-    default_text_model: str = "deepseek/deepseek-v4.1-flash"
+    default_text_model: str = "deepseek/deepseek-v4.1-flash-1017"
     default_image_model: str = "openai/gpt-image-2.6-flare"
     default_transcribe_model: str = "openai/whisper-large-v3"
     default_tts_model: str = "openai/gpt-4o-mini-tts"
@@ -159,7 +159,7 @@ class AssistAIConfig(BaseModel):
     speechkit_url: str = "https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis"
     timeout: float = Field(default=30.0, gt=0)
     max_tool_iterations: int = Field(default=5, ge=1)
-    photo_router_model: str = "deepseek/deepseek-v4.1-flash"
+    photo_router_model: str = "deepseek/deepseek-v4.1-flash-1017"
     router_confidence: float = Field(default=0.55, ge=0, le=1)
     router_max_tokens: int = Field(default=600, ge=1)
     # Мультипровайдерность. Пустые routes в from_env → polza primary;
@@ -285,7 +285,9 @@ class AssistAIConfig(BaseModel):
             text_fallback = registry.text_fallback
             audio_fallback = registry.audio_fallback
             video_fallback = registry.video_fallback
-        default_text_model = _model_env("TEXT_MODEL", "deepseek/deepseek-v4.1-flash")
+        default_text_model = _model_env(
+            "TEXT_MODEL", "deepseek/deepseek-v4.1-flash-1017"
+        )
         return cls(
             proxyapi_key=os.getenv("PROXYAPI_API_KEY", ""),
             base_url=base_url,
@@ -337,9 +339,9 @@ class AssistAIConfig(BaseModel):
             speechkit_speed=speechkit_speed,
             speechkit_url=speechkit_url,
             photo_router_model=os.getenv(
-                "PHOTO_ROUTER_MODEL", "deepseek/deepseek-v4.1-flash"
+                "PHOTO_ROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017"
             ).strip()
-            or "deepseek/deepseek-v4.1-flash",
+            or "deepseek/deepseek-v4.1-flash-1017",
             router_confidence=_bounded_float("PHOTO_ROUTER_CONFIDENCE", 0.55),
             router_max_tokens=_positive_int("PHOTO_ROUTER_MAX_TOKENS", 600),
         )

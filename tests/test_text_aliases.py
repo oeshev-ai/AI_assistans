@@ -17,7 +17,7 @@ from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfi
 
 def _assistant() -> SimpleNamespace:
     return SimpleNamespace(
-        config=SimpleNamespace(default_text_model="deepseek/deepseek-v4.1-flash")
+        config=SimpleNamespace(default_text_model="deepseek/deepseek-v4.1-flash-1017")
     )
 
 
@@ -82,6 +82,6 @@ def test_text_alias_flag_off_keeps_id_until_fallback(
 )
 def test_polza_text_model_aliases(bot_id: str, polza_id: str) -> None:
     assert resolve_polza_text_model(bot_id) == polza_id
-    assert resolve_polza_text_model("deepseek/deepseek-v4.1-flash") == (
-        "deepseek/deepseek-v4.1-flash"
+    assert resolve_polza_text_model("deepseek/deepseek-v4.1-flash-1017") == (
+        "deepseek/deepseek-v4.1-flash-1017"
     )

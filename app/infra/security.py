@@ -12,23 +12,21 @@ import structlog
 
 logger = structlog.get_logger("security")
 
+# Только подмена инструкций. Обычная речь и «сыграй роль» не режутся:
+# «ты теперь», «you are now», «act as a», «pretend to be», «new instructions for…».
 MALICIOUS_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s+instructions",
-    r"forget\s+(everything|all)",
-    r"you\s+are\s+now",
-    r"new\s+instructions?",
-    r"system\s*prompt",
-    r"reveal\s+(your|the)\s+instructions",
-    r"act\s+as\s+(if|a)",
-    r"pretend\s+to\s+be",
-    r"disregard\s+(all\s+)?previous",
+    r"disregard\s+(all\s+)?previous\s+(instructions|rules|prompts|directions)",
     r"override\s+(your|the)\s+(instructions|rules)",
-    # Common RU paraphrases (heuristic only).
+    r"reveal\s+(your|the)\s+instructions",
+    r"(reveal|show|print|dump|repeat)\s+(me\s+)?(your|the)\s+system\s*prompt",
+    r"forget\s+(everything|all)\s+(you\s+(know|were\s+told)|about\s+(your|the)\s+(instructions|rules|prompt)|previous|above|prior)",
+    r"new\s+instructions?\s*:",
+    r"you\s+are\s+now\s+(dan|jailbreak|unfiltered|without\s+restrictions)",
     r"игнорируй\s+(все\s+)?предыдущие\s+инструкции",
     r"забудь\s+(все\s+)?(инструкции|правила)",
-    r"системн(ый|ого)\s+промпт",
     r"раскрой\s+(свои\s+)?инструкции",
-    r"ты\s+теперь",
+    r"(покажи|выведи|напиши|скажи|повтори)\s+(мне\s+)?(свой\s+|свои\s+)?системн(ый|ого)\s+промпт",
 ]
 
 MAX_MESSAGE_LENGTH = 4000
