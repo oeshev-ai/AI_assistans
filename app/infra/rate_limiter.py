@@ -18,6 +18,11 @@ IMAGE_LIMIT = 5
 IMAGE_WINDOW_SECONDS = 3600.0
 MEDIA_LIMIT = 10
 MEDIA_WINDOW_SECONDS = 3600.0
+# HTTP загрузки нет в Telegram-лимите: страница и POST идут снаружи бота.
+UPLOAD_READ_LIMIT = 60
+UPLOAD_READ_WINDOW_SECONDS = 60.0
+UPLOAD_WRITE_LIMIT = 12
+UPLOAD_WRITE_WINDOW_SECONDS = 600.0
 
 # Atomic sliding-window consume: prune → count → zadd (or deny).
 _ALLOW_LUA = """
@@ -45,6 +50,9 @@ class RateLimiter:
         self._text_hits: dict[int, deque[float]] = defaultdict(deque)
         self._image_hits: dict[int, deque[float]] = defaultdict(deque)
         self._media_hits: dict[int, deque[float]] = defaultdict(deque)
+        self._upload_hits: dict[str, dict[str, deque[float]]] = defaultdict(
+            lambda: defaultdict(deque)
+        )
 
     def attach_redis(self, redis_client: Any | None) -> None:
         """Use Redis for durable counters when available."""
@@ -80,6 +88,43 @@ class RateLimiter:
             limit=MEDIA_LIMIT,
             window=MEDIA_WINDOW_SECONDS,
         )
+
+    async def check_upload_limit(self, identity: str, *, write: bool) -> bool:
+        """Скользящее окно на IP HTTP-загрузки. ``write`` — POST файла или presign."""
+        operation = "upload_write" if write else "upload_read"
+        limit = UPLOAD_WRITE_LIMIT if write else UPLOAD_READ_LIMIT
+        window = UPLOAD_WRITE_WINDOW_SECONDS if write else UPLOAD_READ_WINDOW_SECONDS
+        return await self._allow_named(
+            identity, operation=operation, limit=limit, window=window
+        )
+
+    async def get_upload_retry_after(self, identity: str, *, write: bool) -> float:
+        """Секунды до освобождения слота HTTP-загрузки."""
+        operation = "upload_write" if write else "upload_read"
+        limit = UPLOAD_WRITE_LIMIT if write else UPLOAD_READ_LIMIT
+        window = UPLOAD_WRITE_WINDOW_SECONDS if write else UPLOAD_READ_WINDOW_SECONDS
+        now = time.time()
+        key = self._named_key(identity, operation)
+        if self._redis is not None:
+            try:
+                await self._redis.zremrangebyscore(key, 0, now - window)
+                oldest = await self._redis.zrange(key, 0, 0, withscores=True)
+                count = await self._redis.zcard(key)
+                if count < limit or not oldest:
+                    return 0.0
+                return max(0.0, float(oldest[0][1]) + window - now)
+            except Exception as exc:
+                logger.warning("rate_limiter_redis_retry_after_failed", error=str(exc))
+        async with self._lock:
+            self._sweep_expired(now)
+            hits = self._upload_hits[operation][identity]
+            self._prune(hits, now, window)
+            if not hits:
+                self._upload_hits[operation].pop(identity, None)
+                return 0.0
+            if len(hits) < limit:
+                return 0.0
+            return max(0.0, hits[0] + window - now)
 
     async def get_retry_after(self, user_id: int, operation: str) -> float:
         """Seconds until the oldest hit leaves the window (0 if capacity free)."""
@@ -138,6 +183,55 @@ class RateLimiter:
                     user_id=user_id,
                 )
         return await self._allow_memory(user_id, operation, limit, window)
+
+    async def _allow_named(
+        self, identity: str, *, operation: str, limit: int, window: float
+    ) -> bool:
+        if self._redis is not None:
+            try:
+                return await self._allow_redis_key(
+                    self._named_key(identity, operation), limit, window
+                )
+            except Exception as exc:
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "rate_limiter_redis_failed_deny",
+                        error=str(exc),
+                        operation=operation,
+                    )
+                    return False
+                logger.warning(
+                    "rate_limiter_redis_failed_fallback_memory",
+                    error=str(exc),
+                    operation=operation,
+                )
+        now = time.time()
+        async with self._lock:
+            self._sweep_expired(now)
+            hits = self._upload_hits[operation][identity]
+            self._prune(hits, now, window)
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            return True
+
+    async def _allow_redis_key(self, key: str, limit: int, window: float) -> bool:
+        assert self._redis is not None
+        now = time.time()
+        member = f"{now}:{uuid.uuid4().hex}"
+        allowed = await self._redis.eval(
+            _ALLOW_LUA,
+            1,
+            key,
+            now - window,
+            limit,
+            now,
+            member,
+            int(window) + 1,
+        )
+        return int(allowed) == 1
 
     async def _allow_redis(
         self, user_id: int, operation: str, limit: int, window: float
@@ -201,6 +295,16 @@ class RateLimiter:
             self._prune(hits, now, MEDIA_WINDOW_SECONDS)
             if not hits:
                 self._media_hits.pop(user_id, None)
+        windows = {
+            "upload_read": UPLOAD_READ_WINDOW_SECONDS,
+            "upload_write": UPLOAD_WRITE_WINDOW_SECONDS,
+        }
+        for operation, bucket in list(self._upload_hits.items()):
+            window = windows.get(operation, UPLOAD_READ_WINDOW_SECONDS)
+            for identity, hits in list(bucket.items()):
+                self._prune(hits, now, window)
+                if not hits:
+                    bucket.pop(identity, None)
 
     @staticmethod
     def _prune(hits: deque[float], now: float, window: float) -> None:
@@ -211,6 +315,11 @@ class RateLimiter:
     @staticmethod
     def _key(user_id: int, operation: str) -> str:
         return f"rl:{operation}:{user_id}"
+
+    @staticmethod
+    def _named_key(identity: str, operation: str) -> str:
+        safe = identity.strip()[:128] or "unknown"
+        return f"rl:{operation}:{safe}"
 
 
 rate_limiter = RateLimiter()

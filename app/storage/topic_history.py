@@ -7,20 +7,17 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
-from pathlib import Path
 from typing import Any
 
 import structlog
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
-from app.storage.history_storage import trim_messages
+from app.storage.message_trim import trim_messages
 
 logger = structlog.get_logger("TopicHistory")
 
@@ -55,13 +52,14 @@ class TopicConfig(BaseModel):
     @classmethod
     def from_env(cls) -> TopicConfig:
         """Читает ``REDIS_URL``, ``TOPIC_TTL_DAYS`` и ``MAX_HISTORY_LENGTH``."""
-        # Project root .env, then cwd fallback (same pattern as history_storage).
-        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-        load_dotenv()
+        from app.infra.settings import get_settings, load_project_dotenv
+
+        load_project_dotenv()
+        settings = get_settings()
         return cls(
-            redis_url=os.getenv("REDIS_URL", ""),
-            topic_ttl_days=os.getenv("TOPIC_TTL_DAYS", "30"),  # type: ignore[arg-type]
-            max_history_length=os.getenv("MAX_HISTORY_LENGTH", "20"),  # type: ignore[arg-type]
+            redis_url=settings.redis_url,
+            topic_ttl_days=settings.topic_ttl_days,  # type: ignore[arg-type]
+            max_history_length=settings.max_history_length,  # type: ignore[arg-type]
         )
 
 

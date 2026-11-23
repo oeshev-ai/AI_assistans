@@ -104,12 +104,11 @@ async def start_health_server(
     Default bind is ``127.0.0.1`` (override with ``HEALTH_BIND``, use
     ``0.0.0.0`` inside Docker so published ports work).
     """
-    import os
+    from app.infra.settings import get_settings
 
     # Запас под multipart + большие медиа (прокси-upload через наш домен).
-    from app.infra.envparse import env_int
-
-    max_mb = max(1, env_int("UPLOAD_MAX_MB", 512))
+    settings = get_settings()
+    max_mb = settings.upload_max_mb
     app = web.Application(client_max_size=(max_mb + 8) * 1024 * 1024)
     app["upload_enabled"] = False
 
@@ -123,7 +122,7 @@ async def start_health_server(
         setup_app(app)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    raw = bind if bind is not None else os.getenv("HEALTH_BIND")
+    raw = bind if bind is not None else settings.health_bind
     host = (raw or "127.0.0.1").strip() or "127.0.0.1"
     site = web.TCPSite(runner, host, port)
     await site.start()

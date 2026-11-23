@@ -42,7 +42,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     TelegramObject,
 )
-from dotenv import load_dotenv
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from sentry_sdk.integrations.aiohttp import AioHttpIntegration
@@ -114,13 +113,13 @@ from app.storage.assistant_storage import (
     compose_system_prompt,
     create_assistant_storage,
 )
-from app.storage.history_storage import RedisConfig
 from app.storage.persona_icons import (
     DEFAULT_ICON,
     PERSONA_ICONS,
     normalize_icon,
     persona_label,
 )
+from app.storage.redis_config import RedisConfig
 from app.storage.s3_storage import S3Storage, S3StorageError, get_storage
 from app.storage.topic_history import (
     TopicConfig,
@@ -186,6 +185,7 @@ _FLOW_KEYS = (
     "flow_image_model",
     "flow_topic_id",
     "flow_topic_name",
+    "flow_assistant_id",
     "flow_icon",
     "flow_preset_id",
     "flow_photo_id",

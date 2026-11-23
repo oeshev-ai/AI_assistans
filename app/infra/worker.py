@@ -17,20 +17,16 @@ from __future__ import annotations
 
 import base64
 import json
-import os
-from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import structlog
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-load_dotenv()
-
-from app.infra.access import is_production
-from app.infra.envparse import env_int
+from app.infra.access import is_production, require_redis_password
 from app.infra.logging_setup import configure_logging
+from app.infra.settings import get_settings, load_project_dotenv
+
+load_project_dotenv()
 from app.llm.assist_ai import AssistAIClient, AssistAIConfig
 
 configure_logging()
@@ -40,7 +36,7 @@ logger = structlog.get_logger("worker")
 def _warn_polza_user_hash_secret() -> None:
     if not is_production():
         return
-    if (os.getenv("POLZA_USER_HASH_SECRET") or "").strip():
+    if get_settings().polza_user_hash_secret:
         return
     logger.error(
         "polza_user_hash_secret_missing",
@@ -51,7 +47,7 @@ def _warn_polza_user_hash_secret() -> None:
 def redis_settings() -> Any:
     from arq.connections import RedisSettings
 
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+    redis_url = get_settings().worker_redis_url
     parsed = urlparse(redis_url)
     return RedisSettings(
         host=parsed.hostname or "localhost",
@@ -101,6 +97,8 @@ async def startup(ctx: dict[str, Any]) -> None:
     from app.infra.cost_tracker import cost_tracker
     from app.infra.job_queue import validate_arq_image_timeout
 
+    require_redis_password()
+
     try:
         validate_arq_image_timeout()
     except ValueError as exc:
@@ -110,7 +108,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     _warn_polza_user_hash_secret()
     ctx["assistant"] = AssistAIClient(AssistAIConfig.from_env())
     cost_tracker.require_llm_budgets_configured()
-    redis_url = os.getenv("REDIS_URL", "").strip()
+    redis_url = get_settings().redis_url
     billing_redis = await attach_worker_billing_redis(redis_url)
     ctx["billing_redis"] = billing_redis
     logger.info("worker_started")
@@ -304,7 +302,7 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = redis_settings()
-    max_jobs = env_int("ARQ_MAX_JOBS", 10)
+    max_jobs = get_settings().arq_max_jobs
     # Одна попытка: повтор после падения создал бы вторую платную задачу.
     max_tries = 1
-    job_timeout = env_int("ARQ_JOB_TIMEOUT", 450)
+    job_timeout = get_settings().arq_job_timeout

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import secrets
 import tempfile
 import time
@@ -14,7 +13,7 @@ from typing import Any, Protocol
 import structlog
 from aiohttp import BodyPartReader, web
 
-from app.storage.s3_storage import S3StorageError
+from app.storage.s3_storage import S3NotFoundError, S3StorageError
 from app.storage.upload_sessions import (
     UploadSession,
     UploadSessionStore,
@@ -77,20 +76,24 @@ ALLOWED_EXTENSIONS = (
 
 
 def _allowed_mime_types() -> set[str]:
-    raw = os.getenv("UPLOAD_ALLOWED_MIME_TYPES", "").strip()
+    from app.infra.settings import get_settings
+
+    raw = get_settings().upload_allowed_mime_types
     if not raw:
         return set(DEFAULT_ALLOWED_MIME)
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 def _trust_proxy() -> bool:
-    flag = os.getenv("TRUST_PROXY", "").strip().lower()
-    return flag in {"1", "true", "yes", "on"}
+    from app.infra.settings import get_settings
+
+    return get_settings().trust_proxy
 
 
 def _legacy_presign_enabled() -> bool:
-    flag = os.getenv("UPLOAD_LEGACY_PRESIGN", "0").strip().lower()
-    return flag in {"1", "true", "yes", "on"}
+    from app.infra.settings import get_settings
+
+    return get_settings().upload_legacy_presign
 
 
 def _request_is_https(request: web.Request) -> bool:
@@ -100,6 +103,45 @@ def _request_is_https(request: web.Request) -> bool:
     if not _trust_proxy():
         return False
     return request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+
+
+def _client_key(request: web.Request) -> str:
+    """IP для лимита. За доверенным прокси берётся адрес, который дописал nginx."""
+    if _trust_proxy():
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if parts:
+            return parts[-1][:128]
+    return (request.remote or "unknown")[:128]
+
+
+async def _upload_rate_limited(
+    request: web.Request, *, write: bool
+) -> web.Response | None:
+    """429 до чтения тела. ``None`` — слот есть, обработчик продолжается."""
+    from app.infra.rate_limiter import rate_limiter
+
+    identity = _client_key(request)
+    if await rate_limiter.check_upload_limit(identity, write=write):
+        return None
+    retry = max(
+        1, int(await rate_limiter.get_upload_retry_after(identity, write=write))
+    )
+    logger.warning("upload_rate_limited", client=identity, write=write)
+    headers = {"Retry-After": str(retry)}
+    if write:
+        return web.json_response(
+            {"error": "Слишком много запросов. Попробуйте позже."},
+            status=429,
+            headers=headers,
+        )
+    return web.Response(
+        text="Слишком много запросов. Попробуйте позже.",
+        status=429,
+        content_type="text/plain",
+        charset="utf-8",
+        headers=headers,
+    )
 
 
 def _extract_token(request: web.Request) -> str:
@@ -316,6 +358,9 @@ def setup_upload_routes(
     max_bytes = storage.config.max_upload_mb * 1024 * 1024
 
     async def page(request: web.Request) -> web.Response:
+        limited = await _upload_rate_limited(request, write=False)
+        if limited is not None:
+            return limited
         upload_id = request.match_info["upload_id"]
         query_token = request.rel_url.query.get("t", "").strip()
         token = _extract_token(request)
@@ -359,6 +404,9 @@ def setup_upload_routes(
         return page
 
     async def presign(request: web.Request) -> web.Response:
+        limited = await _upload_rate_limited(request, write=True)
+        if limited is not None:
+            return limited
         upload_id = request.match_info["upload_id"]
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
@@ -429,6 +477,9 @@ def setup_upload_routes(
         )
 
     async def complete(request: web.Request) -> web.Response:
+        limited = await _upload_rate_limited(request, write=True)
+        if limited is not None:
+            return limited
         upload_id = request.match_info["upload_id"]
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
@@ -453,9 +504,11 @@ def setup_upload_routes(
 
         try:
             head = await storage.head_object(object_key)
+        except S3NotFoundError:
+            return web.json_response({"error": "Объект не найден"}, status=400)
         except S3StorageError as exc:
             logger.warning("upload_complete_head_failed", error=str(exc.message))
-            return web.json_response({"error": "Объект не найден"}, status=400)
+            return web.json_response({"error": "Ошибка проверки загрузки"}, status=500)
 
         size = int(head.get("ContentLength") or 0)
         if size <= 0:
@@ -503,6 +556,9 @@ def setup_upload_routes(
 
     async def upload_file(request: web.Request) -> web.Response:
         """Same-origin multipart → S3 (обход CORS / Telegram WebView)."""
+        limited = await _upload_rate_limited(request, write=True)
+        if limited is not None:
+            return limited
         upload_id = request.match_info["upload_id"]
         token = _extract_token(request)
         # Claim early so two parallel POSTs cannot both process.
@@ -590,10 +646,10 @@ def setup_upload_routes(
 
             from app.media.file_magic import mime_compatible
 
-            with Path(tmp_path).open("rb") as probe:
-                head = probe.read(64)
-            if not mime_compatible(
-                filename=file_name, claimed_mime=effective_type, head=head
+            if not await mime_compatible(
+                filename=file_name,
+                claimed_mime=effective_type,
+                source=Path(tmp_path),
             ):
                 await _release_claim()
                 return web.json_response(
@@ -683,13 +739,16 @@ def _guess_mime(filename: str) -> str:
 
 
 def public_upload_url(upload_id: str, token: str) -> str | None:
-    base = os.getenv("UPLOAD_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    from app.infra.settings import get_settings
+
+    base = get_settings().upload_public_base_url.rstrip("/")
     if not base:
         return None
     return f"{base}/upload/{upload_id}?t={token}"
 
 
 def is_upload_feature_ready() -> bool:
+    from app.infra.settings import get_settings
     from app.storage.s3_storage import is_s3_configured
 
-    return is_s3_configured() and bool(os.getenv("UPLOAD_PUBLIC_BASE_URL", "").strip())
+    return is_s3_configured() and bool(get_settings().upload_public_base_url)

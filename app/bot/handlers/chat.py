@@ -131,6 +131,8 @@ async def handle_voice(
     voice = message.voice
     if voice is None:
         return
+    if await R._reject_if_busy(message, state):
+        return
     if voice.duration > MAX_VOICE_DURATION_SECONDS:
         await message.answer("Голосовое слишком длинное. Максимум — 10 минут.")
         return

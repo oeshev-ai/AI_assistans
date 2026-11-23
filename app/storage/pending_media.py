@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -26,12 +25,9 @@ _KEY = "chat:{chat_id}:user:{user_id}:asst:{assistant_id}:pending_photo"
 
 def pending_ttl_seconds() -> int:
     """TTL отложенных фото из ``PHOTO_PENDING_TTL_SECONDS``."""
-    raw = os.getenv("PHOTO_PENDING_TTL_SECONDS", "900").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return 900
-    return value if value > 0 else 900
+    from app.infra.settings import get_settings
+
+    return get_settings().photo_pending_ttl_seconds
 
 
 class PendingMediaError(Exception):
@@ -155,6 +151,10 @@ class PendingMediaStorage(ABC):
     async def clear(self, chat_id: int, assistant_id: str, user_id: int) -> None:
         """Удаляет альбом."""
 
+    @abstractmethod
+    async def clear_user(self, chat_id: int, user_id: int) -> bool:
+        """Снимает pending у всех персон пользователя в чате. True, если что-то было."""
+
     async def pop(
         self, chat_id: int, assistant_id: str, user_id: int
     ) -> PendingMedia | None:
@@ -275,6 +275,15 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
         async with self._lock:
             self._items.pop(self._key(chat_id, user_id, assistant_id), None)
 
+    async def clear_user(self, chat_id: int, user_id: int) -> bool:
+        async with self._lock:
+            keys = [
+                key for key in self._items if key[0] == chat_id and key[1] == user_id
+            ]
+            for key in keys:
+                self._items.pop(key, None)
+            return bool(keys)
+
     async def pop(
         self, chat_id: int, assistant_id: str, user_id: int
     ) -> PendingMedia | None:
@@ -383,6 +392,17 @@ class RedisPendingMediaStorage(PendingMediaStorage):
         except RedisError as exc:
             raise PendingMediaError("Не удалось удалить отложенные фото.") from exc
 
+    async def clear_user(self, chat_id: int, user_id: int) -> bool:
+        pattern = f"chat:{chat_id}:user:{user_id}:asst:*:pending_photo"
+        cleared = False
+        try:
+            async for key in self._redis.scan_iter(match=pattern, count=50):
+                await self._redis.delete(key)
+                cleared = True
+        except RedisError as exc:
+            raise PendingMediaError("Не удалось удалить отложенные фото.") from exc
+        return cleared
+
     async def pop(
         self, chat_id: int, assistant_id: str, user_id: int
     ) -> PendingMedia | None:
@@ -457,8 +477,9 @@ async def create_pending_media_storage(
     (как FSM), без тихой деградации в память процесса.
     """
     from app.infra.access import is_production
+    from app.infra.settings import get_settings
 
-    url = (redis_url if redis_url is not None else os.getenv("REDIS_URL", "")).strip()
+    url = (redis_url if redis_url is not None else get_settings().redis_url).strip()
     if not url:
         if is_production():
             logger.error("pending_media_redis_required_in_production")

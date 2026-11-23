@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -16,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from prometheus_client import Counter, Gauge
 
-from app.infra.envparse import env_float
+from app.infra.settings import get_settings
 
 if TYPE_CHECKING:
     from app.llm.providers import ProviderConfig
@@ -106,14 +105,15 @@ LLM_BUDGET_REMAINING = Gauge(
 )
 
 # Approximate ProxyAPI / OpenAI-class rates (USD).
-CHAT_INPUT_PER_1K = env_float("COST_CHAT_INPUT_PER_1K", 0.00015)
-CHAT_OUTPUT_PER_1K = env_float("COST_CHAT_OUTPUT_PER_1K", 0.0006)
-IMAGE_USD = env_float("COST_IMAGE_USD", 0.04)
+_rates = get_settings()
+CHAT_INPUT_PER_1K = _rates.cost_chat_input_per_1k
+CHAT_OUTPUT_PER_1K = _rates.cost_chat_output_per_1k
+IMAGE_USD = _rates.cost_image_usd
 # FLUX klein ~1–2 ₽ → ~0.005 условных USD при RUB_PER_USD=304.
 # Уточнять по дашборду: Δ₽ / N / RUB_PER_USD → COST_IMAGE_FLAT_MAP.
-IMAGE_FLUX_USD = env_float("COST_IMAGE_FLUX_USD", 0.005)
+IMAGE_FLUX_USD = _rates.cost_image_flux_usd
 # Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
-RUB_PER_USD = env_float("RUB_PER_USD", 304.0)
+RUB_PER_USD = _rates.cost_rub_per_usd
 
 
 def extract_cost_rub(usage: dict[str, Any] | None) -> float | None:
@@ -237,7 +237,7 @@ def _parse_flat_map(raw: str | None) -> dict[str, float]:
 
 
 # Per-model flat USD when usage missing; empty → COST_IMAGE_FLUX_USD for non-OpenAI.
-IMAGE_FLAT_MAP: dict[str, float] = _parse_flat_map(os.getenv("COST_IMAGE_FLAT_MAP"))
+IMAGE_FLAT_MAP: dict[str, float] = _parse_flat_map(_rates.cost_image_flat_map)
 
 
 def flat_image_usd(model: str | None) -> float:
@@ -249,10 +249,10 @@ def flat_image_usd(model: str | None) -> float:
     return IMAGE_FLUX_USD
 
 
-IMAGE_OUT_USD_PER_1M = env_float("IMAGE_OUT_USD_PER_1M", 30.0)
-IMAGE_IN_USD_PER_1M = env_float("IMAGE_IN_USD_PER_1M", 8.0)
-TEXT_IN_USD_PER_1M = env_float("TEXT_IN_USD_PER_1M", 5.0)
-TEXT_OUT_USD_PER_1M = env_float("TEXT_OUT_USD_PER_1M", 10.0)
+IMAGE_OUT_USD_PER_1M = _rates.image_out_usd_per_1m
+IMAGE_IN_USD_PER_1M = _rates.image_in_usd_per_1m
+TEXT_IN_USD_PER_1M = _rates.text_in_usd_per_1m
+TEXT_OUT_USD_PER_1M = _rates.text_out_usd_per_1m
 # Выходные токены GPT Image. Измерено: 1024²/low=824, 1024×1536 и 1536×1024/high=1353.
 # Остальные пары — оценка калькулятора, не проверяли. Ориентация токены не меняет.
 _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
@@ -268,9 +268,9 @@ _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
     ("1024x1536", "max"): 5488,  # оценка
 }
 IMAGE_INPUT_TOKEN_CAP = 1536  # наблюдение: 12 MP → 1452 (44×33); берём верхнюю границу
-VIDEO_USD = env_float("COST_VIDEO_USD", 0.20)
-STT_PER_MINUTE = env_float("COST_STT_PER_MINUTE", 0.006)
-TTS_PER_1K_CHARS = env_float("COST_TTS_PER_1K_CHARS", 0.015)
+VIDEO_USD = _rates.cost_video_usd
+STT_PER_MINUTE = _rates.cost_stt_per_minute
+TTS_PER_1K_CHARS = _rates.cost_tts_per_1k_chars
 
 
 def _openai_image_model(model: str) -> bool:
@@ -378,8 +378,9 @@ class CostTracker:
         self._redis: Any | None = None
         self._memory: dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self.daily_budget = env_float("LLM_DAILY_BUDGET_USD", 0.0)
-        self.user_daily_budget = env_float("LLM_USER_DAILY_BUDGET_USD", 0.0)
+        settings = get_settings()
+        self.daily_budget = settings.llm_daily_budget_usd
+        self.user_daily_budget = settings.llm_user_daily_budget_usd
 
     def attach_redis(self, redis_client: Any | None) -> None:
         self._redis = redis_client

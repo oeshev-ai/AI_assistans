@@ -30,7 +30,7 @@ from app.llm.video_settings import (
     coerce_generate_audio,
     coerce_resolution,
 )
-from app.storage.history_storage import RedisConfig
+from app.storage.redis_config import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
 

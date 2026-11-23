@@ -33,7 +33,7 @@ worker.py       точка входа arq: worker.WorkerSettings
 
 Запрос идёт так: хендлер → активная персона и тема → `AssistAIClient` → провайдер. Картинки, TTS и STT при `ARQ_ENABLED=1` ставит в очередь процесс бота, считает их воркер. Чат остаётся в процессе бота.
 
-Диалоги живут в `TopicHistoryStorage` (`TOPIC_TTL_DAYS`, по умолчанию 30). `app/storage/history_storage.py` и `HISTORY_TTL_DAYS` — старое плоское хранилище, бот его не вызывает. `create_storage` в production без живого Redis завершает процесс, как темы и персоны; вне production по-прежнему остаётся память. `trim_messages` и `RedisConfig` оттуда ещё нужны.
+Диалоги живут в `TopicHistoryStorage` (`TOPIC_TTL_DAYS`, по умолчанию 30). Обрезка ленты — `app/storage/message_trim.py`. `RedisConfig` в `app/storage/redis_config.py` задаёт только `REDIS_URL` для профилей ассистентов. `create_topic_storage` и `create_assistant_storage` в production без живого Redis завершают процесс; вне production пустой или недоступный URL оставляет память процесса.
 
 Снятые id моделей (`gpt-image-1.5`, `qwen3.8-max`, `eleven-multilingual-v2` и остальные из таблиц в `app/llm/models_config.py`) при чтении профиля из Redis переписываются на актуальные и сразу сохраняются обратно. Следующее чтение уже не логирует алиас. Выключить подмену: `IMAGE_LEGACY_ALIASES=0`, `TEXT_LEGACY_ALIASES=0`, `TTS_LEGACY_ALIASES=0`.
 

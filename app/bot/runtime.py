@@ -564,61 +564,16 @@ def _is_http_url(value: str) -> bool:
 
 # s3.polza.ai с VPN часто ReadTimeout; s3-alt отдаёт тот же объект за секунды.
 _IMAGE_URL_TIMEOUT = httpx.Timeout(45.0, connect=15.0)
-_POLZA_CDN_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "s3.polza.ai": ("s3-alt.polza.ai",),
-}
-
-
-def _image_url_candidates(url: str) -> list[str]:
-    """Сначала зеркало CDN (если есть), затем исходный URL."""
-    from urllib.parse import urlparse, urlunparse
-
-    parsed = urlparse(url)
-    alts = _POLZA_CDN_FALLBACKS.get(parsed.netloc.casefold(), ())
-    candidates = [urlunparse(parsed._replace(netloc=alt)) for alt in alts]
-    if url not in candidates:
-        candidates.append(url)
-    return candidates
 
 
 async def _download_image_url(url: str) -> bytes:
-    """Скачивает картинку на стороне бота до отправки в Telegram."""
-    from urllib.parse import urlparse
+    """Скачивает картинку на стороне бота до отправки в Telegram.
 
-    last_error: Exception | None = None
-    candidates = _image_url_candidates(url)
-    async with httpx.AsyncClient(
-        timeout=_IMAGE_URL_TIMEOUT, follow_redirects=True
-    ) as client:
-        # Оба хоста иногда дают один ReadTimeout на свежий объект.
-        # Второй проход забирает файл, который минутой раньше не открылся.
-        for attempt in (1, 2):
-            for candidate in candidates:
-                try:
-                    response = await client.get(candidate)
-                    response.raise_for_status()
-                    raw = response.content
-                except httpx.HTTPError as exc:
-                    last_error = exc
-                    logger.warning(
-                        "image_cdn_download_failed",
-                        host=urlparse(candidate).netloc,
-                        error=type(exc).__name__,
-                        attempt=attempt,
-                    )
-                    continue
-                if raw:
-                    if candidate != url:
-                        logger.info(
-                            "image_cdn_fallback_used",
-                            from_host=urlparse(url).netloc,
-                            to_host=urlparse(candidate).netloc,
-                        )
-                    return raw
-                last_error = AssistAIError("CDN провайдера вернул пустое изображение.")
-    raise AssistAIError(
-        "Не удалось скачать изображение с CDN провайдера."
-    ) from last_error
+    Без follow-redirects и с pin публичных IP — тот же контур, что у видео CDN.
+    """
+    from app.llm.media_api import download_public_image
+
+    return await download_public_image(url, timeout=_IMAGE_URL_TIMEOUT)
 
 
 def _extract_generated_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1292,11 +1247,9 @@ def _upload_process_semaphore() -> asyncio.Semaphore:
     """Limit concurrent large-upload STT jobs to bound RAM pressure."""
     global _upload_process_sem
     if _upload_process_sem is None:
-        from app.infra.envparse import env_int
+        from app.infra.settings import get_settings
 
-        _upload_process_sem = asyncio.Semaphore(
-            max(1, env_int("UPLOAD_MAX_CONCURRENT", 2))
-        )
+        _upload_process_sem = asyncio.Semaphore(get_settings().upload_max_concurrent)
     return _upload_process_sem
 
 
@@ -1375,8 +1328,8 @@ async def _process_s3_upload_session(
         data = await storage.download_bytes(object_key, max_bytes=max_bytes)
         from app.media.file_magic import mime_compatible
 
-        if not mime_compatible(
-            filename=filename, claimed_mime=mime_type, head=data[:64]
+        if not await mime_compatible(
+            filename=filename, claimed_mime=mime_type, source=data
         ):
             await bot.send_message(
                 chat_id, "Файл отклонён: содержимое не соответствует типу."
@@ -2182,6 +2135,19 @@ async def _edit_inline(
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             logger.warning("Не удалось обновить сообщение: %s", exc)
+
+
+_BUSY_STEP = (
+    "Сначала завершите текущий шаг или нажмите «Отмена», затем пришлите файл ещё раз."
+)
+
+
+async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
+    """True, если открыт wizard: медиа/голос не берём и говорим об этом."""
+    if await state.get_state() is None:
+        return False
+    await message.answer(_BUSY_STEP)
+    return True
 
 
 async def _drop_flow(state: FSMContext) -> None:

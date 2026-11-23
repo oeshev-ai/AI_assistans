@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
-
-from app.infra.envparse import env_int
 
 logger = structlog.get_logger("s3_storage")
 
@@ -20,6 +17,10 @@ class S3StorageError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class S3NotFoundError(S3StorageError):
+    """Объекта нет в бакете. Остальные сбои S3 этим классом не маскируются."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,27 +35,64 @@ class S3Config:
 
     @classmethod
     def from_env(cls) -> S3Config | None:
-        bucket = os.getenv("YC_BUCKET_NAME", "").strip()
-        access_key_id = os.getenv("YC_ACCESS_KEY_ID", "").strip()
-        secret_access_key = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+        from app.infra.settings import get_settings
+
+        settings = get_settings()
+        bucket = settings.yc_bucket_name
+        access_key_id = settings.yc_access_key_id
+        secret_access_key = settings.yc_secret_access_key
         if not bucket or not access_key_id or not secret_access_key:
             return None
-        from app.infra.envparse import ensure_https_url
+        from app.storage.s3_endpoint import s3_endpoint_url, valid_bucket_name
 
-        endpoint = ensure_https_url(
-            os.getenv("YC_S3_ENDPOINT", "").strip(),
-            name="YC_S3_ENDPOINT",
-            default="https://storage.yandexcloud.net",
-        )
+        if not valid_bucket_name(bucket):
+            logger.error("s3_bucket_name_rejected", bucket=bucket)
+            raise SystemExit(1)
+        endpoint = s3_endpoint_url(settings.yc_s3_endpoint)
         return cls(
             endpoint=endpoint,
-            region=os.getenv("YC_REGION", "ru-central1").strip() or "ru-central1",
+            region=settings.yc_region,
             bucket=bucket,
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
-            signed_url_expires_in=max(60, env_int("SIGNED_URL_EXPIRES_IN", 1800)),
-            max_upload_mb=max(1, env_int("UPLOAD_MAX_MB", 512)),
+            signed_url_expires_in=settings.signed_url_expires_in,
+            max_upload_mb=settings.upload_max_mb,
         )
+
+
+_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _storage_error_types() -> tuple[type[BaseException], ...]:
+    """Ошибки SDK и локального чтения файла. Сбои кода сюда не входят.
+
+    ``ClientError`` (ответ бакета: 403, 404, 500) не наследник ``BotoCoreError``.
+    """
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:  # pragma: no cover - dependency guard
+        return (OSError,)
+    return (BotoCoreError, ClientError, OSError)
+
+
+def _error_code(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict) and error.get("Code"):
+            return str(error["Code"])
+    return type(exc).__name__
+
+
+def _is_missing(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error")
+    code = str(error.get("Code") or "") if isinstance(error, dict) else ""
+    meta = response.get("ResponseMetadata")
+    status = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
+    return code in _MISSING_CODES or status == 404
 
 
 def _build_client(config: S3Config) -> Any:
@@ -66,9 +104,20 @@ def _build_client(config: S3Config) -> Any:
             "Пакет boto3 не установлен. Добавьте boto3 в requirements."
         ) from exc
 
+    from urllib.parse import urlsplit
+
+    from app.storage.s3_endpoint import (
+        YANDEX_S3_HOST,
+        allowed_s3_hosts,
+        guard_s3_request,
+    )
+
     # virtual-hosted: https://{bucket}.storage.yandexcloud.net/... — так же, как
     # у рабочего MRISchoolClub / AWS SDK; path-style чаще ломает CORS в браузере.
-    return boto3.client(
+    # На loopback path-style, иначе хост становится {bucket}.localhost.
+    host = urlsplit(config.endpoint).hostname
+    style = "virtual" if host == YANDEX_S3_HOST else "path"
+    client = boto3.client(
         "s3",
         endpoint_url=config.endpoint,
         region_name=config.region,
@@ -76,9 +125,16 @@ def _build_client(config: S3Config) -> Any:
         aws_secret_access_key=config.secret_access_key,
         config=BotoConfig(
             signature_version="s3v4",
-            s3={"addressing_style": "virtual"},
+            s3={"addressing_style": style},
         ),
     )
+    allowed = allowed_s3_hosts(config.endpoint, config.bucket)
+
+    def _guard(request, **_kwargs: object) -> None:
+        guard_s3_request(getattr(request, "url", ""), allowed=allowed)
+
+    client.meta.events.register("before-send.s3", _guard)
+    return client
 
 
 class S3Storage:
@@ -90,7 +146,9 @@ class S3Storage:
 
     async def create_presigned_put(self, *, object_key: str, content_type: str) -> str:
         def _sign() -> str:
-            return self._client.generate_presigned_url(
+            from app.storage.s3_endpoint import allowed_s3_hosts, guard_s3_request
+
+            signed = self._client.generate_presigned_url(
                 "put_object",
                 Params={
                     "Bucket": self.config.bucket,
@@ -100,12 +158,19 @@ class S3Storage:
                 ExpiresIn=self.config.signed_url_expires_in,
                 HttpMethod="PUT",
             )
+            guard_s3_request(
+                signed,
+                allowed=allowed_s3_hosts(self.config.endpoint, self.config.bucket),
+            )
+            return signed
 
         try:
             return await asyncio.to_thread(_sign)
-        except Exception as exc:
-            logger.exception("s3_presign_failed", key=object_key)
-            raise S3StorageError(f"Не удалось создать ссылку загрузки: {exc}") from exc
+        except _storage_error_types() as exc:
+            logger.exception(
+                "s3_presign_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось создать ссылку загрузки") from exc
 
     async def upload_file(
         self, *, object_key: str, file_path: str, content_type: str
@@ -122,9 +187,11 @@ class S3Storage:
 
         try:
             await asyncio.to_thread(_upload)
-        except Exception as exc:
-            logger.exception("s3_upload_file_failed", key=object_key)
-            raise S3StorageError(f"Не удалось загрузить объект: {exc}") from exc
+        except _storage_error_types() as exc:
+            logger.exception(
+                "s3_upload_file_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось загрузить объект") from exc
 
     async def head_object(self, object_key: str) -> dict[str, Any]:
         def _head() -> dict[str, Any]:
@@ -132,8 +199,11 @@ class S3Storage:
 
         try:
             return await asyncio.to_thread(_head)
-        except Exception as exc:
-            raise S3StorageError(f"Объект не найден в бакете: {object_key}") from exc
+        except _storage_error_types() as exc:
+            if _is_missing(exc):
+                raise S3NotFoundError("Объект не найден в бакете") from exc
+            logger.exception("s3_head_failed", key=object_key, error=_error_code(exc))
+            raise S3StorageError("Не удалось проверить объект в бакете") from exc
 
     async def download_bytes(
         self, object_key: str, *, max_bytes: int | None = None
@@ -174,9 +244,11 @@ class S3Storage:
             return await asyncio.to_thread(_get)
         except S3StorageError:
             raise
-        except Exception as exc:
-            logger.exception("s3_download_failed", key=object_key)
-            raise S3StorageError(f"Не удалось скачать объект: {exc}") from exc
+        except _storage_error_types() as exc:
+            logger.exception(
+                "s3_download_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось скачать объект") from exc
 
     async def delete_object(self, object_key: str) -> None:
         def _delete() -> None:
@@ -184,8 +256,8 @@ class S3Storage:
 
         try:
             await asyncio.to_thread(_delete)
-        except Exception as exc:
-            logger.warning("s3_delete_failed", key=object_key, error=str(exc))
+        except _storage_error_types() as exc:
+            logger.warning("s3_delete_failed", key=object_key, error=_error_code(exc))
 
 
 def is_s3_configured() -> bool:

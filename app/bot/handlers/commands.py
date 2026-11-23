@@ -56,11 +56,8 @@ async def cmd_cancel(
     had_album = await get_album_hub().cancel_chat(message.chat.id, user_id)
     had_pending = False
     try:
-        profile = await R._active_profile(message.chat.id, assistant_storage)
-        had_pending = (
-            await pending_media.get(message.chat.id, profile.id, user_id) is not None
-        )
-        await pending_media.clear(message.chat.id, profile.id, user_id)
+        # Pending ключуется по persona — чистим все слоты пользователя в чате.
+        had_pending = await pending_media.clear_user(message.chat.id, user_id)
     except Exception:
         had_pending = False
     menu = await R._menu_for(message.chat.id, assistant_storage, topic_storage)

@@ -1,10 +1,26 @@
-"""Lightweight file-signature sniffing for upload MIME validation."""
+"""Проверка контейнера загрузки через ffmpeg.
+
+Сигнатура в начале файла этого не делает. MP4 с незнакомым major brand
+остаётся обычным ISO-BMFF, а префикс ID3 или ftyp без настоящего контейнера
+ffmpeg не открывает.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import re
+import tempfile
 from pathlib import Path
 
-# Extension → acceptable sniffed MIME families.
+import structlog
+
+from app.media.media_utils import MediaProcessingError, find_ffmpeg
+
+logger = structlog.get_logger("file_magic")
+
+_PROBE_TIMEOUT_SECONDS = 30.0
+
+# Расширение → допустимые MIME того же семейства.
 _EXT_FAMILIES: dict[str, frozenset[str]] = {
     ".mp3": frozenset({"audio/mpeg", "audio/mp3"}),
     ".m4a": frozenset({"audio/mp4", "audio/m4a", "audio/x-m4a"}),
@@ -24,32 +40,9 @@ _CLAIM_ALIASES: dict[str, str] = {
     "audio/m4a": "audio/mp4",
 }
 
-
-def sniff_mime(data: bytes) -> str | None:
-    """Return a best-effort MIME from magic bytes, or None if unknown."""
-    if not data:
-        return None
-    if data.startswith(b"ID3"):
-        return "audio/mpeg"
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        return "audio/mpeg"
-    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WAVE":
-        return "audio/wav"
-    if data.startswith(b"OggS"):
-        return "audio/ogg"
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        brand = data[8:12]
-        if brand in {b"M4A ", b"M4B ", b"mp4a"}:
-            return "audio/mp4"
-        if brand in {b"qt  ", b"M4V "}:
-            return "video/quicktime"
-        return "video/mp4"
-    if data.startswith(b"\x1aE\xdf\xa3"):
-        # EBML: WebM or Matroska — accept either at the family layer.
-        if b"webm" in data[:64].lower():
-            return "video/webm"
-        return "video/x-matroska"
-    return None
+_ISO_FORMATS = frozenset({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"})
+_INPUT_RE = re.compile(r"Input #\d+,\s*(.+),\s+from\s+")
+_STREAM_RE = re.compile(r"Stream #\d+:\d+.*?:\s*(Audio|Video):")
 
 
 def normalize_mime(value: str) -> str:
@@ -57,27 +50,127 @@ def normalize_mime(value: str) -> str:
     return _CLAIM_ALIASES.get(lowered, lowered)
 
 
-def mime_compatible(
+def _parse_probe(stderr: str) -> tuple[str, bool, bool] | None:
+    """Имя формата ffmpeg и наличие аудио/видео. ``None``, если контейнер не открылся."""
+    if "Error opening input" in stderr:
+        return None
+    match = _INPUT_RE.search(stderr)
+    if match is None:
+        return None
+    kinds = {item.group(1).lower() for item in _STREAM_RE.finditer(stderr)}
+    has_audio = "audio" in kinds
+    has_video = "video" in kinds
+    if not has_audio and not has_video:
+        return None
+    return match.group(1).strip(), has_audio, has_video
+
+
+def container_mime(
+    format_name: str,
+    *,
+    has_audio: bool,
+    has_video: bool,
+    ext: str,
+) -> str | None:
+    """MIME по формату ffmpeg и дорожкам, с учётом расширения."""
+    if not has_audio and not has_video:
+        return None
+    tokens = {part.strip().lower() for part in format_name.split(",") if part.strip()}
+    if "mp3" in tokens:
+        return "audio/mpeg" if has_audio else None
+    if "wav" in tokens:
+        return "audio/wav" if has_audio else None
+    if "ogg" in tokens:
+        if has_video and not has_audio:
+            return "video/ogg"
+        return "audio/ogg" if has_audio else None
+    if tokens & {"matroska", "webm"}:
+        if "webm" in tokens:
+            return "video/webm" if has_video else "audio/webm" if has_audio else None
+        return "video/x-matroska" if has_video or has_audio else None
+    if tokens & _ISO_FORMATS:
+        if ext == ".m4a":
+            return "audio/mp4" if has_audio else None
+        if ext == ".mov":
+            return (
+                "video/quicktime" if has_video else "audio/mp4" if has_audio else None
+            )
+        if has_video:
+            return "video/mp4"
+        if has_audio:
+            return "audio/mp4"
+    return None
+
+
+def _claim_ok(claimed_mime: str, family: frozenset[str]) -> bool:
+    if not claimed_mime or claimed_mime == "application/octet-stream":
+        return True
+    return normalize_mime(claimed_mime) in family
+
+
+async def _probe(path: Path) -> tuple[str, bool, bool] | None:
+    try:
+        ffmpeg = find_ffmpeg()
+    except MediaProcessingError:
+        logger.error("mime_probe_ffmpeg_missing")
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_PROBE_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.warning("mime_probe_timeout")
+        return None
+    return _parse_probe((stderr or b"").decode("utf-8", errors="replace"))
+
+
+async def mime_compatible(
     *,
     filename: str,
     claimed_mime: str,
-    head: bytes,
+    source: bytes | Path,
 ) -> bool:
-    """True when sniffed signature matches extension / claimed MIME family."""
-    sniffed = sniff_mime(head)
-    if sniffed is None:
-        return False
-    sniffed_n = normalize_mime(sniffed)
-    claimed_n = normalize_mime(claimed_mime) if claimed_mime else ""
+    """True, если ffmpeg открыл контейнер того же семейства, что расширение и MIME.
+
+    ``source`` — байты файла или путь к уже записанному временному файлу.
+    Поддельный префикс без контейнера даёт False. Нестандартный major brand
+    у настоящего MP4/M4A остаётся True.
+    """
     ext = Path(filename).suffix.lower()
     family = _EXT_FAMILIES.get(ext)
-    if family is not None and sniffed_n not in family:
+    if family is None or not _claim_ok(claimed_mime, family):
         return False
-    if claimed_n and claimed_n != "application/octet-stream":
-        claimed_family = family or frozenset({claimed_n})
-        # Claimed type must sit in the same family as the extension/sniff.
-        if claimed_n not in claimed_family and claimed_n != sniffed_n:
-            # Allow alias overlap: audio/mpeg vs audio/mp3 already normalized.
-            if family is not None and claimed_n not in family:
-                return False
-    return True
+    if isinstance(source, Path):
+        if not source.is_file() or source.stat().st_size <= 0:
+            return False
+        probed = await _probe(source)
+    else:
+        if not source:
+            return False
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(source)
+            tmp_path = Path(tmp.name)
+        try:
+            probed = await _probe(tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    if probed is None:
+        return False
+    format_name, has_audio, has_video = probed
+    sniffed = container_mime(
+        format_name, has_audio=has_audio, has_video=has_video, ext=ext
+    )
+    if sniffed is None:
+        return False
+    return normalize_mime(sniffed) in family

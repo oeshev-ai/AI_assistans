@@ -24,7 +24,6 @@ from app.bot.constants import (
     MemoryStorage,
     MenuButtonCommands,
     Message,
-    Path,
     Redis,
     RedisConfig,
     SendMessage,
@@ -40,10 +39,8 @@ from app.bot.constants import (
     get_storage,
     is_upload_feature_ready,
     job_queue,
-    load_dotenv,
     logger,
     logging,
-    os,
     rate_limiter,
     sentry_sdk,
     setup_upload_routes,
@@ -52,8 +49,13 @@ from app.bot.constants import (
 )
 from app.bot.handlers import _register_handlers
 from app.bot.middleware import AllowlistMiddleware
-from app.infra.access import is_production, parse_allowed_user_ids
+from app.infra.access import (
+    is_production,
+    parse_allowed_user_ids,
+    require_redis_password,
+)
 from app.infra.security import redact_url_credentials
+from app.infra.settings import get_settings, load_project_dotenv
 from app.storage.pending_media import PendingMediaStorage, create_pending_media_storage
 
 _SENSITIVE_KEYS = frozenset(
@@ -99,7 +101,8 @@ def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
 
 def init_sentry() -> None:
     """Initialize Sentry when ``SENTRY_DSN`` is present."""
-    dsn = os.getenv("SENTRY_DSN", "").strip()
+    settings = get_settings()
+    dsn = settings.sentry_dsn
     if not dsn:
         if is_production():
             logger.error(
@@ -112,8 +115,8 @@ def init_sentry() -> None:
         return
     sentry_sdk.init(
         dsn=dsn,
-        environment=os.getenv("ENVIRONMENT", "development"),
-        release=os.getenv("APP_VERSION", "1.0.0"),
+        environment=settings.environment,
+        release=settings.app_version,
         integrations=[
             AioHttpIntegration(),
             LoggingIntegration(level=logging.INFO, event_level=logging.ERROR),
@@ -124,7 +127,7 @@ def init_sentry() -> None:
     )
     logger.info(
         "sentry_initialized",
-        environment=os.getenv("ENVIRONMENT", "development"),
+        environment=settings.environment,
     )
 
 
@@ -132,7 +135,7 @@ def warn_polza_user_hash_secret() -> None:
     """In production, plain SHA256 user hashes are dictionary-guessable."""
     if not is_production():
         return
-    if (os.getenv("POLZA_USER_HASH_SECRET") or "").strip():
+    if get_settings().polza_user_hash_secret:
         return
     logger.error(
         "polza_user_hash_secret_missing",
@@ -207,7 +210,8 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     topic_storage: TopicHistoryStorage | None = None
     assistant_storage: AssistantStorage | None = None
     pending_media: PendingMediaStorage | None = None
-    redis_url = os.getenv("REDIS_URL", "").strip()
+    settings = get_settings()
+    redis_url = settings.redis_url
     shared_redis = await _open_shared_redis(redis_url)
     rate_limiter.attach_redis(shared_redis)
     cost_tracker.attach_redis(shared_redis)
@@ -215,7 +219,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     from app.bot.album import get_album_hub
 
     get_album_hub().attach_redis(shared_redis)
-    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1":
+    if settings.photo_router_fast_path:
         logger.warning(
             "photo_router_fast_path_enabled",
             hint="Skips LLM router; forces edit at confidence 1.0 — keep 0 in production",
@@ -281,10 +285,8 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     )
     dispatcher.workflow_data["video_delivery_task"] = video_task
 
-    from app.infra.envparse import env_int
-
-    metrics_port = env_int("METRICS_PORT", 8083)
-    health_port = env_int("HEALTH_PORT", 8082)
+    metrics_port = settings.metrics_port
+    health_port = settings.health_port
     start_metrics_server(port=metrics_port)
 
     upload_store = UploadSessionStore(shared_redis)
@@ -295,7 +297,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["s3_storage"] = s3_storage
 
     def _setup_upload_http(app: Any) -> None:
-        if s3_storage is None or not os.getenv("UPLOAD_PUBLIC_BASE_URL", "").strip():
+        if s3_storage is None or not settings.upload_public_base_url:
             logger.info(
                 "large_upload_disabled",
                 reason="YC_* or UPLOAD_PUBLIC_BASE_URL not configured",
@@ -322,7 +324,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
         app["upload_enabled"] = True
         logger.info(
             "large_upload_enabled",
-            public_base=os.getenv("UPLOAD_PUBLIC_BASE_URL", "").strip(),
+            public_base=settings.upload_public_base_url,
         )
 
     health_runner = await start_health_server(
@@ -438,17 +440,17 @@ class _ChromeBot(Bot):
 
 async def main() -> None:
     """Запускает long polling. Токен бота читается из TELEGRAM_BOT_TOKEN."""
-    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-    load_dotenv()
+    load_project_dotenv()
+    require_redis_password()
     init_sentry()
     warn_polza_user_hash_secret()
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = get_settings().telegram_bot_token
     if not token:
         logger.error("telegram_token_missing")
         raise SystemExit(1)
 
     bot = _ChromeBot(token=token, session=AiohttpSession())
-    storage = await create_fsm_storage(os.getenv("REDIS_URL", "").strip())
+    storage = await create_fsm_storage(get_settings().redis_url)
     dispatcher = Dispatcher(storage=storage)
     allowed_ids = parse_allowed_user_ids()
     if allowed_ids:

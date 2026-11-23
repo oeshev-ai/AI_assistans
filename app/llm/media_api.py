@@ -446,6 +446,43 @@ async def download_public_video(
     объект. Если оба хоста молчат, ошибка несёт ``pending_url`` — бот повторит
     скачивание без новой генерации.
     """
+    return await _download_public_cdn(
+        url,
+        timeout=timeout,
+        attempts=attempts,
+        kind="video",
+        fail_message=video_user_error("download"),
+        keep_pending_on_transient=True,
+    )
+
+
+async def download_public_image(
+    url: str, *, timeout: httpx.Timeout, attempts: int = 2
+) -> bytes:
+    """Скачивает готовую картинку с публичного CDN без follow-redirects.
+
+    Тот же SSRF-контур, что у видео: только https на публичные IP, без редиректов.
+    """
+    return await _download_public_cdn(
+        url,
+        timeout=timeout,
+        attempts=attempts,
+        kind="image",
+        fail_message="Не удалось скачать изображение с CDN провайдера.",
+        keep_pending_on_transient=False,
+    )
+
+
+async def _download_public_cdn(
+    url: str,
+    *,
+    timeout: httpx.Timeout,
+    attempts: int,
+    kind: str,
+    fail_message: str,
+    keep_pending_on_transient: bool,
+) -> bytes:
+    """Общий GET публичного CDN: resolve → pin → без редиректов."""
     candidates = cdn_download_candidates(url) if isinstance(url, str) else []
     last_code = "NETWORK_ERROR"
     permanent = False
@@ -458,19 +495,28 @@ async def download_public_video(
         )
         if not resolved or with_auth:
             logger.warning(
-                "video_cdn_url_rejected",
+                "cdn_url_rejected",
+                kind=kind,
                 host=urlparse(candidate).hostname if isinstance(candidate, str) else "",
             )
             continue
         attempted = True
         try:
-            data = await _fetch_public_video(resolved, pins, timeout, attempts=attempts)
+            data = await _fetch_public_cdn(
+                resolved,
+                pins,
+                timeout,
+                attempts=attempts,
+                kind=kind,
+                fail_message=fail_message,
+            )
         except AssistAIError as exc:
             last_code = exc.error_code or last_code
             if exc.error_code == "NOT_FOUND" and candidate == url.strip():
                 permanent = True
             logger.warning(
-                "video_cdn_download_failed",
+                "cdn_download_failed",
+                kind=kind,
                 host=urlparse(candidate).hostname,
                 error_code=exc.error_code,
             )
@@ -478,29 +524,38 @@ async def download_public_video(
         if data:
             if candidate != url.strip():
                 logger.info(
-                    "video_cdn_fallback_used",
+                    "cdn_fallback_used",
+                    kind=kind,
                     host=urlparse(candidate).hostname,
                 )
             return data
-    keep = isinstance(url, str) and polza_cdn_url(url) and not permanent
+    keep = (
+        keep_pending_on_transient
+        and isinstance(url, str)
+        and polza_cdn_url(url)
+        and not permanent
+    )
     if not attempted and not keep:
         last_code = "GUARD_UNSAFE_URL"
     raise AssistAIError(
-        video_user_error("download"),
+        fail_message,
         error_code=last_code,
         job_committed=True,
         pending_url=url.strip() if keep and isinstance(url, str) else None,
     )
 
 
-async def _fetch_public_video(
+async def _fetch_public_cdn(
     url: str,
     pinned_ips: tuple[str, ...],
     timeout: httpx.Timeout,
     *,
     attempts: int = 2,
+    kind: str = "video",
+    fail_message: str | None = None,
 ) -> bytes:
     """GET без ключа провайдера. Приватный адрес сюда не доходит."""
+    message = fail_message or video_user_error("download")
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").strip()
     request_url = url
@@ -526,7 +581,7 @@ async def _fetch_public_video(
             code = exc.response.status_code
             if code in {403, 404, 410}:
                 raise AssistAIError(
-                    video_user_error("download"),
+                    message,
                     error_code="NOT_FOUND",
                     job_committed=True,
                 ) from exc
@@ -537,13 +592,31 @@ async def _fetch_public_video(
             if response.content:
                 return bytes(response.content)
         if attempt < tries:
-            logger.warning("generate_video_download_retry", attempt=attempt)
+            logger.warning("cdn_download_retry", kind=kind, attempt=attempt)
             await asyncio.sleep(_VIDEO_RETRY_PAUSE)
     raise AssistAIError(
-        video_user_error("download"),
+        message,
         error_code="NETWORK_ERROR",
         job_committed=True,
     ) from last
+
+
+async def _fetch_public_video(
+    url: str,
+    pinned_ips: tuple[str, ...],
+    timeout: httpx.Timeout,
+    *,
+    attempts: int = 2,
+) -> bytes:
+    """Совместимость: прежнее имя для GET публичного CDN."""
+    return await _fetch_public_cdn(
+        url,
+        pinned_ips,
+        timeout,
+        attempts=attempts,
+        kind="video",
+        fail_message=video_user_error("download"),
+    )
 
 
 def _url_with_pinned_ip(url: str, ip: str) -> str:
@@ -582,7 +655,7 @@ class MediaApiMixin(ProviderTransportMixin):
         try:
             return await attempt(primary)
         except AssistAIError as exc:
-            reason = fallback_reason(exc)
+            reason = fallback_reason(exc, paid_side_effect=True)
             if reason == "insufficient_balance":
                 logger.error("provider_balance_exhausted", provider=primary.id)
             if fallback is None or reason is None:
@@ -669,6 +742,20 @@ class MediaApiMixin(ProviderTransportMixin):
             )
             logger.info("generate_video_done", bytes=len(result.data))
             return result
+        except AssistAIError as exc:
+            if exc.job_committed:
+                provider_id = exc.pending_provider
+                if not provider_id:
+                    primary, _fallback = self._registry.resolve_route("video")
+                    provider_id = primary.id
+                await cost_tracker.record(
+                    kind="video",
+                    amount_usd=VIDEO_USD,
+                    provider=provider_id,
+                    model=catalog_model,
+                    source="flat",
+                )
+            raise
         finally:
             await cost_tracker.release_reservation()
 
@@ -1199,7 +1286,7 @@ class MediaApiMixin(ProviderTransportMixin):
         try:
             return await attempt(primary)
         except AssistAIError as exc:
-            reason = fallback_reason(exc)
+            reason = fallback_reason(exc, paid_side_effect=True)
             if reason == "insufficient_balance":
                 logger.error("provider_balance_exhausted", provider=primary.id)
             if fallback is None or reason is None:

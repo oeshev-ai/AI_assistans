@@ -18,7 +18,7 @@ from app.storage.assistant_storage import (
     InMemoryAssistantStorage,
     RedisAssistantStorage,
 )
-from app.storage.history_storage import RedisConfig
+from app.storage.redis_config import RedisConfig
 
 pytestmark = pytest.mark.asyncio
 

@@ -10,6 +10,7 @@ from app.infra.rate_limiter import (
     IMAGE_LIMIT,
     MEDIA_LIMIT,
     TEXT_LIMIT,
+    UPLOAD_WRITE_LIMIT,
     RateLimiter,
 )
 
@@ -45,6 +46,17 @@ async def test_media_limit_independent_of_image() -> None:
     assert await limiter.check_image_limit(user_id) is True
     retry = await limiter.get_retry_after(user_id, "media")
     assert retry > 0
+
+
+@pytest.mark.asyncio
+async def test_upload_write_limit_is_per_ip() -> None:
+    limiter = RateLimiter()
+    for _ in range(UPLOAD_WRITE_LIMIT):
+        assert await limiter.check_upload_limit("203.0.113.8", write=True) is True
+    assert await limiter.check_upload_limit("203.0.113.8", write=True) is False
+    assert await limiter.check_upload_limit("203.0.113.9", write=True) is True
+    assert await limiter.get_upload_retry_after("203.0.113.8", write=True) > 0
+    assert await limiter.check_upload_limit("203.0.113.8", write=False) is True
 
 
 @pytest.mark.asyncio

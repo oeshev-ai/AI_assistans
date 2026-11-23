@@ -54,7 +54,9 @@ services:
     environment:
       # Host is compose service; omit userinfo when REDIS_PASSWORD is empty
       # (redis://:@host breaks arq AUTH). Password set → redis://:pass@redis:6379/0
+      # Пустой REDIS_PASSWORD при ENVIRONMENT=production завершает процесс бота.
       REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ENVIRONMENT: production
       # Keep in sync with .env; worker profile alone is not enough.
       ARQ_ENABLED: ${ARQ_ENABLED:-0}
@@ -80,6 +82,7 @@ services:
       - .env
     environment:
       REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ARQ_ENABLED: "1"
       ENVIRONMENT: production
     command: ["arq", "worker.WorkerSettings"]

@@ -31,18 +31,6 @@ from app.bot.constants import (
 from app.bot.handlers.photo import PhotoTurn, deliver_album, incoming_from_message
 from app.storage.pending_media import PendingMediaStorage
 
-_BUSY_STEP = (
-    "Сначала завершите текущий шаг или нажмите «Отмена», затем пришлите файл ещё раз."
-)
-
-
-async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
-    """True, если открыт другой шаг: файл не берём и говорим об этом."""
-    if await state.get_state() is None:
-        return False
-    await message.answer(_BUSY_STEP)
-    return True
-
 
 async def on_upload_cancel(
     query: CallbackQuery,
@@ -106,7 +94,7 @@ async def handle_audio(
     audio = message.audio
     if audio is None:
         return
-    if await _reject_if_busy(message, state):
+    if await R._reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):
@@ -161,7 +149,7 @@ async def handle_video_file(
     video = message.video or message.video_note
     if video is None:
         return
-    if await _reject_if_busy(message, state):
+    if await R._reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):
@@ -220,7 +208,7 @@ async def handle_photo(
     """
     if not message.photo:
         return
-    if await _reject_if_busy(message, state):
+    if await R._reject_if_busy(message, state):
         return
     photo = incoming_from_message(message)
     if photo is None:
@@ -264,7 +252,7 @@ async def handle_document(
     state: FSMContext,
 ) -> None:
     """Документ: картинка/PDF через Vision; аудио/видео — в media pipeline персоны."""
-    if await _reject_if_busy(message, state):
+    if await R._reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):
