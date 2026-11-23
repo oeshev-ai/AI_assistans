@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
@@ -34,14 +33,6 @@ from app.llm.video_settings import (
 from app.storage.history_storage import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
-
-
-def legacy_aliases_enabled() -> bool:
-    """``IMAGE_LEGACY_ALIASES=0`` оставляет старый image-id до soft-fallback."""
-    raw = os.getenv("IMAGE_LEGACY_ALIASES")
-    if raw is None or not raw.strip():
-        return True
-    return raw.strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def alias_model(model: str | None, table: dict[str, str], kind: str) -> str | None:
@@ -140,6 +131,8 @@ class AssistantProfile(BaseModel):
     text_model: str | None = None
     image_model: str | None = None
     image_size: str | None = None
+    image_background: Literal["auto", "transparent", "opaque"] | None = None
+    image_as_file: dict[str, bool] = Field(default_factory=dict)
     video_aspect_ratio: str | None = None
     video_duration: int | None = None
     video_resolution: str | None = None
@@ -151,6 +144,33 @@ class AssistantProfile(BaseModel):
     tts_role: str | None = None
     tts_format: str | None = None
     stt_language: str | None = None
+
+    @field_validator("image_background", mode="before")
+    @classmethod
+    def _image_background(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip().casefold()
+        if cleaned in {"auto", "transparent", "opaque"}:
+            return cleaned
+        return None
+
+    @field_validator("image_as_file", mode="before")
+    @classmethod
+    def _image_as_file(cls, value: object) -> dict[str, bool]:
+        """Какие модели отдавать файлом. Чужие значения не ломают загрузку."""
+        if not isinstance(value, dict):
+            return {}
+        cleaned: dict[str, bool] = {}
+        for key, flag in value.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            if flag is True or (
+                isinstance(flag, str)
+                and flag.strip().casefold() in {"1", "true", "yes"}
+            ):
+                cleaned[key.strip()] = True
+        return cleaned
 
     @field_validator("icon")
     @classmethod

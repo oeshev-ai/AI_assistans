@@ -47,11 +47,14 @@ jobs:
             ${{ steps.image.outputs.name }}:latest
             ${{ steps.image.outputs.name }}:${{ github.event.workflow_run.head_sha }}
 
-      # Доставка на VPS: в .env на сервере задать
-      #   APP_IMAGE=ghcr.io/<owner>/<repo>:latest
-      # (тот же name, что steps.image выше), затем:
-      #   docker compose pull && docker compose up -d
-      # Нужны секрет SSH_PRIVATE_KEY и login в GHCR на хосте.
+      # Авто-доставка на VPS (раскомментировать после чеклиста в README «Деплой»).
+      # Секреты: SSH_HOST, SSH_USER=deploy, SSH_PRIVATE_KEY.
+      # На сервере: APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:latest
+      # и docker login ghcr.io (если пакет private).
+      # Каталог: /home/deploy/AI_assistans (не /opt/vpd06).
+      # При ARQ_ENABLED=1 заменить up на:
+      #   docker compose --profile arq pull
+      #   docker compose --profile arq up -d
       # - name: Deploy over SSH
       #   uses: appleboy/ssh-action@v1
       #   with:
@@ -59,6 +62,7 @@ jobs:
       #     username: ${{ secrets.SSH_USER }}
       #     key: ${{ secrets.SSH_PRIVATE_KEY }}
       #     script: |
-      #       cd /opt/vpd06
+      #       set -e
+      #       cd /home/deploy/AI_assistans
       #       docker compose pull
       #       docker compose up -d

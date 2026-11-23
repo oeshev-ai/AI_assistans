@@ -21,6 +21,15 @@ def test_openai_gets_quality_without_complexity() -> None:
     )
     assert body["quality"] == "high"
     assert "complexity" not in body
+    assert "background" not in body
+    with_background = _image_generation_body(
+        "openai/gpt-image-2.6-flare",
+        "poster",
+        "1024x1024",
+        quality="high",
+        background="transparent",
+    )
+    assert with_background["background"] == "transparent"
 
 
 def test_other_families_omit_openai_params() -> None:
@@ -37,3 +46,4 @@ def test_other_families_omit_openai_params() -> None:
         )
         assert "quality" not in body
         assert "complexity" not in body
+        assert "background" not in body

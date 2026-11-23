@@ -237,7 +237,9 @@ async def test_edit_keeps_result_file_id_not_source(
     )
     await pending.put(media)
 
-    async def send(_message: Any, _image: str, _index: int) -> SimpleNamespace:
+    async def send(
+        _message: Any, _image: str, _index: int, *, as_file: bool = False
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             photo=[
                 SimpleNamespace(file_id="thumb"),

@@ -14,7 +14,8 @@
 * ``data`` — список ``[{"url": ...}]`` (допускаем и объект, и ``b64_json``);
 * референсы передаются как ``{"type": "base64", "data": ...}``;
 * опрос статуса — только ``GET /v1/media/{id}``;
-* ``complexity`` и ``background`` не отправляются;
+* ``complexity`` не отправляется; ``background`` — только у GPT Image
+  (``auto`` / ``transparent`` / ``opaque``), правка всегда ``auto``;
 * ``usage.cost_rub`` приходит уже в синхронном ответе.
 
 Адаптер не знает про breaker и fallback: это делает ``assist_ai``.
@@ -332,11 +333,6 @@ def polza_media_profile(model: str) -> PolzaMediaProfile:
     )
 
 
-def uses_image_resolution(model: str) -> bool:
-    """True, если каталог принимает ``image_resolution``, не pixel ``size``."""
-    return polza_media_profile(model).mode == "resolution"
-
-
 def _snap_resolution(raw: str, allowed: frozenset[str]) -> str:
     """Ближайший ярус из ``allowed`` (каталог модели)."""
     if not allowed:
@@ -494,12 +490,13 @@ def build_media_body(
     quality: str | None = None,
     output_format: str | None = "png",
     images: list[bytes] | None = None,
+    background: str | None = None,
     max_images: int | None = 1,
     user: str | None = None,
     pin_upstream: bool | None = None,
     send_max_price: bool | None = None,
 ) -> dict[str, Any]:
-    """Тело ``POST /v1/media``. ``complexity`` и ``background`` не включаются."""
+    """Тело ``POST /v1/media``. ``complexity`` не включается."""
     media_input: dict[str, Any] = {"prompt": prompt}
     if aspect_ratio:
         media_input["aspect_ratio"] = aspect_ratio
@@ -513,6 +510,8 @@ def build_media_body(
         media_input["output_format"] = output_format
     if max_images:
         media_input["max_images"] = max_images
+    if background:
+        media_input["background"] = background
     if images:
         # Порядок сохраняется: основа — первой, как в prepare_edit_files.
         media_input["images"] = [
@@ -810,6 +809,7 @@ async def generate(
     quality: str | None = None,
     output_format: str | None = "png",
     images: list[bytes] | None = None,
+    background: str | None = None,
     max_images: int | None = 1,
     user: str | None = None,
     pin_upstream: bool | None = None,
@@ -839,6 +839,7 @@ async def generate(
         quality=quality,
         output_format=output_format,
         images=images,
+        background=background,
         max_images=max_images,
         user=user,
         pin_upstream=pin_upstream,

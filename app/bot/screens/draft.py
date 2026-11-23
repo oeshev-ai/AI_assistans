@@ -91,7 +91,9 @@ def _draft_models_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _icons_keyboard(prefix: str, current: str) -> InlineKeyboardMarkup:
+def _icons_keyboard(
+    prefix: str, current: str, *, done: str = "picker:done"
+) -> InlineKeyboardMarkup:
     """Сетка иконок по 5 в ряд; callback — индекс в PERSONA_ICONS."""
     current_icon = normalize_icon(current)
     rows: list[list[InlineKeyboardButton]] = []
@@ -110,10 +112,6 @@ def _icons_keyboard(prefix: str, current: str) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append(
-        [
-            InlineKeyboardButton(
-                text="Готово", callback_data="picker:done", style="success"
-            )
-        ]
+        [InlineKeyboardButton(text="Готово", callback_data=done, style="success")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)

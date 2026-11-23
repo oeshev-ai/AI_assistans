@@ -141,6 +141,42 @@ async def test_send_failure_schedules_the_same_url(
     assert waiting[0].filenames == ["image.png"]
 
 
+class _FileBot(_Bot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.documents: list[tuple[int, str | None]] = []
+
+    async def send_document(
+        self,
+        chat_id: int,
+        document: object,
+        caption: str | None = None,
+        request_timeout: int | None = None,
+    ) -> None:
+        self.documents.append((chat_id, caption))
+
+
+@pytest.mark.asyncio
+async def test_due_download_sends_a_saved_file_choice() -> None:
+    store = InMemoryImageDeliveryStore()
+    await store.add(
+        5,
+        9,
+        "https://s3-alt.polza.ai/b.png",
+        "image.png",
+        now=0,
+        as_file=True,
+    )
+    bot = _FileBot()
+
+    async def _ok(_url: str) -> bytes:
+        return b"png"
+
+    await deliver_due(bot, store, _ok, now=60)  # type: ignore[arg-type]
+    assert bot.photos == []
+    assert bot.documents == [(5, IMAGE_LATE_CAPTION)]
+
+
 @pytest.mark.asyncio
 async def test_due_download_sends_photo_and_drops_the_record() -> None:
     store = InMemoryImageDeliveryStore()
@@ -196,4 +232,6 @@ def test_photo_size_and_type_errors_fall_back_to_document() -> None:
     assert telegram_photo_needs_document(RuntimeError("IMAGE_PROCESS_FAILED"))
     assert telegram_photo_needs_document(RuntimeError("PHOTO_INVALID_DIMENSIONS"))
     assert telegram_photo_needs_document(RuntimeError("file is too big"))
-    assert not telegram_photo_needs_document(RuntimeError("bot was blocked by the user"))
+    assert not telegram_photo_needs_document(
+        RuntimeError("bot was blocked by the user")
+    )

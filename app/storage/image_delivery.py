@@ -36,6 +36,30 @@ def _safe_job(provider: str, job_id: str) -> dict[str, str] | None:
     return {"provider": provider, "id": job_id}
 
 
+def _stored_job(provider: str, job_id: str, *, as_file: bool) -> dict[str, str] | None:
+    job = _safe_job(provider, job_id)
+    if job is None:
+        return None
+    if as_file:
+        job["as_file"] = "1"
+    return job
+
+
+def _job_known(jobs: list[dict[str, str]], job: dict[str, str]) -> bool:
+    return any(
+        item.get("provider") == job.get("provider") and item.get("id") == job.get("id")
+        for item in jobs
+    )
+
+
+def _align_flags(flags: object, count: int) -> list[bool]:
+    raw = flags if isinstance(flags, list) else []
+    aligned = [item is True or item == "1" for item in raw[:count]]
+    if len(aligned) < count:
+        aligned.extend([False] * (count - len(aligned)))
+    return aligned
+
+
 def _jobs_from(payload: object) -> list[dict[str, str]]:
     if not isinstance(payload, list):
         return []
@@ -48,8 +72,11 @@ def _jobs_from(payload: object) -> list[dict[str, str]]:
         if not isinstance(provider, str) or not isinstance(job_id, str):
             continue
         job = _safe_job(provider, job_id)
-        if job is not None and job not in jobs:
-            jobs.append(job)
+        if job is None or _job_known(jobs, job):
+            continue
+        if item.get("as_file") in {True, "1", "true", "yes"}:
+            job["as_file"] = "1"
+        jobs.append(job)
     return jobs
 
 
@@ -76,6 +103,7 @@ class ImageDelivery:
     attempts: int = 0
     not_before: float = 0.0
     jobs: list[dict[str, str]] = field(default_factory=list)
+    as_files: list[bool] = field(default_factory=list)
 
     def expired(self, now: float) -> bool:
         return now >= self.created_at + IMAGE_DELIVERY_TTL_SECONDS
@@ -91,6 +119,7 @@ class ImageDelivery:
                 "attempts": self.attempts,
                 "not_before": self.not_before,
                 "jobs": self.jobs,
+                "as_files": self.as_files,
             },
             ensure_ascii=False,
         )
@@ -124,6 +153,7 @@ class ImageDelivery:
                 attempts=int(payload.get("attempts") or 0),
                 not_before=float(payload.get("not_before") or 0),
                 jobs=jobs,
+                as_files=_align_flags(payload.get("as_files"), len(clean_urls)),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -141,7 +171,14 @@ class InMemoryImageDeliveryStore:
     _items: dict[tuple[int, int], ImageDelivery] = field(default_factory=dict)
 
     async def add(
-        self, chat_id: int, user_id: int, url: str, filename: str, *, now: float
+        self,
+        chat_id: int,
+        user_id: int,
+        url: str,
+        filename: str,
+        *,
+        now: float,
+        as_file: bool = False,
     ) -> bool:
         if not public_https_image_url(url):
             return False
@@ -155,6 +192,7 @@ class InMemoryImageDeliveryStore:
                 urls=[url],
                 filenames=[name],
                 created_at=now,
+                as_files=[as_file],
                 not_before=now + retry_delay_seconds(0),
             )
             return True
@@ -162,6 +200,8 @@ class InMemoryImageDeliveryStore:
             return True
         current.urls.append(url)
         current.filenames.append(name)
+        current.as_files = _align_flags(current.as_files, len(current.urls) - 1)
+        current.as_files.append(as_file)
         return True
 
     async def due(self, now: float) -> list[ImageDelivery]:
@@ -178,9 +218,16 @@ class InMemoryImageDeliveryStore:
         self._items[(record.chat_id, record.user_id)] = record
 
     async def add_job(
-        self, chat_id: int, user_id: int, provider: str, job_id: str, *, now: float
+        self,
+        chat_id: int,
+        user_id: int,
+        provider: str,
+        job_id: str,
+        *,
+        now: float,
+        as_file: bool = False,
     ) -> bool:
-        job = _safe_job(provider, job_id)
+        job = _stored_job(provider, job_id, as_file=as_file)
         if job is None:
             return False
         key = (chat_id, user_id)
@@ -196,7 +243,7 @@ class InMemoryImageDeliveryStore:
                 not_before=now + retry_delay_seconds(0),
             )
             return True
-        if job in current.jobs:
+        if _job_known(current.jobs, job):
             return True
         current.jobs.append(job)
         return True
@@ -215,7 +262,14 @@ class RedisImageDeliveryStore:
         return _RECORD_KEY.format(chat_id=chat_id, user_id=user_id)
 
     async def add(
-        self, chat_id: int, user_id: int, url: str, filename: str, *, now: float
+        self,
+        chat_id: int,
+        user_id: int,
+        url: str,
+        filename: str,
+        *,
+        now: float,
+        as_file: bool = False,
     ) -> bool:
         if not public_https_image_url(url):
             return False
@@ -230,6 +284,7 @@ class RedisImageDeliveryStore:
                     urls=[url],
                     filenames=[name],
                     created_at=now,
+                    as_files=[as_file],
                     not_before=now + retry_delay_seconds(0),
                 )
             elif url in current.urls:
@@ -237,6 +292,8 @@ class RedisImageDeliveryStore:
             else:
                 current.urls.append(url)
                 current.filenames.append(name)
+                current.as_files = _align_flags(current.as_files, len(current.urls) - 1)
+                current.as_files.append(as_file)
                 record = current
             await self._redis.set(
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
@@ -289,9 +346,16 @@ class RedisImageDeliveryStore:
             logger.warning("image_delivery_store_failed", chat_id=record.chat_id)
 
     async def add_job(
-        self, chat_id: int, user_id: int, provider: str, job_id: str, *, now: float
+        self,
+        chat_id: int,
+        user_id: int,
+        provider: str,
+        job_id: str,
+        *,
+        now: float,
+        as_file: bool = False,
     ) -> bool:
-        job = _safe_job(provider, job_id)
+        job = _stored_job(provider, job_id, as_file=as_file)
         if job is None:
             return False
         key = self._key(chat_id, user_id)
@@ -307,7 +371,7 @@ class RedisImageDeliveryStore:
                     jobs=[job],
                     not_before=now + retry_delay_seconds(0),
                 )
-            elif job in current.jobs:
+            elif _job_known(current.jobs, job):
                 return True
             else:
                 current.jobs.append(job)

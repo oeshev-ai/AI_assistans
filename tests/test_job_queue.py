@@ -16,7 +16,9 @@ async def test_generate_image_inline_when_disabled() -> None:
     job_queue._pool = None
 
     class FakeAssistant:
-        async def generate_image(self, prompt, model=None, size="1024x1024"):
+        async def generate_image(
+            self, prompt, model=None, size="1024x1024", background=None
+        ):
             return [f"img:{prompt}:{model}:{size}"]
 
     result = await job_queue.generate_image(

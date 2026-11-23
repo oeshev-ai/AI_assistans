@@ -138,6 +138,7 @@ async def generate_image_task(
     model: str | None,
     size: str,
     billing_user_id: int | None = None,
+    background: str | None = None,
 ) -> list[str]:
     assistant: AssistAIClient = ctx["assistant"]
     _bind_billing_user(billing_user_id)
@@ -145,10 +146,13 @@ async def generate_image_task(
         "job_generate_image",
         model=model,
         size=size,
+        background=background,
         prompt_chars=len(prompt),
         billing_user_id=billing_user_id,
     )
-    return await assistant.generate_image(prompt=prompt, model=model, size=size)
+    return await assistant.generate_image(
+        prompt=prompt, model=model, size=size, background=background
+    )
 
 
 async def synthesize_speech_task(

@@ -138,6 +138,46 @@ def _display_image_size(profile: AssistantProfile, assistant: AssistAIClient) ->
     return _default_image_size(model_id)
 
 
+_BACKGROUND_LABELS = {
+    "auto": "авто",
+    "transparent": "прозрачный",
+    "opaque": "непрозрачный",
+}
+
+
+def _image_background_of(
+    profile: AssistantProfile, assistant: AssistAIClient
+) -> str | None:
+    """Фон генерации GPT Image. Для других семейств настройки нет."""
+    model_id = _image_model_of(profile, assistant)
+    if image_model_family(model_id) != "openai":
+        return None
+    stored = profile.image_background
+    if stored in _BACKGROUND_LABELS:
+        return stored
+    return "auto"
+
+
+def _background_label(value: str) -> str:
+    return _BACKGROUND_LABELS.get(value, "авто")
+
+
+def _image_as_file(profile: AssistantProfile, model_id: str | None) -> bool:
+    """Эту модель персона просила присылать файлом, а не фото."""
+    flags = getattr(profile, "image_as_file", None)
+    if (
+        not isinstance(flags, dict)
+        or not isinstance(model_id, str)
+        or not model_id.strip()
+    ):
+        return False
+    return flags.get(model_id.strip()) is True
+
+
+def _image_file_label(enabled: bool) -> str:
+    return "да" if enabled else "нет"
+
+
 def _stored_image_size(profile: AssistantProfile) -> str:
     """Размер для генерации. Пустое поле персоны остаётся 1024x1024."""
     if isinstance(profile.image_size, str) and profile.image_size.strip():
@@ -269,12 +309,18 @@ def _compatible_tts_voice(
 def _model_keyboard(
     models: tuple[str, ...],
     prefix: str,
+    *,
+    done: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Кнопки моделей. В callback кладётся индекс, не имя."""
     rows = [
         [InlineKeyboardButton(text=model, callback_data=f"{prefix}:{index}")]
         for index, model in enumerate(models)
     ]
+    if done:
+        rows.append(
+            [InlineKeyboardButton(text="Готово", callback_data=done, style="success")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

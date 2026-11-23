@@ -233,11 +233,6 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             return resolve_polza_text_model(catalog_model) or catalog_model
         return catalog_model
 
-    def _resolve_chat_model(self, model: str | None) -> str:
-        """Модель для chat: legacy-алиас, на Polza — ещё алиас каталога."""
-        catalog = self._catalog_chat_model(model)
-        return self._provider_chat_model(catalog, self._endpoint("text"))
-
     async def _chat_post_with_fallback(
         self,
         payload: dict[str, Any],

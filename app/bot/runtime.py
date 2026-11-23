@@ -677,15 +677,21 @@ def _extract_generated_images(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 async def _send_extracted_images(
-    message: Message, images: list[dict[str, Any]]
+    message: Message,
+    images: list[dict[str, Any]],
+    profile: AssistantProfile | None = None,
 ) -> None:
     """Отправляет картинки из инструмента. Сбой одной не отменяет остальные."""
     for index, image in enumerate(images):
         value = image.get("value")
         if not isinstance(value, str):
             continue
+        model = image.get("model")
+        as_file = profile is not None and M._image_as_file(
+            profile, model if isinstance(model, str) else None
+        )
         try:
-            await _send_generated_image(message, value, index)
+            await _send_generated_image(message, value, index, as_file=as_file)
         except AssistAIError as exc:
             logger.warning("generated_image_not_delivered", chat_id=message.chat.id)
             await message.answer(exc.message)
@@ -694,10 +700,11 @@ async def _send_extracted_images(
 
 
 async def _answer_photo_bytes(
-    message: Message, raw: bytes, filename: str
+    message: Message, raw: bytes, filename: str, *, as_file: bool = False
 ) -> Message | None:
     """Фото, а при ``IMAGE_PROCESS_FAILED`` — повтор и затем документ.
 
+    ``as_file`` сразу отдаёт исходный файл: так сохраняется альфа-канал.
     Telegram отдаёт ``IMAGE_PROCESS_FAILED`` и на валидный файл, который
     через минуту принимает без изменений. ``sendDocument`` картинку не
     обрабатывает, поэтому оплаченный результат всё равно доходит.
@@ -706,6 +713,11 @@ async def _answer_photo_bytes(
     """
     from app.bot.image_retry import telegram_photo_needs_document
 
+    if as_file:
+        return await message.answer_document(
+            document=BufferedInputFile(raw, filename=filename),
+            request_timeout=120,
+        )
     last_error: TelegramBadRequest | None = None
     for attempt in (1, 2):
         try:
@@ -731,11 +743,16 @@ async def _answer_photo_bytes(
     )
 
 
-async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> None:
+async def _send_outbound_media(
+    message: Message,
+    items: list[OutboundMedia],
+    profile: AssistantProfile | None = None,
+) -> None:
     """Отправляет файлы из media-tools (видео, аудио, транскрипт, правки)."""
     for item in items:
         try:
             if item.kind == "image":
+                as_file = profile is not None and M._image_as_file(profile, item.model)
                 if item.url:
                     try:
                         raw = await _download_image_url(item.url)
@@ -751,14 +768,22 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
                             else message.chat.id
                         )
                         if await note_failed_image(
-                            message.chat.id, user_id, item.url, item.filename
+                            message.chat.id,
+                            user_id,
+                            item.url,
+                            item.filename,
+                            as_file=as_file,
                         ):
                             await message.answer(IMAGE_RETRY_TEXT)
                             continue
                         raise
-                    await _answer_photo_bytes(message, raw, item.filename)
+                    await _answer_photo_bytes(
+                        message, raw, item.filename, as_file=as_file
+                    )
                 elif item.data:
-                    await _answer_photo_bytes(message, item.data, item.filename)
+                    await _answer_photo_bytes(
+                        message, item.data, item.filename, as_file=as_file
+                    )
             elif item.kind == "audio":
                 if not item.data:
                     continue
@@ -790,7 +815,7 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
 
 
 async def _send_generated_image(
-    message: Message, image: str, index: int
+    message: Message, image: str, index: int, *, as_file: bool = False
 ) -> Message | None:
     """URL сначала качается ботом, затем уходит файлом; base64 — сразу файлом.
 
@@ -807,7 +832,9 @@ async def _send_generated_image(
             from app.bot.image_retry import IMAGE_RETRY_TEXT, note_failed_image
 
             user_id = message.from_user.id if message.from_user else message.chat.id
-            if await note_failed_image(message.chat.id, user_id, image, filename):
+            if await note_failed_image(
+                message.chat.id, user_id, image, filename, as_file=as_file
+            ):
                 raise AssistAIError(IMAGE_RETRY_TEXT) from None
             raise
     else:
@@ -819,7 +846,7 @@ async def _send_generated_image(
             ) from exc
     if not raw:
         raise AssistAIError("Провайдер вернул пустое изображение.")
-    return await _answer_photo_bytes(message, raw, filename)
+    return await _answer_photo_bytes(message, raw, filename, as_file=as_file)
 
 
 async def _send_voice_reply(
@@ -997,12 +1024,16 @@ async def _process_user_message_locked(
         )
     except AssistantStorageError:
         await cost_tracker.release_reservation(user_id)
+        reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
+        clear_request_context()
         await _reply_profile_error(message)
         return
     except TopicStorageError:
         await cost_tracker.release_reservation(user_id)
+        reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
+        clear_request_context()
         await _reply_history_error(message)
         return
     text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
@@ -1018,7 +1049,12 @@ async def _process_user_message_locked(
     parts: list[str] = []
     shown = ""
     last_edit = 0.0
-    scope = ImageModelScope(profile.image_model, profile.image_size)
+    scope = ImageModelScope(
+        profile.image_model,
+        profile.image_size,
+        background=M._image_background_of(profile, assistant),
+        as_file=profile.image_as_file,
+    )
     video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
@@ -1085,8 +1121,8 @@ async def _process_user_message_locked(
                     await _reply_history_error(message)
             else:
                 await _reply_history_error(message)
-        await _send_extracted_images(message, images)
-        await _send_outbound_media(message, outbound)
+        await _send_extracted_images(message, images, profile)
+        await _send_outbound_media(message, outbound, profile)
         logger.info(
             "message_answered",
             chars=len(answer),
@@ -1097,16 +1133,16 @@ async def _process_user_message_locked(
             await _send_voice_reply(message, assistant, profile, answer)
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
     except Exception as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
@@ -1620,7 +1656,12 @@ async def _process_vision_message_locked(
     parts: list[str] = []
     shown = ""
     last_edit = 0.0
-    scope = ImageModelScope(profile.image_model, profile.image_size)
+    scope = ImageModelScope(
+        profile.image_model,
+        profile.image_size,
+        background=M._image_background_of(profile, assistant),
+        as_file=profile.image_as_file,
+    )
     video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
@@ -1687,8 +1728,8 @@ async def _process_vision_message_locked(
                     await _reply_history_error(message)
             else:
                 await _reply_history_error(message)
-        await _send_extracted_images(message, images)
-        await _send_outbound_media(message, outbound)
+        await _send_extracted_images(message, images, profile)
+        await _send_outbound_media(message, outbound, profile)
         logger.info(
             "Vision-ответ, chat_id=%s topic_id=%s, символов=%s, картинок=%s",
             chat_id,
@@ -1700,15 +1741,15 @@ async def _process_vision_message_locked(
             await _send_voice_reply(message, assistant, profile, answer)
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
     except Exception as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
@@ -2106,6 +2147,21 @@ async def _forget_message_screens(
             changed = True
     if changed:
         await state.set_data(data)
+
+
+async def _dismiss_open_picker(message: Message, state: FSMContext) -> None:
+    """Удаляет отдельный экран выбора, если он ещё висит в чате."""
+    data = await state.get_data()
+    picker_id = data.get(_SCREEN_PICKER)
+    bot = message.bot
+    if not isinstance(picker_id, int) or bot is None or picker_id == message.message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=picker_id)
+    except TelegramBadRequest as exc:
+        logger.warning("Не удалось закрыть выбор модели: %s", exc)
+    data.pop(_SCREEN_PICKER, None)
+    await state.set_data(data)
 
 
 async def _close_screen(message: Message, state: FSMContext, key: str) -> None:

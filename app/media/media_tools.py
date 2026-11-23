@@ -14,6 +14,7 @@ from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
 from app.llm.image_ops import (
     _get_generation_ids,
+    current_image_as_file,
     generated_image_records,
     note_generation_id,
 )
@@ -42,6 +43,7 @@ class OutboundMedia:
     mime_type: str
     data: bytes | None = None
     url: str | None = None
+    model: str | None = None
 
 
 @dataclass
@@ -96,35 +98,6 @@ def reset_user_media(token: Token[list[UserMedia] | None]) -> None:
 
 def get_user_media() -> list[UserMedia]:
     return list(_REQUEST_USER_MEDIA.get() or [])
-
-
-_BASE_OVERRIDE: ContextVar[int | None] = ContextVar("photo_base_override", default=None)
-_LAST_EDIT_BASE: ContextVar[int | None] = ContextVar("last_edit_base", default=None)
-_IMAGE_LIMIT_CHECKED: ContextVar[bool] = ContextVar(
-    "image_limit_checked", default=False
-)
-
-
-def set_base_override(index: int | None) -> Token[int | None]:
-    return _BASE_OVERRIDE.set(index)
-
-
-def reset_base_override(token: Token[int | None]) -> None:
-    _BASE_OVERRIDE.reset(token)
-
-
-def take_last_edit_base() -> int | None:
-    value = _LAST_EDIT_BASE.get()
-    _LAST_EDIT_BASE.set(None)
-    return value
-
-
-def mark_image_limit_checked() -> Token[bool]:
-    return _IMAGE_LIMIT_CHECKED.set(True)
-
-
-def reset_image_limit_checked(token: Token[bool]) -> None:
-    _IMAGE_LIMIT_CHECKED.reset(token)
 
 
 def _outbound() -> MediaBucket | None:
@@ -208,18 +181,15 @@ class EditImageTool(BaseTool):
             return _error_json(
                 "Нет изображения во вложении. Попросите пользователя прислать картинку."
             )
-        if not _IMAGE_LIMIT_CHECKED.get():
-            from app.infra.cost_tracker import get_billing_user
-            from app.infra.rate_limiter import rate_limiter
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.rate_limiter import rate_limiter
 
-            user_id = get_billing_user()
-            if user_id is not None and not await rate_limiter.check_image_limit(
-                user_id
-            ):
-                retry_after = await rate_limiter.get_retry_after(user_id, "image")
-                return _error_json(
-                    f"Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
-                )
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.check_image_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "image")
+            return _error_json(
+                f"Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
+            )
         base, refs, error = _resolve_edit_indexes(images, kwargs)
         if error is not None:
             return _error_json(error)
@@ -237,6 +207,11 @@ class EditImageTool(BaseTool):
         prompt = security.sanitize_prompt(instruction.strip())
         if isinstance(edit_type, str) and edit_type.strip():
             prompt = f"{edit_type.strip()}: {prompt}"
+        config = getattr(self._client, "config", None)
+        fallback = getattr(config, "default_image_edit_model", None)
+        used_model = selected or (
+            fallback if isinstance(fallback, str) and fallback.strip() else None
+        )
         logger.info(
             "edit_image_call",
             count=len(files),
@@ -267,7 +242,14 @@ class EditImageTool(BaseTool):
             user_id = ctx.user_id if ctx is not None else billed
             chat_id = ctx.chat_id if ctx is not None else user_id
             if chat_id is not None and user_id is not None:
-                return _error_json(await image_failure_reply(chat_id, user_id, exc))
+                return _error_json(
+                    await image_failure_reply(
+                        chat_id,
+                        user_id,
+                        exc,
+                        as_file=current_image_as_file(used_model),
+                    )
+                )
             return _error_json(exc.message)
         except (TypeError, ValueError) as exc:
             return _error_json(_exception_text(exc))
@@ -275,7 +257,6 @@ class EditImageTool(BaseTool):
             logger.exception("edit_image_failed")
             return _error_json(_exception_text(exc))
 
-        _LAST_EDIT_BASE.set(base)
         for generation_id in _get_generation_ids():
             note_generation_id(
                 generation_id if isinstance(generation_id, str) else None
@@ -288,6 +269,7 @@ class EditImageTool(BaseTool):
                     filename=f"edited_{index + 1}.png",
                     mime_type="image/png",
                     url=image,
+                    model=used_model,
                 )
             else:
                 import base64
@@ -297,6 +279,7 @@ class EditImageTool(BaseTool):
                     filename=f"edited_{index + 1}.png",
                     mime_type="image/png",
                     data=base64.b64decode(image),
+                    model=used_model,
                 )
             if bucket is not None:
                 bucket.add(item)
@@ -319,20 +302,9 @@ def _resolve_edit_indexes(
     images: list[UserMedia], kwargs: dict[str, Any]
 ) -> tuple[int | None, list[int], str | None]:
     """Индексы из аргументов модели. При нескольких фото без индексов — ошибка."""
-    override = _BASE_OVERRIDE.get()
     raw_base = kwargs.get("base_index")
     raw_refs = kwargs.get("reference_indexes")
     count = len(images)
-    if override is not None:
-        if not 0 <= override < count:
-            return None, [], "Индекс основы вне диапазона фото."
-        refs = _int_list(raw_refs)
-        if refs is None:
-            refs = [index for index in range(count) if index != override]
-        refs = [index for index in refs if index != override]
-        if any(index < 0 or index >= count for index in refs):
-            return None, [], "Индекс референса вне диапазона фото."
-        return override, refs, None
     if count > 1 and (not isinstance(raw_base, int) or not isinstance(raw_refs, list)):
         return (
             None,

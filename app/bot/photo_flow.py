@@ -531,6 +531,7 @@ async def _edit(
     files = [(item.data, item.filename, item.mime_type) for item in ordered]
     labels = [str(base + 1), *[str(index + 1) for index in refs]]
     model = turn.assistant.config.default_image_edit_model
+    as_file = M._image_as_file(profile, model)
     # Edit must keep source aspect ratio (IMAGE_EDIT_SIZE_MODE=source).
     # Persona image_size is for generate only — passing it here squashes
     # e.g. 3:2 photos to the persona canvas when generate model is also Flare.
@@ -578,19 +579,25 @@ async def _edit(
                 from app.bot.image_retry import image_failure_reply
 
                 await message.answer(
-                    await image_failure_reply(media.chat_id, user_id, exc)
+                    await image_failure_reply(
+                        media.chat_id, user_id, exc, as_file=as_file
+                    )
                 )
                 return
         try:
             sent_last = None
             for index, image in enumerate(result):
-                sent_last = await R._send_generated_image(message, image, index)
+                sent_last = await R._send_generated_image(
+                    message, image, index, as_file=as_file
+                )
             if sent_last is not None:
                 kept_file_id = result_file_id(sent_last)
         except AssistAIError as exc:
             from app.bot.image_retry import image_failure_reply
 
-            await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
+            await message.answer(
+                await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+            )
             return
         logger.info("edit_image_done", count=len(result), base_index=base)
         fallback = f"Готово. Основа — фото {base + 1}."
@@ -812,6 +819,7 @@ async def _generate(
         else:
             model = generate_model
             edit_size = None
+        as_file = M._image_as_file(profile, model)
         with ImageModelScope(model, size), MediaTurnScope():
             # Budget preflight — в generate_image / edit_images.
             if files:
@@ -829,17 +837,22 @@ async def _generate(
                     prompt,
                     model=generate_model,
                     size=size,
+                    background=M._image_background_of(profile, turn.assistant),
                 )
         try:
             sent_last = None
             for index, image in enumerate(result):
-                sent_last = await R._send_generated_image(message, image, index)
+                sent_last = await R._send_generated_image(
+                    message, image, index, as_file=as_file
+                )
             if sent_last is not None:
                 kept_file_id = result_file_id(sent_last)
         except AssistAIError as exc:
             from app.bot.image_retry import image_failure_reply
 
-            await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
+            await message.answer(
+                await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+            )
             return
         fallback = "Готово. Это новое изображение по вашему фото."
         user_prompt = (
@@ -876,7 +889,9 @@ async def _generate(
     except AssistAIError as exc:
         from app.bot.image_retry import image_failure_reply
 
-        await message.answer(await image_failure_reply(media.chat_id, user_id, exc))
+        await message.answer(
+            await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+        )
     finally:
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)

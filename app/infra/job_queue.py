@@ -221,6 +221,7 @@ async def generate_image(
     *,
     timeout: float | None = None,
     billing_user_id: int | None = None,
+    background: str | None = None,
 ) -> list[str]:
     """Generate an image via arq worker or inline client."""
     user_id = _billing_user_id(billing_user_id)
@@ -234,6 +235,7 @@ async def generate_image(
                 model,
                 size,
                 user_id,
+                background,
             )
         except Exception as exc:
             logger.warning("arq_generate_enqueue_failed", error=str(exc))
@@ -243,7 +245,9 @@ async def generate_image(
         logger.info("arq_job_enqueued", task="generate_image_task", job_id=job.job_id)
         result = await job.result(timeout=wait)
         return list(result)
-    return await assistant.generate_image(prompt=prompt, model=model, size=size)
+    return await assistant.generate_image(
+        prompt=prompt, model=model, size=size, background=background
+    )
 
 
 async def edit_images(

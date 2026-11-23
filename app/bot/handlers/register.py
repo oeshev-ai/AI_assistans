@@ -18,13 +18,12 @@ from app.bot.handlers.assistants import (
     on_assistants_page,
     on_asst_del_ask,
     on_asst_del_yes,
-    on_asst_edit,
     on_asst_edit_ask,
     on_asst_icon_menu,
     on_asst_keep_prompt,
-    on_asst_list,
     on_asst_new_commit,
     on_asst_new_icon,
+    on_asst_new_icon_back,
     on_asst_new_icon_menu,
     on_asst_new_image,
     on_asst_new_start,
@@ -63,8 +62,10 @@ from app.bot.handlers.presets import (
 from app.bot.handlers.settings import (
     on_menu_settings,
     on_picker_done,
+    on_set_image_file,
     on_set_image_menu,
     on_set_image_model,
+    on_set_persona_background,
     on_set_persona_size,
     on_set_text_menu,
     on_set_text_model,
@@ -81,10 +82,6 @@ from app.bot.handlers.settings import (
 )
 from app.bot.handlers.topics import (
     on_menu_topics,
-    on_topic_clear_ask,
-    on_topic_clear_yes,
-    on_topic_del_ask,
-    on_topic_del_yes,
     on_topic_delete_ask,
     on_topic_delete_yes,
     on_topic_list,
@@ -92,7 +89,6 @@ from app.bot.handlers.topics import (
     on_topic_rename,
     on_topic_use,
     on_topics_page,
-    on_topics_refresh,
     sg_new_topic_name,
     sg_rename_topic_name,
 )
@@ -133,7 +129,6 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(
         on_asst_edit_ask, F.data.startswith("asst_edit:")
     )
-    dispatcher.callback_query.register(on_topics_refresh, F.data == "topic_list")
     dispatcher.callback_query.register(
         on_topic_delete_ask, F.data.startswith("topic_del_ask:")
     )
@@ -151,9 +146,7 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(sg_new_assistant_models, NewAssistantSG.models)
     dispatcher.message.register(sg_new_topic_name, NewTopicSG.name)
     dispatcher.message.register(sg_rename_topic_name, RenameTopicSG.name)
-    dispatcher.callback_query.register(on_asst_list, F.data == "asst:list")
     dispatcher.callback_query.register(on_asst_use, F.data.startswith("asst:use:"))
-    dispatcher.callback_query.register(on_asst_edit, F.data.startswith("asst:edit:"))
     dispatcher.callback_query.register(
         on_asst_del_ask, F.data.startswith("asst:del_ask:")
     )
@@ -170,6 +163,9 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_asst_new_commit, F.data == "asst:new_commit")
     dispatcher.callback_query.register(
         on_asst_new_icon_menu, F.data == "asst:new_icon_menu"
+    )
+    dispatcher.callback_query.register(
+        on_asst_new_icon_back, F.data == "asst:new_icon_back"
     )
     dispatcher.callback_query.register(
         on_asst_new_icon, F.data.startswith("asst:new_icon:")
@@ -197,19 +193,7 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_topic_list, F.data == "topic:list")
     dispatcher.callback_query.register(on_topic_use, F.data.startswith("topic:use:"))
     dispatcher.callback_query.register(
-        on_topic_clear_ask, F.data.startswith("topic:clear_ask:")
-    )
-    dispatcher.callback_query.register(
-        on_topic_clear_yes, F.data.startswith("topic:clear_yes:")
-    )
-    dispatcher.callback_query.register(
         on_topic_rename, F.data.startswith("topic:rename:")
-    )
-    dispatcher.callback_query.register(
-        on_topic_del_ask, F.data.startswith("topic:del_ask:")
-    )
-    dispatcher.callback_query.register(
-        on_topic_del_yes, F.data.startswith("topic:del_yes:")
     )
     dispatcher.callback_query.register(on_topic_new, F.data == "topic:new")
     dispatcher.callback_query.register(on_settings_open, F.data == "settings:open")
@@ -225,6 +209,12 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_voice_menu, F.data == "voice_menu")
     dispatcher.callback_query.register(
         on_set_persona_size, F.data.startswith("set_size:")
+    )
+    dispatcher.callback_query.register(
+        on_set_persona_background, F.data.startswith("set_bg:")
+    )
+    dispatcher.callback_query.register(
+        on_set_image_file, F.data.startswith("set_file:")
     )
     dispatcher.callback_query.register(on_voice_mode, F.data.startswith("voice_mode:"))
     dispatcher.callback_query.register(on_voice_name, F.data.startswith("voice_name:"))

@@ -251,6 +251,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
 
     image_store = open_image_delivery_store(shared_redis)
     bind_image_delivery(image_store)
+
     async def _resume_image(provider: str, job_id: str) -> bytes:
         return await assistant.recover_paid_file(provider, job_id, kind="image")
 
@@ -269,6 +270,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
 
     video_store = open_video_delivery_store(shared_redis)
     bind_video_delivery(video_store)
+
     async def _resume_video(provider: str, job_id: str) -> bytes:
         return await assistant.recover_paid_file(provider, job_id, kind="video")
 

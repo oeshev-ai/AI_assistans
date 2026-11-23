@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Any
 
 VIDEO_ASPECT_RATIOS: tuple[str, ...] = ("16:9", "9:16", "1:1", "4:3", "3:4", "21:9")
 VIDEO_DURATIONS: tuple[int, ...] = (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
@@ -180,13 +179,3 @@ class VideoSettingsScope:
 def current_video_settings() -> VideoSettings | None:
     """Настройки хода. Вне ``VideoSettingsScope`` — ``None``."""
     return _REQUEST_VIDEO.get()
-
-
-def video_request_kwargs(settings: VideoSettings) -> dict[str, Any]:
-    """Поля запроса ``generate_video`` из настроек персоны."""
-    return {
-        "aspect_ratio": settings.aspect_ratio,
-        "duration": settings.duration,
-        "resolution": settings.resolution,
-        "generate_audio": settings.generate_audio,
-    }

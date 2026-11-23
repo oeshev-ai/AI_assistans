@@ -44,24 +44,6 @@ async def on_menu_assistants(
     await R._open_assistants(message, assistant_storage, state)
 
 
-async def on_asst_list(
-    query: CallbackQuery, assistant_storage: AssistantStorage, state: FSMContext
-) -> None:
-    """Возвращает сообщение к списку персон."""
-    message = R._query_message(query)
-    if message is None:
-        await query.answer()
-        return
-    try:
-        text, markup = await R._assistant_screen(message.chat.id, assistant_storage)
-    except AssistantStorageError as exc:
-        await query.answer(exc.message, show_alert=True)
-        return
-    await R._edit_inline(message, text, markup)
-    await state.update_data({_SCREEN_ASSISTANTS: message.message_id})
-    await query.answer()
-
-
 async def on_asst_use(
     query: CallbackQuery,
     assistant_storage: AssistantStorage,
@@ -259,41 +241,6 @@ async def sg_edit_prompt(
     await R._open_persona_settings(message, assistant, assistant_storage, state)
 
 
-async def on_asst_edit(
-    query: CallbackQuery, assistant_storage: AssistantStorage, state: FSMContext
-) -> None:
-    """Запускает правку промпта существующей персоны."""
-    message = R._query_message(query)
-    if message is None:
-        await query.answer()
-        return
-    profile_id = (query.data or "").removeprefix("asst:edit:")
-    try:
-        profiles = await assistant_storage.list_assistants(message.chat.id)
-    except AssistantStorageError as exc:
-        await query.answer(exc.message, show_alert=True)
-        return
-    profile = next((item for item in profiles if item.id == profile_id), None)
-    if profile is None:
-        await query.answer("Ассистент не найден.", show_alert=True)
-        return
-    await R._drop_flow(state)
-    await state.set_state(NewAssistantSG.prompt)
-    await state.update_data(
-        flow_edit_id=profile.id,
-        flow_name=profile.name,
-        flow_icon=normalize_icon(profile.icon),
-        flow_text_model=profile.text_model,
-        flow_image_model=profile.image_model,
-    )
-    await query.answer()
-    await message.answer(
-        f"Пришлите системный промпт для «{persona_label(profile.name, profile.icon)}» "
-        "(мин. 10 символов).\n"
-        "/cancel — отмена"
-    )
-
-
 async def on_asst_del_ask(
     query: CallbackQuery, assistant_storage: AssistantStorage
 ) -> None:
@@ -387,9 +334,7 @@ async def sg_new_assistant_name(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     icon = data.get("flow_icon") or DEFAULT_ICON
-    await state.update_data(
-        flow_name=name, flow_edit_id=None, flow_icon=normalize_icon(str(icon))
-    )
+    await state.update_data(flow_name=name, flow_icon=normalize_icon(str(icon)))
     await state.set_state(NewAssistantSG.prompt)
     await message.answer(
         "Пришлите системный промпт (мин. 10 символов).\n/cancel — отмена"
@@ -489,7 +434,6 @@ async def on_asst_new_commit(
     data = await state.get_data()
     name = data.get("flow_name")
     prompt = data.get("flow_prompt")
-    edit_id = data.get("flow_edit_id")
     if not isinstance(name, str) or not isinstance(prompt, str):
         await query.answer("Имя 1–50, промпт ≥ 10", show_alert=True)
         await state.set_state(NewAssistantSG.name)
@@ -507,8 +451,6 @@ async def on_asst_new_commit(
             "text_model": M._optional_model(data.get("flow_text_model")),
             "image_model": M._optional_model(data.get("flow_image_model")),
         }
-        if isinstance(edit_id, str) and edit_id:
-            fields["id"] = edit_id
         profile = AssistantProfile.model_validate(fields)
     except ValidationError:
         await query.answer("Имя 1–50, промпт ≥ 10", show_alert=True)
@@ -532,11 +474,10 @@ async def on_asst_new_commit(
         topic_storage,
         also_delete=[message.message_id],
     )
-    verb = "Обновлён" if isinstance(edit_id, str) and edit_id else "Создан"
     # Меню уже на невидимом якоре: не вешаем его на текст, иначе удаление
     # подтверждения снова спрячет кнопки.
     label = persona_label(profile.name, profile.icon)
-    await message.answer(f"✅ {verb} ассистент «{label}» ({profile.id}).")
+    await message.answer(f"✅ Создан ассистент «{label}» ({profile.id}).")
     await R._open_settings(message, assistant, assistant_storage, state)
 
 
@@ -612,7 +553,27 @@ async def on_asst_new_icon_menu(query: CallbackQuery, state: FSMContext) -> None
     await R._edit_inline(
         message,
         f"Иконка персоны: {current}\nВыберите эмодзи.",
-        screens._icons_keyboard("asst:new_icon", current),
+        screens._icons_keyboard("asst:new_icon", current, done="asst:new_icon_back"),
+    )
+
+
+async def on_asst_new_icon_back(
+    query: CallbackQuery, state: FSMContext, assistant: AssistAIClient
+) -> None:
+    """Закрывает сетку иконок черновика и возвращает экран моделей."""
+    if await state.get_state() != NewAssistantSG.models.state:
+        await query.answer("Сначала начните создание персоны.", show_alert=True)
+        return
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    data = await state.get_data()
+    await query.answer()
+    await R._edit_inline(
+        message,
+        screens._draft_models_text(data, assistant),
+        screens._draft_models_keyboard(data),
     )
 
 

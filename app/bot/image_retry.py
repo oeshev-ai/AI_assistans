@@ -55,6 +55,7 @@ def telegram_photo_needs_document(exc: BaseException) -> bool:
     text = str(exc).upper()
     return any(marker in text for marker in _PHOTO_DOCUMENT_MARKERS)
 
+
 Download = Callable[[str], Awaitable[bytes]]
 Resume = Callable[[str, str], Awaitable[bytes]]
 _STOP_CODES = frozenset({"FAILED", "NOT_FOUND", "BAD_REQUEST"})
@@ -68,18 +69,16 @@ def bind_image_delivery(store: ImageDeliveryStore | None) -> None:
     _store = store
 
 
-def current_image_delivery() -> ImageDeliveryStore | None:
-    return _store
-
-
 async def note_failed_image(
-    chat_id: int, user_id: int, url: str, filename: str
+    chat_id: int, user_id: int, url: str, filename: str, *, as_file: bool = False
 ) -> bool:
     """Кладёт ссылку в очередь повторов. False — повторять нечего или хранилище молчит."""
     store = _store
     if store is None:
         return False
-    saved = await store.add(chat_id, user_id, url, filename, now=delivery_clock())
+    saved = await store.add(
+        chat_id, user_id, url, filename, now=delivery_clock(), as_file=as_file
+    )
     if saved:
         logger.info(
             "image_delivery_scheduled",
@@ -90,14 +89,19 @@ async def note_failed_image(
 
 
 async def note_failed_image_job(
-    chat_id: int, user_id: int, provider: str, job_id: str
+    chat_id: int, user_id: int, provider: str, job_id: str, *, as_file: bool = False
 ) -> bool:
     """Кладёт id уже оплаченной задачи. False — повторять нечего."""
     store = _store
     if store is None:
         return False
     saved = await store.add_job(
-        chat_id, user_id, provider, job_id, now=delivery_clock()
+        chat_id,
+        user_id,
+        provider,
+        job_id,
+        now=delivery_clock(),
+        as_file=as_file,
     )
     if saved:
         logger.info(
@@ -108,7 +112,9 @@ async def note_failed_image_job(
     return saved
 
 
-async def image_failure_reply(chat_id: int, user_id: int, exc: AssistAIError) -> str:
+async def image_failure_reply(
+    chat_id: int, user_id: int, exc: AssistAIError, *, as_file: bool = False
+) -> str:
     """Текст пользователю: повтор забора файла или исходная ошибка."""
     provider = exc.pending_provider
     job_id = exc.pending_job_id
@@ -116,12 +122,16 @@ async def image_failure_reply(chat_id: int, user_id: int, exc: AssistAIError) ->
         exc.pending_kind in {None, "image"}
         and isinstance(provider, str)
         and isinstance(job_id, str)
-        and await note_failed_image_job(chat_id, user_id, provider, job_id)
+        and await note_failed_image_job(
+            chat_id, user_id, provider, job_id, as_file=as_file
+        )
     ):
         return IMAGE_KEEP_TEXT
     pending = exc.pending_url
     if isinstance(pending, str) and pending:
-        if await note_failed_image(chat_id, user_id, pending, "image.png"):
+        if await note_failed_image(
+            chat_id, user_id, pending, "image.png", as_file=as_file
+        ):
             return IMAGE_RETRY_TEXT
     return exc.message
 
@@ -182,12 +192,17 @@ async def _deliver_record(
 ) -> None:
     pending_urls: list[str] = []
     pending_names: list[str] = []
-    for url, filename in zip(record.urls, record.filenames, strict=True):
+    pending_flags: list[bool] = []
+    flags = _align_delivery_flags(record)
+    for url, filename, as_file in zip(
+        record.urls, record.filenames, flags, strict=True
+    ):
         try:
             raw = await download(url)
         except AssistAIError:
             pending_urls.append(url)
             pending_names.append(filename)
+            pending_flags.append(as_file)
             logger.warning(
                 "image_delivery_retry",
                 chat_id=record.chat_id,
@@ -198,13 +213,15 @@ async def _deliver_record(
         if not raw:
             pending_urls.append(url)
             pending_names.append(filename)
+            pending_flags.append(as_file)
             continue
         try:
-            await _send_bytes(bot, record.chat_id, raw, filename)
+            await _send_bytes(bot, record.chat_id, raw, filename, as_file=as_file)
         except Exception:
             logger.exception("image_delivery_send_failed", chat_id=record.chat_id)
             pending_urls.append(url)
             pending_names.append(filename)
+            pending_flags.append(as_file)
             continue
         logger.info("image_delivery_sent", chat_id=record.chat_id, bytes=len(raw))
     pending_jobs: list[dict[str, str]] = []
@@ -236,7 +253,13 @@ async def _deliver_record(
             pending_jobs.append(job)
             continue
         try:
-            await _send_bytes(bot, record.chat_id, raw, "image.png")
+            await _send_bytes(
+                bot,
+                record.chat_id,
+                raw,
+                "image.png",
+                as_file=job.get("as_file") == "1",
+            )
         except Exception:
             logger.exception("image_delivery_send_failed", chat_id=record.chat_id)
             pending_jobs.append(job)
@@ -247,14 +270,32 @@ async def _deliver_record(
         return
     record.urls = pending_urls
     record.filenames = pending_names
+    record.as_files = pending_flags
     record.jobs = pending_jobs
     record.attempts += 1
     record.not_before = now + retry_delay_seconds(record.attempts)
     await store.save(record, now=now)
 
 
-async def _send_bytes(bot: Bot, chat_id: int, raw: bytes, filename: str) -> None:
+def _align_delivery_flags(record: ImageDelivery) -> list[bool]:
+    flags = list(record.as_files)
+    if len(flags) < len(record.urls):
+        flags.extend([False] * (len(record.urls) - len(flags)))
+    return flags[: len(record.urls)]
+
+
+async def _send_bytes(
+    bot: Bot, chat_id: int, raw: bytes, filename: str, *, as_file: bool = False
+) -> None:
     payload = BufferedInputFile(raw, filename=filename)
+    if as_file:
+        await bot.send_document(
+            chat_id,
+            payload,
+            caption=IMAGE_LATE_CAPTION,
+            request_timeout=120,
+        )
+        return
     try:
         await bot.send_photo(
             chat_id,

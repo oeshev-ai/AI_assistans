@@ -6,7 +6,6 @@ import app.bot.screens as screens
 from app.bot import models as M
 from app.bot import runtime as R
 from app.bot.constants import (
-    _SCREEN_PICKER,
     _SCREEN_PRESETS,
     _SCREEN_SETTINGS,
     _VOICE_MODE_LABELS,
@@ -20,9 +19,7 @@ from app.bot.constants import (
     CallbackQuery,
     FSMContext,
     Message,
-    TelegramBadRequest,
     is_speechkit_tts_model,
-    logger,
     resolve_speechkit_role,
     speechkit_roles_for,
 )
@@ -168,6 +165,7 @@ async def on_settings_open(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer()
+    await R._dismiss_open_picker(message, state)
     text, markup = screens._settings_hub_view(profile)
     await R._edit_inline(message, text, markup)
     data = await state.get_data()
@@ -193,6 +191,7 @@ async def on_settings_persona(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer()
+    await R._dismiss_open_picker(message, state)
     text, markup = screens._settings_persona_view(profile, assistant)
     await R._edit_inline(message, text, markup)
     await state.update_data({_SCREEN_SETTINGS: message.message_id})
@@ -205,20 +204,7 @@ async def on_settings_close(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer()
         return
     await query.answer()
-    data = await state.get_data()
-    picker_id = data.get(_SCREEN_PICKER)
-    bot = message.bot
-    if (
-        isinstance(picker_id, int)
-        and bot is not None
-        and picker_id != message.message_id
-    ):
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=picker_id)
-        except TelegramBadRequest as exc:
-            logger.warning("Не удалось закрыть выбор модели: %s", exc)
-        data.pop(_SCREEN_PICKER, None)
-        await state.set_data(data)
+    await R._dismiss_open_picker(message, state)
     await R._close_screen(message, state, _SCREEN_SETTINGS)
 
 
@@ -246,6 +232,69 @@ async def on_set_persona_size(
         await query.answer(exc.message, show_alert=True)
         return
     await query.answer("Размер обновлён")
+    text, markup = screens._model_picker_parts(updated, assistant, "image")
+    await R._edit_or_answer(query, text, markup)
+
+
+async def on_set_persona_background(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Записывает фон генерации GPT Image. Правка это поле не использует."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    background = (query.data or "").removeprefix("set_bg:")
+    if background not in M._BACKGROUND_LABELS:
+        await query.answer("Неизвестный фон", show_alert=True)
+        return
+    try:
+        chat_id = message.chat.id
+        profile = await R._active_profile(chat_id, assistant_storage)
+        if M._image_background_of(profile, assistant) is None:
+            await query.answer("Эта модель не задаёт фон", show_alert=True)
+            return
+        updated = profile.model_copy(update={"image_background": background})
+        await assistant_storage.save_assistant(chat_id, updated)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer("Фон обновлён")
+    text, markup = screens._model_picker_parts(updated, assistant, "image")
+    await R._edit_or_answer(query, text, markup)
+
+
+async def on_set_image_file(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Записывает «файлом» для текущей модели картинок. У остальных моделей свой флаг."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    flag = (query.data or "").removeprefix("set_file:")
+    if flag not in {"0", "1"}:
+        await query.answer("Неизвестная настройка", show_alert=True)
+        return
+    try:
+        chat_id = message.chat.id
+        profile = await R._active_profile(chat_id, assistant_storage)
+        model_id = M._image_model_of(profile, assistant, chat_id=chat_id)
+        flags = dict(profile.image_as_file)
+        if flag == "1":
+            flags[model_id] = True
+        else:
+            flags.pop(model_id, None)
+        updated = profile.model_copy(update={"image_as_file": flags})
+        await assistant_storage.save_assistant(chat_id, updated)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer("Результат: файл" if flag == "1" else "Результат: фото")
     text, markup = screens._model_picker_parts(updated, assistant, "image")
     await R._edit_or_answer(query, text, markup)
 

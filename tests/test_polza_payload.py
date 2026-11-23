@@ -47,15 +47,21 @@ def _body(**kwargs: Any) -> dict[str, Any]:
     return build_media_body(make_polza_provider(), model=_MODEL, prompt="x", **kwargs)
 
 
-def test_body_has_no_complexity_background_or_image_resolution() -> None:
+def test_body_omits_complexity_and_image_resolution() -> None:
     body = _body(aspect_ratio="3:2", size="1536x1024", quality="high")
     media_input = body["input"]
     assert media_input["aspect_ratio"] == "3:2"
     assert media_input["size"] == "1536x1024"
     assert media_input["quality"] == "high"
-    for forbidden in ("complexity", "background", "image_resolution"):
+    for forbidden in ("complexity", "image_resolution"):
         assert forbidden not in media_input
         assert forbidden not in body
+    assert "background" not in media_input
+
+
+def test_background_is_optional_on_media_body() -> None:
+    assert _body(background="transparent")["input"]["background"] == "transparent"
+    assert _body(background="auto")["input"]["background"] == "auto"
 
 
 def test_quality_is_passed_through_as_is() -> None:
@@ -395,9 +401,7 @@ async def test_generate_rejects_more_than_limit() -> None:
 async def test_client_edit_two_photos_sends_two_references(
     multi_client_factory: Callable[..., AssistAIClient],
     polza_fixture: Callable[[str], dict[str, Any]],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ALLOW_COMPOSITE_FALLBACK", raising=False)
     client = multi_client_factory()
     base, extra = _png((255, 0, 0), (64, 48)), _png((0, 0, 255), (64, 48))
     set_billing_user(4242)
@@ -419,8 +423,8 @@ async def test_client_edit_two_photos_sends_two_references(
     assert len(refs) == 2
     assert base64.b64decode(refs[0]["data"]) == base
     assert base64.b64decode(refs[1]["data"]) == extra
-    assert "composite" not in sent["input"]["prompt"]
     assert "complexity" not in sent["input"]
+    assert sent["input"]["background"] == "auto"
     assert sent["provider"]["only"] == ["OpenAI"]
     assert sent["user"] == hash_user_id(4242)
     assert "4242" not in sent["user"]
@@ -444,7 +448,7 @@ async def test_client_generate_sends_size_not_resolution(
     assert media_input["quality"] == "high"
     assert "image_resolution" not in media_input
     assert "complexity" not in media_input
-    assert "background" not in media_input
+    assert media_input["background"] == "auto"
 
 
 # --- G7: capability-aware multi-image ---
@@ -459,8 +463,7 @@ def test_multi_image_depends_on_provider_and_model() -> None:
     assert max_edit_images(None) is None
 
 
-def test_polza_album_is_not_composited(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ALLOW_COMPOSITE_FALLBACK", raising=False)
+def test_polza_album_keeps_separate_files() -> None:
     files = [(_png((i, i, i)), f"{i}.png", "image/png") for i in range(5)]
     prepared = prepare_edit_files(files, _MODEL, provider=make_polza_provider())
     assert len(prepared) == 5

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
@@ -50,6 +49,13 @@ _REQUEST_IMAGE_MODEL: ContextVar[str | None] = ContextVar(
 _REQUEST_IMAGE_SIZE: ContextVar[str | None] = ContextVar(
     "request_image_size", default=None
 )
+_REQUEST_IMAGE_BACKGROUND: ContextVar[str | None] = ContextVar(
+    "request_image_background", default=None
+)
+_REQUEST_IMAGE_AS_FILE: ContextVar[dict[str, bool] | None] = ContextVar(
+    "request_image_as_file", default=None
+)
+IMAGE_BACKGROUNDS = ("auto", "transparent", "opaque")
 _REQUEST_IMAGES: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "request_generated_images", default=None
 )
@@ -66,6 +72,16 @@ def _set_generation_ids(ids: list[str | None]) -> None:
 def _get_generation_ids() -> list[str | None]:
     value = _GENERATION_IDS.get()
     return list(value) if value else []
+
+
+def current_image_as_file(model_id: str | None) -> bool:
+    """Флаг «файлом» для модели текущего хода. Вне хода — фото."""
+    if not isinstance(model_id, str) or not model_id.strip():
+        return False
+    flags = _REQUEST_IMAGE_AS_FILE.get()
+    if not isinstance(flags, dict):
+        return False
+    return flags.get(model_id.strip()) is True
 
 
 def generated_image_records() -> list[dict[str, str]]:
@@ -124,25 +140,45 @@ class ImageModelScope:
     обратно в контекст текстовой модели.
     """
 
-    def __init__(self, model: str | None, size: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None,
+        size: str | None = None,
+        background: str | None = None,
+        as_file: dict[str, bool] | None = None,
+    ) -> None:
         self._model = (
             model.strip() if isinstance(model, str) and model.strip() else None
         )
         self._size = size.strip() if isinstance(size, str) and size.strip() else None
+        self._background = (
+            background.strip()
+            if isinstance(background, str) and background.strip()
+            else None
+        )
+        self._as_file = dict(as_file) if isinstance(as_file, dict) else {}
         self.images: list[dict[str, str]] = []
         self._token: Token[str | None] | None = None
         self._size_token: Token[str | None] | None = None
+        self._background_token: Token[str | None] | None = None
+        self._as_file_token: Token[dict[str, bool] | None] | None = None
         self._images_token: Token[list[dict[str, str]] | None] | None = None
 
     def __enter__(self) -> Self:
         self._token = _REQUEST_IMAGE_MODEL.set(self._model)
         self._size_token = _REQUEST_IMAGE_SIZE.set(self._size)
+        self._background_token = _REQUEST_IMAGE_BACKGROUND.set(self._background)
+        self._as_file_token = _REQUEST_IMAGE_AS_FILE.set(self._as_file)
         self._images_token = _REQUEST_IMAGES.set(self.images)
         return self
 
     def __exit__(self, *_exc: object) -> None:
         if self._images_token is not None:
             _REQUEST_IMAGES.reset(self._images_token)
+        if self._as_file_token is not None:
+            _REQUEST_IMAGE_AS_FILE.reset(self._as_file_token)
+        if self._background_token is not None:
+            _REQUEST_IMAGE_BACKGROUND.reset(self._background_token)
         if self._size_token is not None:
             _REQUEST_IMAGE_SIZE.reset(self._size_token)
         if self._token is not None:
@@ -233,6 +269,13 @@ class GenerateImageTool(BaseTool):
         )
         if selected_model is None:
             selected_model = _REQUEST_IMAGE_MODEL.get()
+        background = _REQUEST_IMAGE_BACKGROUND.get()
+        if (
+            selected_model is not None
+            and image_model_family(selected_model) != "openai"
+        ):
+            background = None
+        used_model = selected_model or self._client.config.default_image_model
         try:
             import app.infra.job_queue as job_queue
 
@@ -241,6 +284,7 @@ class GenerateImageTool(BaseTool):
                 prompt.strip(),
                 selected_model,
                 size.strip(),
+                background=background,
             )
         except BudgetExceededError as exc:
             logger.warning("generate_image_budget_exceeded", error=exc.message)
@@ -256,7 +300,14 @@ class GenerateImageTool(BaseTool):
             user_id = ctx.user_id if ctx is not None else billed
             chat_id = ctx.chat_id if ctx is not None else user_id
             if chat_id is not None and user_id is not None:
-                return _error_json(await image_failure_reply(chat_id, user_id, exc))
+                return _error_json(
+                    await image_failure_reply(
+                        chat_id,
+                        user_id,
+                        exc,
+                        as_file=current_image_as_file(used_model),
+                    )
+                )
             return _error_json(exc.message)
         except (TypeError, ValueError) as exc:
             logger.error("generate_image: %s", exc)
@@ -273,6 +324,7 @@ class GenerateImageTool(BaseTool):
                 if image.startswith(("http://", "https://"))
                 else "base64",
                 "value": image,
+                "model": used_model,
             }
             if index < len(generation_ids):
                 generation_id = generation_ids[index]
@@ -338,6 +390,18 @@ def image_model_family(model: str) -> ImageModelFamily:
     return "openai"
 
 
+def openai_background(model: str, requested: str | None, *, edit: bool) -> str | None:
+    """Фон GPT Image. Правка всегда ``auto``. Остальные семейства поле не шлют."""
+    if image_model_family(model) != "openai":
+        return None
+    if edit:
+        return "auto"
+    cleaned = (requested or "auto").strip().casefold()
+    if cleaned not in IMAGE_BACKGROUNDS:
+        return "auto"
+    return cleaned
+
+
 def supports_multi_image(model_id: str, provider: ProviderConfig | None = None) -> bool:
     """True, если edits принимает несколько файлов.
 
@@ -363,15 +427,13 @@ def max_edit_images(provider: ProviderConfig | None = None) -> int | None:
 def prepare_edit_files(
     files: list[tuple[bytes, str, str]],
     model_id: str,
-    labels: list[str] | None = None,
     *,
     provider: ProviderConfig | None = None,
 ) -> list[tuple[bytes, str, str]]:
-    """Оставляет файлы по отдельности или собирает одно полотно.
+    """Оставляет файлы по отдельности. Модель без multi-image получает ошибку.
 
-    OpenAI получает исходный порядок (основа первой). Модель без multi-image
-    при ``ALLOW_COMPOSITE_FALLBACK=1`` склеивает кадры рядом, иначе ошибка.
-    Референс при этом не отбрасывается молча.
+    OpenAI сохраняет исходный порядок (основа первой). Лишний референс не
+    отбрасывается молча.
     """
     if len(files) <= 1 or supports_multi_image(model_id, provider):
         limit = max_edit_images(provider)
@@ -381,48 +443,10 @@ def prepare_edit_files(
                 error_code="BAD_REQUEST",
             )
         return list(files)
-    if os.getenv("ALLOW_COMPOSITE_FALLBACK", "0").strip() == "1":
-        return [_composite_edit_canvas(files, labels)]
     raise AssistAIError(
         f"Модель {model_id} не принимает несколько изображений. "
         "Выберите другую в настройках или опишите словами, что взять со второго фото."
     )
-
-
-def _composite_edit_canvas(
-    files: list[tuple[bytes, str, str]],
-    labels: list[str] | None,
-) -> tuple[bytes, str, str]:
-    """Склеивает фото слева направо и подписывает половины номерами."""
-    from io import BytesIO
-
-    from PIL import Image, ImageDraw
-
-    opened: list[Image.Image] = []
-    try:
-        for data, _name, _mime in files:
-            opened.append(Image.open(BytesIO(data)).convert("RGB"))
-        height = max(image.height for image in opened)
-        width = sum(image.width for image in opened)
-        canvas = Image.new("RGB", (width, height), "white")
-        draw = ImageDraw.Draw(canvas)
-        offset = 0
-        for index, image in enumerate(opened):
-            canvas.paste(image, (offset, 0))
-            mark = labels[index] if labels and index < len(labels) else str(index + 1)
-            draw.text((offset + 4, 4), mark, fill=(0, 0, 0))
-            offset += image.width
-        buffer = BytesIO()
-        canvas.save(buffer, format="PNG")
-        return buffer.getvalue(), "composite.png", "image/png"
-    finally:
-        for image in opened:
-            image.close()
-
-
-def _is_flux_model(model: str) -> bool:
-    """FLUX не принимает пиксельный ``size`` вроде ``1024x1024``."""
-    return image_model_family(model) == "flux"
 
 
 def _snap_aspect_ratio(width: int, height: int) -> str:
@@ -602,10 +626,12 @@ def _image_generation_body(
     size: str,
     *,
     quality: str | None = None,
+    background: str | None = None,
 ) -> dict[str, Any]:
     """Тело ``images/generations`` с учётом семейства модели.
 
     ``complexity`` не отправляется: на ProxyAPI разницы low/high не было.
+    ``background`` — только у GPT Image.
     """
     fields: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
     cleaned = size.strip()
@@ -614,6 +640,8 @@ def _image_generation_body(
         fields["size"] = _OPENAI_SIZE_ALIASES.get(cleaned, cleaned)
         if quality:
             fields["quality"] = quality
+        if background:
+            fields["background"] = background
         return fields
     if family == "flux":
         fields.update(_flux_size_fields(cleaned))
@@ -765,6 +793,7 @@ class ImageOpsMixin(ProviderTransportMixin):
         prompt: str,
         size: str,
         images: list[bytes] | None = None,
+        background: str | None = None,
     ) -> dict[str, Any]:
         """Генерация или правка через Polza ``/v1/media`` под breaker провайдера."""
         breaker = get_breaker(provider.id)
@@ -798,6 +827,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                 quality=fields.get("quality"),
                 output_format=fields.get("output_format"),
                 images=images,
+                background=background,
                 user=polza_media.hash_user_id(get_billing_user()),
                 pin_upstream=bool(fields.get("pin_upstream", True)),
                 send_max_price=bool(fields.get("send_max_price", True)),
@@ -894,6 +924,7 @@ class ImageOpsMixin(ProviderTransportMixin):
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         """Генерирует изображение и возвращает URL или строки base64.
 
@@ -928,6 +959,7 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise ValueError("Prompt слишком длинный")
         sanitized_prompt = security.sanitize_prompt(prompt)
         selected_model = model or self.config.default_image_model
+        resolved_background = openai_background(selected_model, background, edit=False)
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -945,6 +977,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                 sanitized_prompt,
                 size.strip(),
                 quality=self.config.image_quality,
+                background=resolved_background,
             )
             read_timeout = max(self.config.timeout, _IMAGE_READ_TIMEOUT)
             timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
@@ -958,6 +991,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                 "generate_image",
                 model=selected_model,
                 size=size_label,
+                background=resolved_background,
                 prompt_chars=len(sanitized_prompt),
             )
             polza_size = size.strip()
@@ -971,6 +1005,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                         model=selected_model,
                         prompt=sanitized_prompt,
                         size=polza_size,
+                        background=resolved_background,
                     )
                 return await self._post_image_json(
                     payload, timeout=timeout, provider=provider
@@ -1031,11 +1066,13 @@ class ImageOpsMixin(ProviderTransportMixin):
         try:
             image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
             sanitized = security.sanitize_prompt(prompt.strip())
+            edit_background = openai_background(selected_model, None, edit=True)
             body = _image_generation_body(
                 selected_model,
                 sanitized,
                 edit_size,
                 quality=self.config.image_quality,
+                background=edit_background,
             )
             form = {key: str(value) for key, value in body.items() if key != "n"}
             files = {
@@ -1061,6 +1098,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                         prompt=sanitized,
                         size=polza_size,
                         images=[image_bytes],
+                        background=edit_background,
                     )
                 return await self._post_image_edit(form, files, provider)
 
@@ -1124,21 +1162,15 @@ class ImageOpsMixin(ProviderTransportMixin):
                 scaled_data, scaled_mime = self._downscale_edit_input(raw, mime)
                 scaled.append((scaled_data, name, scaled_mime))
             polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
+            edit_background = openai_background(selected_model, None, edit=True)
 
             async def attempt(provider: ProviderConfig) -> dict[str, Any]:
-                # Лимит и склейка зависят от провайдера, поэтому готовим файлы здесь.
-                prepared = prepare_edit_files(
-                    scaled, selected_model, labels, provider=provider
-                )
+                # Лимит числа файлов зависит от провайдера, поэтому готовим их здесь.
+                prepared = prepare_edit_files(scaled, selected_model, provider=provider)
                 sanitized = security.sanitize_prompt(prompt.strip())
                 if labels:
                     numbered = ", ".join(labels)
                     sanitized = f"{sanitized}\nImage order: {numbered}."
-                if len(prepared) == 1 and len(files) > 1:
-                    sanitized = (
-                        f"{sanitized} The canvas is a side-by-side composite. "
-                        "The left half is the base image."
-                    )
                 logger.info(
                     "edit_image",
                     model=selected_model,
@@ -1153,12 +1185,14 @@ class ImageOpsMixin(ProviderTransportMixin):
                         prompt=sanitized,
                         size=polza_size,
                         images=[data for data, _name, _mime in prepared],
+                        background=edit_background,
                     )
                 body = _image_generation_body(
                     selected_model,
                     sanitized,
                     edit_size,
                     quality=self.config.image_quality,
+                    background=edit_background,
                 )
                 form = {
                     key: str(value) for key, value in body.items() if key not in {"n"}

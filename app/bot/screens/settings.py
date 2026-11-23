@@ -149,6 +149,35 @@ def _model_picker_parts(
                 )
             )
         rows.append(size_row)
+        background = M._image_background_of(profile, assistant)
+        background_line = ""
+        choose = "Выберите модель, размер или получение файлом:"
+        if background is not None:
+            bg_row: list[InlineKeyboardButton] = []
+            for value, label in M._BACKGROUND_LABELS.items():
+                mark = "✅ " if value == background else ""
+                bg_row.append(
+                    InlineKeyboardButton(
+                        text=f"{mark}{label}",
+                        callback_data=f"set_bg:{value}",
+                    )
+                )
+            rows.append(bg_row)
+            background_line = f"Фон: {M._background_label(background)}\n"
+            choose = "Выберите модель, размер, фон или получение файлом:"
+        file_on = M._image_as_file(profile, image_model)
+        file_row: list[InlineKeyboardButton] = []
+        for enabled, label in ((False, "Фото"), (True, "Файлом")):
+            mark = "✅ " if file_on is enabled else ""
+            flag = "1" if enabled else "0"
+            file_row.append(
+                InlineKeyboardButton(
+                    text=f"{mark}{label}",
+                    callback_data=f"set_file:{flag}",
+                )
+            )
+        rows.append(file_row)
+        file_line = f"Получать результат файлом: {M._image_file_label(file_on)}\n"
         rows.append(
             [
                 InlineKeyboardButton(
@@ -159,8 +188,10 @@ def _model_picker_parts(
         text = (
             f"Модель картинок ассистента «{profile.name}»:\n"
             f"{current}\n"
-            f"Размер: {shown_size}\n\n"
-            "Выберите модель или размер:\n\n"
+            f"Размер: {shown_size}\n"
+            f"{background_line}"
+            f"{file_line}\n"
+            f"{choose}\n\n"
             f"{M._hints_block(AVAILABLE_IMAGE_MODELS, image_model)}"
         )
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -253,7 +284,7 @@ def _model_picker_parts(
         profile.text_model, assistant.config.default_text_model
     )
     text_model = M._text_model_of(profile, assistant)
-    keyboard = M._model_keyboard(AVAILABLE_TEXT_MODELS, "set_text")
+    keyboard = M._model_keyboard(AVAILABLE_TEXT_MODELS, "set_text", done="picker:done")
     text = (
         f"Текстовая модель ассистента «{profile.name}»:\n{current}\n\n"
         f"Выберите модель:\n\n{M._hints_block(AVAILABLE_TEXT_MODELS, text_model)}"
@@ -322,6 +353,17 @@ def _settings_persona_view(
     lines.extend(
         [
             f"Размер картинки: {shown_size}",
+        ]
+    )
+    background = M._image_background_of(profile, assistant)
+    if background is not None:
+        lines.append(f"Фон картинки: {M._background_label(background)}")
+    lines.append(
+        "Получать результат файлом: "
+        f"{M._image_file_label(M._image_as_file(profile, image_model))}"
+    )
+    lines.extend(
+        [
             f"Видео: {video_settings_summary(video_settings_from(profile))}",
             (
                 "TTS модель: "

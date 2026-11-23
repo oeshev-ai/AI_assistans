@@ -22,21 +22,6 @@ _MAX_IMAGE_SIDE = 3840
 _MAX_IMAGE_RATIO = 3.0
 
 
-def image_dimensions(data: bytes) -> tuple[int, int]:
-    """Ширина и высота первого кадра. Пустой или битый файл — ошибка."""
-    from io import BytesIO
-
-    from PIL import Image
-
-    if not data:
-        raise MediaProcessingError("Пустой файл изображения.")
-    with Image.open(BytesIO(data)) as image:
-        width, height = image.size
-    if width <= 0 or height <= 0:
-        raise MediaProcessingError("Не удалось прочитать размер изображения.")
-    return width, height
-
-
 def source_image_size(data: bytes) -> tuple[int, int]:
     """Размер после EXIF-поворота. Для поля ``size`` берём оригинал, не даунскейл."""
     from io import BytesIO

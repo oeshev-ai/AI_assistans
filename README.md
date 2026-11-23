@@ -196,13 +196,21 @@ pytest tests/ -v
 
 CI на push и pull request в `main`: ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
 
-После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/<owner>/<repo>:latest` и тег по SHA. На VPS в `.env`:
+После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`. SSH-шаг в workflow по умолчанию выключен.
 
-```text
-APP_IMAGE=ghcr.io/<owner>/<repo>:latest
-```
+### Чеклист перед включением Deploy over SSH
 
-Дальше на сервере: `docker compose pull && docker compose up -d`. SSH из workflow не выполняется. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
+VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistans` (не `/opt/vpd06`).
+
+1. На `main` есть актуальный `docker-compose.yml` с `image: ${APP_IMAGE:-…}` (не только `build: .`). На сервере: `git pull` до этого коммита.
+2. В `/home/deploy/AI_assistans/.env`:
+   ```text
+   APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:latest
+   ```
+3. Под `deploy`: `docker login ghcr.io` (PAT с `read:packages`), если пакет private.
+4. Вручную: `cd /home/deploy/AI_assistans && docker compose pull && docker compose up -d` — контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai_assistans-bot`.
+5. Секреты репозитория: `SSH_HOST`, `SSH_USER` (`deploy`), `SSH_PRIVATE_KEY` (отдельный ключ для Actions, pubkey в `authorized_keys` у `deploy`).
+6. В `.github/workflows/deploy.yml` раскомментировать шаг `Deploy over SSH`. При `ARQ_ENABLED=1` в script использовать `--profile arq` для `pull` и `up`.
 
 Redis в Compose: AOF, потолок `REDIS_MAXMEMORY` (по умолчанию 256mb), политика `volatile-ttl`. У тем, персон, бюджета, лимитов и буферов очереди есть срок жизни. Когда память кончается, Redis снимает ключ с самым коротким остатком TTL: сначала окна лимитов и временные payload, потом давно не открытые темы. Активный чат продлевает TTL при обращении и освобождается последним. Запись истории при этом не останавливается целиком. Пароль — `REDIS_PASSWORD`; пустой пароль не подставляется в URL, иначе клиент arq ломает AUTH.
 

@@ -471,8 +471,16 @@ async def test_generate_image_tool_packs_url_and_base64(
     assert payload["reference_indexes"] == [0, 1]
     assert "aGVsbG8=" not in json.dumps(payload)
     assert scope.images == [
-        {"type": "url", "value": "https://cdn.example/cat.png"},
-        {"type": "base64", "value": "aGVsbG8="},
+        {
+            "type": "url",
+            "value": "https://cdn.example/cat.png",
+            "model": "openai/gpt-image-2.6-flare",
+        },
+        {
+            "type": "base64",
+            "value": "aGVsbG8=",
+            "model": "openai/gpt-image-2.6-flare",
+        },
     ]
 
 
@@ -504,9 +512,11 @@ async def test_image_model_scope_used_when_tool_omits_model(
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         seen["model"] = model
         seen["prompt"] = prompt
+        seen["background"] = background
         return ["https://cdn.example/cat.png"]
 
     assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
@@ -515,6 +525,12 @@ async def test_image_model_scope_used_when_tool_omits_model(
         payload = json.loads(await tool.execute(prompt="кот"))
 
     assert seen["model"] == "openai/gpt-image-2.6-flare"
+    assert seen["background"] is None
+    assert payload["status"] == "success"
+
+    with ImageModelScope("openai/gpt-image-2.6-flare", background="transparent"):
+        payload = json.loads(await tool.execute(prompt="кот"))
+    assert seen["background"] == "transparent"
     assert payload["status"] == "success"
 
 
@@ -530,9 +546,11 @@ async def test_image_size_scope_used_when_tool_omits_size(
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         sizes.append(size)
         seen["model"] = model
+        seen["background"] = background
         return ["https://cdn.example/cat.png"]
 
     assist_client.generate_image = _fake_generate  # type: ignore[method-assign]

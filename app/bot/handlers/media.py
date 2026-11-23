@@ -32,8 +32,7 @@ from app.bot.handlers.photo import PhotoTurn, deliver_album, incoming_from_messa
 from app.storage.pending_media import PendingMediaStorage
 
 _BUSY_STEP = (
-    "Сначала завершите текущий шаг или нажмите «Отмена», "
-    "затем пришлите файл ещё раз."
+    "Сначала завершите текущий шаг или нажмите «Отмена», затем пришлите файл ещё раз."
 )
 
 

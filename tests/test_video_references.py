@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,11 +25,15 @@ from app.storage.assistant_storage import DEFAULT_SYSTEM_PROMPT
 
 
 class _ImageClient:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(default_image_model="openai/gpt-image-2.6-flare")
+
     async def generate_image(
         self,
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         return ["https://cdn.example/ref.png"]
 
