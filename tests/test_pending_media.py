@@ -51,6 +51,23 @@ async def test_users_are_isolated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clear_user_removes_all_personas() -> None:
+    store = InMemoryPendingMediaStorage(ttl_seconds=30)
+    for asst in ("a", "b"):
+        media = _sample()
+        media.assistant_id = asst
+        await store.put(media)
+    other = _sample(user_id=99)
+    other.assistant_id = "a"
+    await store.put(other)
+    assert await store.clear_user(7, 42) is True
+    assert await store.get(7, "a", 42) is None
+    assert await store.get(7, "b", 42) is None
+    assert await store.get(7, "a", 99) is not None
+    assert await store.clear_user(7, 42) is False
+
+
+@pytest.mark.asyncio
 async def test_memory_expires() -> None:
     store = InMemoryPendingMediaStorage(ttl_seconds=0.01)
     await store.put(_sample())

@@ -10,7 +10,6 @@ from __future__ import annotations
 import base64
 import json
 import math
-import os
 import uuid
 from typing import Any
 from urllib.parse import urlparse
@@ -23,7 +22,6 @@ logger = structlog.get_logger("job_queue")
 
 # Создание картинки может занять весь read-timeout, затем опрос — POLZA_TOTAL_WAIT.
 _IMAGE_CREATE_TIMEOUT = 180.0
-_DEFAULT_ARQ_JOB_TIMEOUT = 450.0
 
 
 def _optional_float(value: Any) -> float | None:
@@ -81,8 +79,9 @@ def _redis_settings_from_url(redis_url: str) -> Any:
 async def init_job_queue(redis_url: str) -> None:
     """Create an arq pool when queueing is enabled."""
     global _pool, _enabled
-    flag = os.getenv("ARQ_ENABLED", "").strip().lower()
-    _enabled = flag in {"1", "true", "yes", "on"}
+    from app.infra.settings import get_settings
+
+    _enabled = get_settings().arq_enabled
     if not _enabled:
         logger.info("arq_disabled")
         return
@@ -132,9 +131,9 @@ def _billing_user_id(explicit: int | None = None) -> int | None:
 
 def _polza_image_wait_needed() -> float:
     """Минимум ожидания: таймаут создания плюс опрос Polza и запас."""
-    from app.infra.envparse import env_float
+    from app.infra.settings import get_settings
 
-    polza_wait = max(0.0, env_float("POLZA_TOTAL_WAIT", 240.0))
+    polza_wait = max(0.0, get_settings().polza_total_wait_seconds)
     return _IMAGE_CREATE_TIMEOUT + polza_wait + 30.0
 
 
@@ -144,15 +143,16 @@ def validate_arq_image_timeout() -> None:
     A shorter worker timeout kills paid image jobs while the bot may still wait
     (or historically gave up early). Call when the arq queue/worker is enabled.
     """
-    from app.infra.envparse import env_float
+    from app.infra.settings import get_settings
 
-    arq_timeout = env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT)
+    settings = get_settings()
+    arq_timeout = settings.arq_job_timeout_seconds
     needed = _polza_image_wait_needed()
     if arq_timeout > 0 and arq_timeout < needed:
         logger.error(
             "arq_image_timeout_below_polza_wait",
             arq_job_timeout=arq_timeout,
-            polza_total_wait=env_float("POLZA_TOTAL_WAIT", 240.0),
+            polza_total_wait=settings.polza_total_wait_seconds,
             needed=needed,
         )
         raise ValueError(
@@ -169,9 +169,9 @@ def image_result_timeout(explicit: float | None = None) -> float:
     """
     if explicit is not None:
         return explicit
-    from app.infra.envparse import env_float
+    from app.infra.settings import get_settings
 
-    job_timeout = env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT)
+    job_timeout = get_settings().arq_job_timeout_seconds
     return max(_polza_image_wait_needed(), job_timeout)
 
 
@@ -179,9 +179,9 @@ def audio_result_timeout(explicit: float | None = None) -> float:
     """Ожидание TTS/STT совпадает с таймаутом задачи, чтобы бот не сдался раньше."""
     if explicit is not None:
         return explicit
-    from app.infra.envparse import env_float
+    from app.infra.settings import get_settings
 
-    return max(120.0, env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT))
+    return max(120.0, get_settings().arq_job_timeout_seconds)
 
 
 def _payload_ttl_seconds() -> int:
@@ -190,10 +190,11 @@ def _payload_ttl_seconds() -> int:
     Must outlive queue delay + worker ``ARQ_JOB_TIMEOUT`` so backlog does not
     expire the body before the job starts.
     """
-    from app.infra.envparse import env_float
+    from app.infra.settings import get_settings
 
-    job_timeout = max(0.0, env_float("ARQ_JOB_TIMEOUT", _DEFAULT_ARQ_JOB_TIMEOUT))
-    polza_wait = max(0.0, env_float("POLZA_TOTAL_WAIT", 240.0))
+    settings = get_settings()
+    job_timeout = max(0.0, settings.arq_job_timeout_seconds)
+    polza_wait = max(0.0, settings.polza_total_wait_seconds)
     return int(max(600.0, job_timeout + 120.0, polza_wait + 120.0))
 
 

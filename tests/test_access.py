@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from app.infra.access import is_production, is_user_allowed, parse_allowed_user_ids
+import pytest
+
+from app.infra.access import (
+    is_production,
+    is_user_allowed,
+    parse_allowed_user_ids,
+    require_redis_password,
+)
 
 
 def test_parse_empty_is_open_mode() -> None:
@@ -30,6 +37,27 @@ def test_closed_mode_requires_membership() -> None:
     assert is_user_allowed(10, allowed) is True
     assert is_user_allowed(99, allowed) is False
     assert is_user_allowed(None, allowed) is False
+
+
+def test_redis_password_required_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("REDIS_PASSWORD", "  ")
+    with pytest.raises(SystemExit):
+        require_redis_password()
+
+
+def test_redis_password_set_allows_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("REDIS_PASSWORD", "secret")
+    require_redis_password()
+
+
+def test_redis_password_optional_outside_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+    require_redis_password()
 
 
 def test_is_production(monkeypatch) -> None:

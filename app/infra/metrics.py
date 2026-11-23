@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Awaitable, Callable
 from functools import wraps
@@ -74,7 +73,9 @@ def start_metrics_server(port: int = 8080, addr: str | None = None) -> None:
     global _metrics_started
     if _metrics_started:
         return
-    raw = addr if addr is not None else os.getenv("METRICS_BIND")
+    from app.infra.settings import get_settings
+
+    raw = addr if addr is not None else get_settings().metrics_bind
     bind = (raw or "127.0.0.1").strip() or "127.0.0.1"
     start_http_server(port, addr=bind)
     _metrics_started = True

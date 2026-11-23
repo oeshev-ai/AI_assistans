@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import wave
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +14,16 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from app.media.upload_server import setup_upload_routes
 from app.storage.upload_sessions import UploadSessionStore
+
+
+def _wav_bytes() -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x00\x00" * 800)
+    return buf.getvalue()
 
 
 @dataclass
@@ -38,9 +50,9 @@ class FakeStorage:
     async def head_object(self, object_key: str) -> dict[str, Any]:
         data = self.objects.get(object_key)
         if data is None:
-            from app.storage.s3_storage import S3StorageError
+            from app.storage.s3_storage import S3NotFoundError
 
-            raise S3StorageError("missing")
+            raise S3NotFoundError("missing")
         return {"ContentLength": len(data), "ContentType": "audio/mpeg"}
 
     async def download_bytes(self, object_key: str) -> bytes:
@@ -89,9 +101,9 @@ async def test_same_origin_file_upload_flow() -> None:
         form = FormData()
         form.add_field(
             "file",
-            b"ID3fake-mp3-bytes",
-            filename="lecture.mp3",
-            content_type="audio/mpeg",
+            _wav_bytes(),
+            filename="lecture.wav",
+            content_type="audio/wav",
         )
         # Auth via HttpOnly cookie only — no ?t= on API.
         resp = await client.post(
@@ -107,9 +119,9 @@ async def test_same_origin_file_upload_flow() -> None:
         form2 = FormData()
         form2.add_field(
             "file",
-            b"ID3fake-mp3-bytes-2",
-            filename="lecture2.mp3",
-            content_type="audio/mpeg",
+            _wav_bytes(),
+            filename="lecture2.wav",
+            content_type="audio/wav",
         )
         dup = await client.post(
             f"/api/uploads/{session.upload_id}/file",
@@ -156,9 +168,9 @@ async def test_upload_releases_claim_on_bad_multipart() -> None:
         form = FormData()
         form.add_field(
             "file",
-            b"ID3retry-bytes",
-            filename="retry.mp3",
-            content_type="audio/mpeg",
+            _wav_bytes(),
+            filename="retry.wav",
+            content_type="audio/wav",
         )
         ok = await client.post(f"/api/uploads/{session.upload_id}/file", data=form)
         assert ok.status == 200, await ok.text()
@@ -200,6 +212,21 @@ async def test_upload_rejects_mime_mismatch() -> None:
         assert storage.objects == {}
     finally:
         await client.close()
+
+
+def test_client_key_uses_last_forwarded_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from app.media.upload_server import _client_key
+
+    req = SimpleNamespace(
+        remote="10.0.0.2",
+        headers={"X-Forwarded-For": "1.2.3.4, 203.0.113.9"},
+    )
+    monkeypatch.delenv("TRUST_PROXY", raising=False)
+    assert _client_key(req) == "10.0.0.2"  # type: ignore[arg-type]
+    monkeypatch.setenv("TRUST_PROXY", "1")
+    assert _client_key(req) == "203.0.113.9"  # type: ignore[arg-type]
 
 
 def test_forwarded_proto_requires_trust_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,9 +289,9 @@ async def test_upload_errors_are_opaque() -> None:
         form = FormData()
         form.add_field(
             "file",
-            b"ID3bytes",
-            filename="a.mp3",
-            content_type="audio/mpeg",
+            _wav_bytes(),
+            filename="a.wav",
+            content_type="audio/wav",
         )
         resp = await client.post(f"/api/uploads/{session.upload_id}/file", data=form)
         body = await resp.json()
@@ -272,6 +299,56 @@ async def test_upload_errors_are_opaque() -> None:
         assert body["error"] == "Ошибка загрузки"
         assert "secret-xyz" not in str(body)
         assert "10.0.0.5" not in str(body)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_post_is_rate_limited_before_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from app.infra.rate_limiter import rate_limiter
+
+    store = UploadSessionStore(redis=None)
+    storage = FakeStorage()
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application(client_max_size=10 * 1024 * 1024)
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=storage,
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        rate_limiter, "check_upload_limit", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        rate_limiter, "get_upload_retry_after", AsyncMock(return_value=42.0)
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        form = FormData()
+        form.add_field(
+            "file",
+            b"not-a-real-upload",
+            filename="lecture.mp3",
+            content_type="audio/mpeg",
+        )
+        resp = await client.post(
+            f"/api/uploads/{session.upload_id}/file?t={session.token}",
+            data=form,
+        )
+        assert resp.status == 429
+        assert resp.headers["Retry-After"] == "42"
+        body = await resp.json()
+        assert "позже" in body["error"]
+        assert storage.objects == {}
+        saved = await store.get_authorized(session.upload_id, session.token)
+        assert saved is not None
+        assert saved.status == "pending"
     finally:
         await client.close()
 

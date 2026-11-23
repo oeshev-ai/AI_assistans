@@ -34,6 +34,16 @@ NO_FALLBACK_CODES = frozenset(
 )
 NO_FALLBACK_STATUSES = frozenset({400, 401, 403, 404, 413})
 
+# Платный one-shot (картинка/видео/аудио): таймаут/сеть после ухода запроса
+# могли уже создать задачу у провайдера — второй хост = риск двойной оплаты.
+PAID_AMBIGUOUS_CODES = frozenset(
+    {
+        "TIMEOUT",
+        "REQUEST_TIMEOUT",
+        "NETWORK_ERROR",
+    }
+)
+
 
 class AssistAIError(Exception):
     """Ошибка запроса к провайдеру или исчерпанный лимит вызовов инструментов.
@@ -82,15 +92,21 @@ def is_rate_limited(exc: AssistAIError) -> bool:
     return _normalized_code(exc) == "TOO_MANY_REQUESTS" or exc.status_code == 429
 
 
-def fallback_reason(exc: AssistAIError) -> str | None:
+def fallback_reason(
+    exc: AssistAIError, *, paid_side_effect: bool = False
+) -> str | None:
     """Причина для fallback или ``None``, если переключаться нельзя.
 
     Неизвестные ошибки трактуются консервативно: без fallback.
+    ``paid_side_effect=True`` — для картинок/видео/аудио: TIMEOUT/NETWORK
+    без ``job_committed`` тоже без fallback (запрос мог уже приняться).
     """
     if exc.job_committed:
         return None
     code = _normalized_code(exc)
     if code.startswith("GUARD_") or code in NO_FALLBACK_CODES:
+        return None
+    if paid_side_effect and code in PAID_AMBIGUOUS_CODES:
         return None
     if code in FALLBACK_CODES:
         return FALLBACK_CODES[code]
@@ -100,6 +116,8 @@ def fallback_reason(exc: AssistAIError) -> str | None:
     if status in NO_FALLBACK_STATUSES:
         return None
     if status == 408:
+        if paid_side_effect:
+            return None
         return "request_timeout"
     if status == 429:
         return "rate_limited"

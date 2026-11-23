@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,24 +81,20 @@ class SpeechKitConfig:
 
     @classmethod
     def from_env(cls) -> SpeechKitConfig | None:
-        """Читает конфиг из env. ``None``, если ключ не задан."""
-        api_key = os.getenv("YC_SPEECHKIT_API_KEY", "").strip()
+        """Читает конфиг из общего слоя настроек. ``None``, если ключ не задан."""
+        from app.infra.envparse import ensure_https_url
+        from app.infra.settings import get_settings
+
+        settings = get_settings()
+        api_key = settings.speechkit_api_key
         if not api_key:
             return None
-        folder_id = os.getenv("YC_FOLDER_ID", "").strip()
-        role = os.getenv("SPEECHKIT_ROLE", DEFAULT_ROLE).strip()
-        speed_raw = os.getenv("SPEECHKIT_SPEED", str(DEFAULT_SPEED)).strip() or str(
-            DEFAULT_SPEED
-        )
-        try:
-            speed = float(speed_raw)
-        except ValueError:
-            speed = DEFAULT_SPEED
-        voice = os.getenv("SPEECHKIT_VOICE", DEFAULT_VOICE).strip() or DEFAULT_VOICE
-        from app.infra.envparse import ensure_https_url
-
+        folder_id = settings.speechkit_folder_id
+        role = settings.speechkit_role
+        speed = settings.speechkit_speed
+        voice = settings.speechkit_voice
         url = ensure_https_url(
-            os.getenv("SPEECHKIT_URL", "").strip(),
+            settings.speechkit_url,
             name="SPEECHKIT_URL",
             default=DEFAULT_SPEECHKIT_URL,
         )

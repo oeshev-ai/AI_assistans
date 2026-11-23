@@ -294,9 +294,18 @@ async def on_asst_del_yes(
             if deleted is not None
             else profile_id
         )
-        if profile_id != DEFAULT_ASSISTANT_ID:
-            await topic_storage.delete_assistant_topics(chat_id, profile_id)
+        # Сначала профиль: если темы упадут после удаления, останутся сироты,
+        # а не «темы стёрты, персона жива».
         await assistant_storage.delete_assistant(chat_id, profile_id)
+        if profile_id != DEFAULT_ASSISTANT_ID:
+            try:
+                await topic_storage.delete_assistant_topics(chat_id, profile_id)
+            except TopicStorageError:
+                logger.warning(
+                    "assistant_topics_cleanup_failed chat_id=%s id=%s",
+                    chat_id,
+                    profile_id,
+                )
         profile = await R._active_profile(chat_id, assistant_storage)
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError as exc:

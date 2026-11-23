@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import os
-
 AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
     "deepseek/deepseek-v4.1-flash-1017",
     "google/gemini-3.8-flash",
@@ -95,24 +93,26 @@ POLZA_VIDEO_MODEL_ALIASES: dict[str, str] = {
 }
 
 
-def _aliases_enabled(env_name: str) -> bool:
-    return os.getenv(env_name, "1").strip().casefold() not in {"0", "false", "no"}
-
-
 def resolve_image_model(model_id: str | None) -> str | None:
-    if not model_id or not _aliases_enabled("IMAGE_LEGACY_ALIASES"):
+    from app.infra.settings import get_settings
+
+    if not model_id or not get_settings().image_legacy_aliases:
         return model_id
     return LEGACY_IMAGE_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
 
 
 def resolve_text_model(model_id: str | None) -> str | None:
-    if not model_id or not _aliases_enabled("TEXT_LEGACY_ALIASES"):
+    from app.infra.settings import get_settings
+
+    if not model_id or not get_settings().text_legacy_aliases:
         return model_id
     return LEGACY_TEXT_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
 
 
 def resolve_tts_model(model_id: str | None) -> str | None:
-    if not model_id or not _aliases_enabled("TTS_LEGACY_ALIASES"):
+    from app.infra.settings import get_settings
+
+    if not model_id or not get_settings().tts_legacy_aliases:
         return model_id
     return LEGACY_TTS_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
 

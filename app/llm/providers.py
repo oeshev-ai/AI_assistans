@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.infra.settings import get_settings
 
 _LOCAL_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -95,39 +96,9 @@ class ProviderConfig(BaseModel):
 
 
 _ROUTE_OPS = ("text", "image", "audio", "video")
-_DEFAULT_PROXYAPI_BASE = "https://api.proxyapi.ru/v1"
-_DEFAULT_POLZA_BASE = "https://polza.ai/api"
-_DEFAULT_POLZA_CHAT_BASE = "https://polza.ai/api/v1"
 PROXYAPI_CAPABILITIES = frozenset({"chat", "images", "images_edit", "audio", "video"})
 _PROXYAPI_CAPABILITIES = PROXYAPI_CAPABILITIES
 _POLZA_CAPABILITIES = frozenset({"chat", "images", "images_edit", "audio", "video"})
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = _env(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _split_csv(raw: str) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def load_providers(
@@ -135,65 +106,64 @@ def load_providers(
     proxyapi_key: str | None = None,
     polza_key: str | None = None,
 ) -> dict[str, ProviderConfig]:
-    """Собирает реестр из env. Без ключа провайдер не регистрируется."""
+    """Собирает реестр из настроек. Без ключа провайдер не регистрируется."""
+    settings = get_settings()
     providers: dict[str, ProviderConfig] = {}
-    proxy_key = proxyapi_key if proxyapi_key is not None else _env("PROXYAPI_API_KEY")
+    proxy_key = proxyapi_key if proxyapi_key is not None else settings.proxyapi_api_key
     if proxy_key:
         providers["proxyapi"] = ProviderConfig(
             id="proxyapi",
             kind="openai",
-            base_url=_env("PROXYAPI_BASE_URL", _DEFAULT_PROXYAPI_BASE)
-            or _DEFAULT_PROXYAPI_BASE,
+            base_url=settings.proxyapi_base_url,
             api_key=proxy_key,
             capabilities=_PROXYAPI_CAPABILITIES,
             cost_source="usage_tokens",
             cost_multiplier=1.0,
         )
 
-    polza = polza_key if polza_key is not None else _env("POLZA_API_KEY")
+    polza = polza_key if polza_key is not None else settings.polza_api_key
     if polza:
-        upstream = _split_csv(_env("POLZA_UPSTREAM_ONLY", "OpenAI"))
         providers["polza"] = ProviderConfig(
             id="polza",
             kind="polza_media",
-            base_url=_env("POLZA_BASE_URL", _DEFAULT_POLZA_BASE) or _DEFAULT_POLZA_BASE,
+            base_url=settings.polza_base_url,
             api_key=polza,
             capabilities=_POLZA_CAPABILITIES,
             cost_source="cost_rub",
-            cost_multiplier=_env_float("POLZA_COST_MULTIPLIER", 0.39),
-            upstream_only=upstream or ("OpenAI",),
-            allow_upstream_fallbacks=_env_flag("POLZA_ALLOW_UPSTREAM_FALLBACKS", False),
-            max_price_image_rub=_env_float("POLZA_MAX_PRICE_IMAGE_RUB", 12.0),
-            chat_base_url=_env("POLZA_CHAT_BASE_URL", _DEFAULT_POLZA_CHAT_BASE)
-            or _DEFAULT_POLZA_CHAT_BASE,
+            cost_multiplier=settings.polza_cost_multiplier,
+            upstream_only=settings.polza_upstream_only,
+            allow_upstream_fallbacks=settings.polza_allow_upstream_fallbacks,
+            max_price_image_rub=settings.polza_max_price_image_rub,
+            chat_base_url=settings.polza_chat_base_url,
         )
     return providers
 
 
 def load_routes() -> dict[str, str]:
     """Маршруты операций → id провайдера. Пустые env → polza."""
+    settings = get_settings()
     return {
-        "text": _env("TEXT_PROVIDER", "polza") or "polza",
-        "image": _env("IMAGE_PROVIDER", "polza") or "polza",
-        "audio": _env("AUDIO_PROVIDER", "polza") or "polza",
-        "video": _env("VIDEO_PROVIDER", "polza") or "polza",
+        "text": settings.text_provider,
+        "image": settings.image_provider,
+        "audio": settings.audio_provider,
+        "video": settings.video_provider,
     }
 
 
 def load_image_fallback() -> str:
-    return _env("IMAGE_PROVIDER_FALLBACK", "proxyapi")
+    return get_settings().image_provider_fallback
 
 
 def load_text_fallback() -> str:
-    return _env("TEXT_PROVIDER_FALLBACK", "proxyapi")
+    return get_settings().text_provider_fallback
 
 
 def load_audio_fallback() -> str:
-    return _env("AUDIO_PROVIDER_FALLBACK", "proxyapi")
+    return get_settings().audio_provider_fallback
 
 
 def load_video_fallback() -> str:
-    return _env("VIDEO_PROVIDER_FALLBACK", "proxyapi")
+    return get_settings().video_provider_fallback
 
 
 class ProviderRegistry:

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -24,32 +23,21 @@ _LOCK_TTL_SEC = 5
 
 
 def album_debounce_seconds() -> float:
-    raw = os.getenv("ALBUM_DEBOUNCE_SECONDS", "1.2").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 1.2
-    return value if value > 0 else 1.2
+    from app.infra.settings import get_settings
+
+    return get_settings().album_debounce_seconds
 
 
 def max_album_items() -> int:
-    raw = os.getenv("MAX_ALBUM_ITEMS", "5").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return 5
-    return value if value > 0 else 5
+    from app.infra.settings import get_settings
+
+    return get_settings().max_album_items
 
 
 def max_album_total_bytes() -> int:
-    raw = os.getenv("MAX_ALBUM_TOTAL_MB", "20").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 20
-    if value < 1:
-        value = 20
-    return value * 1024 * 1024
+    from app.infra.settings import get_settings
+
+    return get_settings().max_album_total_mb * 1024 * 1024
 
 
 @dataclass

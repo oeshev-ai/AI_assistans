@@ -875,12 +875,16 @@ class ImageOpsMixin(ProviderTransportMixin):
         self,
         attempt: Callable[[ProviderConfig], Awaitable[dict[str, Any]]],
     ) -> tuple[dict[str, Any], ProviderConfig]:
-        """Картинка у основного провайдера; один fallback только при недоступности."""
+        """Картинка у основного провайдера; один fallback только при недоступности.
+
+        TIMEOUT/NETWORK без ``job_committed`` на fallback не уходят: sync-запрос
+        мог уже создаться у провайдера.
+        """
         primary, fallback = self._registry.resolve_route("image")
         try:
             return await self._attempt_image(primary, attempt), primary
         except AssistAIError as exc:
-            reason = fallback_reason(exc)
+            reason = fallback_reason(exc, paid_side_effect=True)
             if reason == "insufficient_balance":
                 logger.error("provider_balance_exhausted", provider=primary.id)
             if fallback is None or reason is None:
@@ -891,6 +895,14 @@ class ImageOpsMixin(ProviderTransportMixin):
             )
             note_provider_fallback(primary.id, fallback.id, reason)
             return await self._attempt_image(fallback, attempt), fallback
+
+    def _image_provider_for_id(self, provider_id: str | None) -> ProviderConfig:
+        if provider_id:
+            try:
+                return self._registry.get(provider_id)
+            except KeyError:
+                pass
+        return self._endpoint("image")
 
     async def _record_image_spend(
         self,
@@ -917,6 +929,23 @@ class ImageOpsMixin(ProviderTransportMixin):
             model=model,
             source=estimate.source,
             cost_rub=estimate.cost_rub,
+        )
+
+    async def _record_committed_image_spend(
+        self,
+        *,
+        model: str,
+        size: str,
+        provider_id: str | None = None,
+    ) -> None:
+        """Оценка расхода, когда задача уже принята, а файл не дошёл."""
+        provider = self._image_provider_for_id(provider_id)
+        await self._record_image_spend(
+            count=1,
+            model=model,
+            size=size,
+            data={},
+            provider=provider,
         )
 
     async def generate_image(
@@ -971,6 +1000,7 @@ class ImageOpsMixin(ProviderTransportMixin):
         # Бюджет держим здесь (и в edit_images), не в хендлерах: иначе двойная
         # резервация при ARQ/tool-path и ложные отказы у края лимита.
         await cost_tracker.check_budget(estimated=image_cost)
+        size_for_bill = size.strip()
         try:
             payload = _image_generation_body(
                 selected_model,
@@ -987,6 +1017,7 @@ class ImageOpsMixin(ProviderTransportMixin):
                 or payload.get("aspect_ratio")
                 or size.strip()
             )
+            size_for_bill = str(size_label)
             logger.info(
                 "generate_image",
                 model=selected_model,
@@ -1019,17 +1050,29 @@ class ImageOpsMixin(ProviderTransportMixin):
 
             if not images:
                 logger.error("generate_image: в ответе нет url и b64_json")
-                raise AssistAIError(f"{_provider_label(used)} не вернул изображение.")
+                raise AssistAIError(
+                    f"{_provider_label(used)} не вернул изображение.",
+                    job_committed=True,
+                    pending_provider=used.id,
+                )
 
             logger.info("generate_image: получено изображений: %s", len(images))
             await self._record_image_spend(
                 count=len(images),
                 model=selected_model,
-                size=str(size_label),
+                size=size_for_bill,
                 data=data,
                 provider=used,
             )
             return images
+        except AssistAIError as exc:
+            if exc.job_committed:
+                await self._record_committed_image_spend(
+                    model=selected_model,
+                    size=size_for_bill,
+                    provider_id=exc.pending_provider,
+                )
+            raise
         finally:
             await cost_tracker.release_reservation()
 
@@ -1109,7 +1152,9 @@ class ImageOpsMixin(ProviderTransportMixin):
             images = [record["value"] for record in records]
             if not images:
                 raise AssistAIError(
-                    f"{_provider_label(used)} не вернул отредактированное изображение."
+                    f"{_provider_label(used)} не вернул отредактированное изображение.",
+                    job_committed=True,
+                    pending_provider=used.id,
                 )
             await self._record_image_spend(
                 count=len(images),
@@ -1119,6 +1164,14 @@ class ImageOpsMixin(ProviderTransportMixin):
                 provider=used,
             )
             return images
+        except AssistAIError as exc:
+            if exc.job_committed:
+                await self._record_committed_image_spend(
+                    model=selected_model,
+                    size=edit_size,
+                    provider_id=exc.pending_provider,
+                )
+            raise
         finally:
             await cost_tracker.release_reservation()
 
@@ -1209,7 +1262,9 @@ class ImageOpsMixin(ProviderTransportMixin):
             images = [record["value"] for record in records]
             if not images:
                 raise AssistAIError(
-                    f"{_provider_label(used)} не вернул отредактированное изображение."
+                    f"{_provider_label(used)} не вернул отредактированное изображение.",
+                    job_committed=True,
+                    pending_provider=used.id,
                 )
             await self._record_image_spend(
                 count=len(images),
@@ -1219,5 +1274,13 @@ class ImageOpsMixin(ProviderTransportMixin):
                 provider=used,
             )
             return images
+        except AssistAIError as exc:
+            if exc.job_committed:
+                await self._record_committed_image_spend(
+                    model=selected_model,
+                    size=edit_size,
+                    provider_id=exc.pending_provider,
+                )
+            raise
         finally:
             await cost_tracker.release_reservation()

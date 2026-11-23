@@ -1,8 +1,6 @@
-"""Safe environment variable parsers with defaults on bad input."""
+"""Safe parsers for values already read by ``app.infra.settings``."""
 
 from __future__ import annotations
-
-import os
 
 import structlog
 
@@ -10,7 +8,9 @@ logger = structlog.get_logger("envparse")
 
 
 def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    from app.infra.settings import getenv
+
+    raw = getenv(name)
     if raw is None or not str(raw).strip():
         return default
     try:
@@ -21,7 +21,9 @@ def env_int(name: str, default: int) -> int:
 
 
 def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
+    from app.infra.settings import getenv
+
+    raw = getenv(name)
     if raw is None or not str(raw).strip():
         return default
     try:

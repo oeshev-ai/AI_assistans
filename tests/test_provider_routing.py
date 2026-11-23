@@ -380,10 +380,6 @@ async def test_text_no_fallback_configured_raises(
             "service_unavailable",
         ),
         (httpx.Response(502, json={"error": {"code": "BAD_GATEWAY"}}), "bad_gateway"),
-        (
-            httpx.Response(408, json={"error": {"code": "REQUEST_TIMEOUT"}}),
-            "request_timeout",
-        ),
         (httpx.Response(500, text="boom"), "internal_error"),
     ],
 )
@@ -416,18 +412,28 @@ async def test_unavailable_falls_back_exactly_once(
 
 
 @pytest.mark.asyncio
-async def test_timeout_falls_back(
+@pytest.mark.parametrize(
+    "polza_response",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.Response(408, json={"error": {"code": "REQUEST_TIMEOUT"}}),
+    ],
+)
+async def test_timeout_does_not_fall_back_for_paid_image(
     multi_client_factory: Callable[..., AssistAIClient],
+    polza_response: httpx.Response | Exception,
 ) -> None:
+    """Sync TIMEOUT мог уже создать картинку у primary — второй хост не зовём."""
     client = multi_client_factory()
     with respx.mock(assert_all_called=False) as router:
-        router.post(_POLZA_MEDIA).mock(side_effect=httpx.ReadTimeout("slow"))
+        router.post(_POLZA_MEDIA).mock(side_effect=polza_response)
         proxy = router.post(_PROXY_IMAGES).mock(
             return_value=httpx.Response(200, json=_PROXY_OK)
         )
-        images = await client.generate_image("постер", model=_MODEL, size="1024x1024")
-    assert images == ["https://cdn.example/proxy.png"]
-    assert len(proxy.calls) == 1
+        with pytest.raises(AssistAIError) as info:
+            await client.generate_image("постер", model=_MODEL, size="1024x1024")
+    assert info.value.error_code in {"TIMEOUT", "REQUEST_TIMEOUT"}
+    assert not proxy.called
 
 
 @pytest.mark.asyncio
@@ -614,6 +620,20 @@ async def test_insufficient_balance_falls_back_and_alerts(
 def test_fallback_reason_classification() -> None:
     assert fallback_reason(AssistAIError("x", status_code=503)) == "http_5xx"
     assert fallback_reason(AssistAIError("x", error_code="TIMEOUT")) == "timeout"
+    assert (
+        fallback_reason(AssistAIError("x", error_code="TIMEOUT"), paid_side_effect=True)
+        is None
+    )
+    assert (
+        fallback_reason(
+            AssistAIError("x", error_code="NETWORK_ERROR"), paid_side_effect=True
+        )
+        is None
+    )
+    assert (
+        fallback_reason(AssistAIError("x", status_code=503), paid_side_effect=True)
+        == "http_5xx"
+    )
     assert fallback_reason(AssistAIError("x", status_code=400)) is None
     assert fallback_reason(AssistAIError("x", status_code=413)) is None
     assert fallback_reason(AssistAIError("x", error_code="guard_blocked")) is None

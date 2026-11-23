@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import structlog
@@ -82,18 +81,16 @@ _ANALYZE_QUESTION = {
 
 def max_clarify_rounds() -> int:
     """Сколько уточнений задать, прежде чем сбросить ожидание."""
-    raw = os.getenv("PHOTO_MAX_CLARIFY_ROUNDS", "2").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return 2
-    return value if value > 0 else 2
+    from app.infra.settings import get_settings
+
+    return get_settings().photo_max_clarify_rounds
 
 
 def confirm_mode() -> str:
     """A — текст персоны, C — шаблон без вызова модели."""
-    mode = os.getenv("PHOTO_CONFIRM_MODE", "A").strip().upper()
-    return mode if mode in {"A", "C"} else "A"
+    from app.infra.settings import get_settings
+
+    return get_settings().photo_confirm_mode
 
 
 async def confirm_reply(
@@ -182,6 +179,9 @@ async def route_album(
         await message.answer(
             f"⏳ Слишком много запросов. Подождите {int(retry_after) or 60} секунд."
         )
+        # deliver_album уже сделал put — слот нельзя оставлять, иначе следующий
+        # свободный текст уйдёт как подпись к этому альбому.
+        await _release_album(turn, media, None)
         return
     try:
         profile = await R._active_profile(message.chat.id, turn.assistant_storage)
@@ -365,9 +365,9 @@ async def _decision(
             )
         caption = reused
         media.caption = reused
-    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1" and not asks_for_video(
-        caption
-    ):
+    from app.infra.settings import get_settings
+
+    if get_settings().photo_router_fast_path and not asks_for_video(caption):
         from app.bot.photo_routing import resolve_roles
 
         roles = resolve_roles(caption, len(images), base_override=media.base_override)

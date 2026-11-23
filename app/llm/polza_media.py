@@ -27,7 +27,6 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -470,7 +469,9 @@ def hash_user_id(user_id: int | str | None) -> str | None:
     """
     if user_id is None:
         return None
-    secret = (os.getenv("POLZA_USER_HASH_SECRET") or "").strip()
+    from app.infra.settings import get_settings
+
+    secret = get_settings().polza_user_hash_secret
     material = f"assist-ai:{user_id}".encode()
     if secret:
         digest = hmac.new(secret.encode(), material, hashlib.sha256).hexdigest()

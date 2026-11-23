@@ -92,7 +92,11 @@ async def on_topic_delete_ask(
     await R._edit_inline(
         message,
         f"Удалить тему «{name}» со всей историей?",
-        M._confirm_row("✅ Да, удалить", f"topic_del_yes:{topic_id}", "topic:list"),
+        M._confirm_row(
+            "✅ Да, удалить",
+            f"topic_del_yes:{assistant_id}:{topic_id}",
+            "topic:list",
+        ),
     )
 
 
@@ -107,10 +111,18 @@ async def on_topic_delete_yes(
     if not isinstance(message, Message):
         await query.answer()
         return
-    topic_id = (query.data or "").removeprefix("topic_del_yes:")
+    raw = (query.data or "").removeprefix("topic_del_yes:")
     chat_id = message.chat.id
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
-    if assistant_id is None:
+    # Новый формат: assistant_id:topic_id — персона из UI, не текущая активная.
+    if ":" in raw:
+        assistant_id, topic_id = raw.split(":", 1)
+    else:
+        topic_id = raw
+        assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+        if assistant_id is None:
+            return
+    if not assistant_id or not topic_id:
+        await query.answer("Тема не найдена.", show_alert=True)
         return
     try:
         text, markup, menu = await R._finish_topic_delete(
@@ -206,19 +218,31 @@ async def on_topic_rename(
         return
     await R._drop_flow(state)
     await state.set_state(RenameTopicSG.name)
-    await state.update_data(flow_topic_id=topic_id, flow_topic_name=name)
+    await state.update_data(
+        flow_topic_id=topic_id,
+        flow_topic_name=name,
+        flow_assistant_id=assistant_id,
+    )
     await query.answer()
     await message.answer(f"Введите новое название для темы «{name}».\n/cancel — отмена")
 
 
-async def on_topic_new(query: CallbackQuery, state: FSMContext) -> None:
+async def on_topic_new(
+    query: CallbackQuery,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
     """Запрашивает название новой темы."""
     message = R._query_message(query)
     if message is None:
         await query.answer()
         return
+    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    if assistant_id is None:
+        return
     await R._drop_flow(state)
     await state.set_state(NewTopicSG.name)
+    await state.update_data(flow_assistant_id=assistant_id)
     await query.answer()
     await message.answer("Введите название темы (до 100 символов).\n/cancel — отмена")
 
@@ -237,10 +261,14 @@ async def sg_new_topic_name(
         )
         return
     chat_id = message.chat.id
+    data = await state.get_data()
+    assistant_id = data.get("flow_assistant_id")
     try:
-        profile = await R._active_profile(chat_id, assistant_storage)
-        topic_id = await topic_storage.create_topic(chat_id, profile.id, name)
-        await topic_storage.set_active_topic(chat_id, profile.id, topic_id)
+        if not isinstance(assistant_id, str) or not assistant_id:
+            profile = await R._active_profile(chat_id, assistant_storage)
+            assistant_id = profile.id
+        topic_id = await topic_storage.create_topic(chat_id, assistant_id, name)
+        await topic_storage.set_active_topic(chat_id, assistant_id, topic_id)
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError:
         await R._reply_profile_error(message)
@@ -271,6 +299,7 @@ async def sg_rename_topic_name(
         return
     data = await state.get_data()
     topic_id = data.get("flow_topic_id")
+    assistant_id = data.get("flow_assistant_id")
     chat_id = message.chat.id
     if not isinstance(topic_id, str) or not topic_id:
         await R._reset_flow(state)
@@ -278,8 +307,10 @@ async def sg_rename_topic_name(
         await message.answer("Тема для переименования не выбрана.", reply_markup=menu)
         return
     try:
-        profile = await R._active_profile(chat_id, assistant_storage)
-        await topic_storage.rename_topic(chat_id, profile.id, topic_id, name)
+        if not isinstance(assistant_id, str) or not assistant_id:
+            profile = await R._active_profile(chat_id, assistant_storage)
+            assistant_id = profile.id
+        await topic_storage.rename_topic(chat_id, assistant_id, topic_id, name)
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError:
         await R._reply_profile_error(message)

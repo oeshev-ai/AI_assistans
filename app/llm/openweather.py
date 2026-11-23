@@ -6,7 +6,6 @@ Production-ready асинхронный клиент для OpenWeatherMap API.
 
 import asyncio
 import logging
-import os
 import ssl
 import sys
 from dataclasses import dataclass, field
@@ -15,7 +14,6 @@ from typing import Any
 
 import httpx
 import structlog
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from tenacity import (
     retry,
@@ -31,8 +29,6 @@ from app.infra.circuit_breaker import (
 )
 from app.infra.metrics import track_api_call
 
-load_dotenv()
-
 # ==============================================================================
 # 1. Конфигурация и Логирование
 # ==============================================================================
@@ -42,11 +38,17 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = structlog.get_logger("OpenWeatherAPI")
 
 
+def _openweather_api_key() -> str:
+    from app.infra.settings import get_settings
+
+    return get_settings().openweather_api_key
+
+
 @dataclass
 class OWMConfig:
     """Конфигурация клиента OpenWeatherMap."""
 
-    api_key: str = field(default_factory=lambda: os.getenv("OPENWEATHER_API_KEY", ""))
+    api_key: str = field(default_factory=_openweather_api_key)
     base_url_weather: str = "https://api.openweathermap.org/data/2.5"
     base_url_geo: str = "https://api.openweathermap.org/geo/1.0"
     base_url_air: str = "https://api.openweathermap.org/data/2.5"
