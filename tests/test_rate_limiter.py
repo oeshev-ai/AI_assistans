@@ -8,6 +8,7 @@ import pytest
 
 from app.infra.rate_limiter import (
     IMAGE_LIMIT,
+    MEDIA_LIMIT,
     TEXT_LIMIT,
     RateLimiter,
 )
@@ -32,6 +33,18 @@ async def test_image_limit_independent_of_text() -> None:
         assert await limiter.check_image_limit(user_id) is True
     assert await limiter.check_image_limit(user_id) is False
     assert await limiter.check_text_limit(user_id) is True
+
+
+@pytest.mark.asyncio
+async def test_media_limit_independent_of_image() -> None:
+    limiter = RateLimiter()
+    user_id = 11
+    for _ in range(MEDIA_LIMIT):
+        assert await limiter.check_media_limit(user_id) is True
+    assert await limiter.check_media_limit(user_id) is False
+    assert await limiter.check_image_limit(user_id) is True
+    retry = await limiter.get_retry_after(user_id, "media")
+    assert retry > 0
 
 
 @pytest.mark.asyncio
@@ -78,6 +91,28 @@ async def test_window_expiry_frees_slot(monkeypatch: pytest.MonkeyPatch) -> None
     assert await limiter.check_text_limit(user_id) is False
     now["t"] += 61.0
     assert await limiter.check_text_limit(user_id) is True
+
+
+@pytest.mark.asyncio
+async def test_expired_memory_keys_are_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    limiter = RateLimiter()
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(time, "time", lambda: now["t"])
+    for uid in range(15):
+        assert await limiter.check_text_limit(uid) is True
+    assert len(limiter._text_hits) == 15
+    now["t"] += 120.0
+    assert await limiter.check_text_limit(0) is True
+    # Sweep drops fully expired peers; only the touched user remains.
+    assert 0 in limiter._text_hits
+    assert len(limiter._text_hits) == 1
+
+
+def test_env_int_falls_back_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.infra.envparse import env_int
+
+    monkeypatch.setenv("BAD_PORT", "xyz")
+    assert env_int("BAD_PORT", 8082) == 8082
 
 
 @pytest.mark.asyncio

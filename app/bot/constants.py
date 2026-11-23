@@ -59,20 +59,14 @@ from app.infra.logging_setup import (
 from app.infra.metrics import note_active_user, observe_message, start_metrics_server
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIConfig,
-    AssistAIError,
-    ImageModelScope,
-    image_model_family,
-)
+from app.llm.assist_ai import AssistAIClient, AssistAIConfig
+from app.llm.errors import AssistAIError
+from app.llm.image_ops import ImageModelScope, image_model_family
 from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     AVAILABLE_TTS_MODELS,
-    ELEVENLABS_TTS_VOICES,
     OPENAI_TTS_VOICES,
-    is_elevenlabs_tts_model,
     model_hint,
 )
 from app.llm.speechkit_tts import (
@@ -162,7 +156,7 @@ WELCOME = (
     "(или напишите «нужна ссылка на загрузку»).\n\n"
     "Внизу кнопки: персоны и темы.\n"
     "Каталог готовых персон — в /settings.\n"
-    "Меню (☰): /settings — настройки, /help — справка, /cancel — отмена мастера"
+    "Меню (☰): /settings — настройки, /help — справка"
 )
 InputKind = Literal["text", "voice"]
 MAX_VOICE_DURATION_SECONDS = 600
@@ -171,17 +165,17 @@ MAX_MEDIA_SIZE_MB = 20  # лимит Telegram Bot API getFile
 SHOW_RECOGNIZED_TEXT = True
 VOICE_RECOGNIZED_PREVIEW_LIMIT = 500
 TTS_MAX_CHARS = 3500
-# Совместимость со старым именем; актуальный список — ``_tts_voices_for``.
-PROXYAPI_TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
 TTS_VOICES: tuple[str, ...] = OPENAI_TTS_VOICES
 _MENU_ASSISTANTS = "Персоны"
 _MENU_TOPICS = "Темы"
 _OPENAI_IMAGE_SIZES: tuple[str, ...] = ("1024x1024", "1024x1792", "1792x1024")
 _TIER_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K")
+_BANANA_IMAGE_SIZES: tuple[str, ...] = ("1K", "2K", "4K")
 _ASPECT_IMAGE_SIZES: tuple[str, ...] = ("1:1", "16:9", "9:16")
 IMAGE_SIZES: tuple[str, ...] = (
     *_OPENAI_IMAGE_SIZES,
     *_TIER_IMAGE_SIZES,
+    *_BANANA_IMAGE_SIZES,
     *_ASPECT_IMAGE_SIZES,
 )
 _FLOW_KEYS = (
@@ -202,8 +196,6 @@ _SCREEN_ASSISTANTS = "screen_assistants"
 _SCREEN_TOPICS = "screen_topics"
 _SCREEN_SETTINGS = "screen_settings"
 _SCREEN_PICKER = "screen_picker"
-_SCREEN_IMAGE = "screen_image"
-_SCREEN_PHOTO = "screen_photo"
 _SCREEN_PRESETS = "screen_presets"
 _MENU_ANCHOR = "menu_anchor"
 _CHROME = "chrome_ids"
@@ -214,8 +206,6 @@ _SCREEN_KEYS = (
     _SCREEN_TOPICS,
     _SCREEN_SETTINGS,
     _SCREEN_PICKER,
-    _SCREEN_IMAGE,
-    _SCREEN_PHOTO,
     _SCREEN_PRESETS,
 )
 _VOICE_MODE_LABELS: dict[str, str] = {
@@ -226,14 +216,13 @@ _VOICE_MODE_LABELS: dict[str, str] = {
 MSG_UNAVAILABLE = "⚠️ Сервис временно недоступен. Попробуйте позже."
 MSG_TIMEOUT = "⚠️ Превышено время ожидания."
 MSG_INTERNAL = "❌ Произошла внутренняя ошибка."
-MSG_IMAGE_FAILED = "Не удалось сгенерировать изображение."
+MSG_UPLOAD_PROCESS_FAILED = "Не удалось обработать загруженный файл."
 MSG_HISTORY = "⚠️ Временные проблемы с историей диалога. Попробуйте позже."
 MSG_PROFILE = "⚠️ Не удалось прочитать профиль ассистента. Попробуйте позже."
 
 
 from app.bot.states import (
     EditAssistantSG,
-    ImageSG,
     NewAssistantSG,
     NewTopicSG,
     RenameTopicSG,

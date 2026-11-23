@@ -31,6 +31,18 @@ from app.bot.constants import (
 from app.bot.handlers.photo import PhotoTurn, deliver_album, incoming_from_message
 from app.storage.pending_media import PendingMediaStorage
 
+_BUSY_STEP = (
+    "Сначала завершите текущий шаг или нажмите «Отмена», затем пришлите файл ещё раз."
+)
+
+
+async def _reject_if_busy(message: Message, state: FSMContext) -> bool:
+    """True, если открыт другой шаг: файл не берём и говорим об этом."""
+    if await state.get_state() is None:
+        return False
+    await message.answer(_BUSY_STEP)
+    return True
+
 
 async def on_upload_cancel(
     query: CallbackQuery,
@@ -48,13 +60,18 @@ async def on_upload_cancel(
     bot = query.bot
     if not isinstance(store, UploadSessionStore) or bot is None:
         return
+    user_id = query.from_user.id if query.from_user else chat_id
     session = await store.get(upload_id)
-    if session is None or session.chat_id != chat_id:
+    if session is None or session.chat_id != chat_id or session.user_id != user_id:
         if isinstance(query.message, Message):
             try:
                 await query.message.edit_reply_markup(reply_markup=None)
-            except TelegramBadRequest:
-                pass
+            except TelegramBadRequest as exc:
+                logger.debug(
+                    "upload_cancel_markup_gone",
+                    chat_id=chat_id,
+                    error=str(exc),
+                )
         await bot.send_message(chat_id, "Ссылка уже недействительна или устарела.")
         return
     if session.status not in {"pending"}:
@@ -89,7 +106,7 @@ async def handle_audio(
     audio = message.audio
     if audio is None:
         return
-    if await state.get_state() is not None:
+    if await _reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):
@@ -144,7 +161,7 @@ async def handle_video_file(
     video = message.video or message.video_note
     if video is None:
         return
-    if await state.get_state() is not None:
+    if await _reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):
@@ -197,18 +214,13 @@ async def handle_photo(
     state: FSMContext,
     pending_media: PendingMediaStorage,
 ) -> None:
-    """Кладёт фото в буфер альбома. Разбор намерения — после паузы или сразу."""
+    """Кладёт фото в буфер альбома. Разбор намерения — после паузы или сразу.
+
+    Text rate limit is consumed once in ``route_album`` on flush, not per photo.
+    """
     if not message.photo:
         return
-    if await state.get_state() is not None:
-        return
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    if not await rate_limiter.check_text_limit(user_id):
-        retry_after = await rate_limiter.get_retry_after(user_id, "text")
-        await message.answer(
-            f"⏳ Слишком много запросов. Подождите {int(retry_after) or 60} секунд."
-        )
-        logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
+    if await _reject_if_busy(message, state):
         return
     photo = incoming_from_message(message)
     if photo is None:
@@ -218,9 +230,11 @@ async def handle_photo(
             f"Файл слишком большой. Максимум — {MAX_IMAGE_SIZE_MB} МБ."
         )
         return
+    user_id = message.from_user.id if message.from_user else message.chat.id
     logger.info(
         "photo_received",
         chat_id=message.chat.id,
+        user_id=user_id,
         message_id=message.message_id,
         grouped=bool(message.media_group_id),
     )
@@ -234,6 +248,7 @@ async def handle_photo(
     )
     await get_album_hub().add(
         message.chat.id,
+        user_id,
         message.media_group_id,
         photo,
         turn,
@@ -249,7 +264,7 @@ async def handle_document(
     state: FSMContext,
 ) -> None:
     """Документ: картинка/PDF через Vision; аудио/видео — в media pipeline персоны."""
-    if await state.get_state() is not None:
+    if await _reject_if_busy(message, state):
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_text_limit(user_id):

@@ -1,18 +1,35 @@
+# APP_IMAGE: GHCR tag published by Deploy workflow (docker compose pull).
+# Local default tags the build as ai-assistans:local so build+up still work.
+x-app: &app
+  image: ${APP_IMAGE:-ai-assistans:local}
+  build: .
+
 services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # noeviction: histories/personas/budgets must not be silently LRU-evicted.
-    # Under memory pressure Redis returns OOM on writes instead of dropping keys.
-    # Optional REDIS_PASSWORD → requirepass (set matching REDIS_URL on bot/worker).
+    # volatile-ttl: every app key has EXPIRE. Under the cap Redis drops the
+    # shortest remaining TTL first (rate limits, album/arq payloads, then
+    # stale topics). Active chats refresh TTL, so they go last. noeviction
+    # rejected every write once 256mb was full, including a new history line.
+    # REDIS_MAXMEMORY is digits plus a unit (256mb, 1gb). Optional
+    # REDIS_PASSWORD → requirepass (set matching REDIS_URL on bot/worker).
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-256mb}
     command:
       - /bin/sh
       - -c
       - |
         set -e
-        ARGS="--appendonly yes --maxmemory 256mb --maxmemory-policy noeviction"
+        MEM="$${REDIS_MAXMEMORY:-256mb}"
+        case "$$MEM" in
+          ''|*[!0-9A-Za-z]*)
+            echo "invalid REDIS_MAXMEMORY: $$MEM" >&2
+            exit 1
+            ;;
+        esac
+        ARGS="--appendonly yes --maxmemory $$MEM --maxmemory-policy volatile-ttl"
         if [ -n "$$REDIS_PASSWORD" ]; then
           ARGS="$$ARGS --requirepass $$REDIS_PASSWORD"
         fi
@@ -23,14 +40,14 @@ services:
       test:
         [
           "CMD-SHELL",
-          'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi',
+          'if [ -n "$$REDIS_PASSWORD" ]; then REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping; else redis-cli ping; fi',
         ]
       interval: 10s
       timeout: 5s
       retries: 5
 
   bot:
-    build: .
+    <<: *app
     restart: unless-stopped
     env_file:
       - .env
@@ -57,7 +74,7 @@ services:
 
   # Optional: docker compose --profile arq up -d  (also set ARQ_ENABLED=1 in .env)
   worker:
-    build: .
+    <<: *app
     restart: unless-stopped
     env_file:
       - .env

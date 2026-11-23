@@ -31,6 +31,8 @@ def test_old_profile_gets_voice_defaults() -> None:
     assert profile.tts_format is None
     assert profile.stt_language is None
     assert profile.vision_model is None
+    assert profile.image_background is None
+    assert profile.image_as_file == {}
 
 
 def test_compose_system_prompt_appends_shared_rules() -> None:

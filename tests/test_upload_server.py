@@ -126,6 +126,82 @@ async def test_same_origin_file_upload_flow() -> None:
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_upload_releases_claim_on_bad_multipart() -> None:
+    """Битый multipart не должен оставлять сессию в processing."""
+    store = UploadSessionStore(redis=None)
+    storage = FakeStorage()
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application(client_max_size=10 * 1024 * 1024)
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=storage,
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        await client.get(f"/upload/{session.upload_id}?t={session.token}")
+        resp = await client.post(
+            f"/api/uploads/{session.upload_id}/file",
+            data=b"not-multipart",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert resp.status == 400
+        refreshed = await store.get(session.upload_id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        # Повтор с нормальным файлом должен пройти после release.
+        form = FormData()
+        form.add_field(
+            "file",
+            b"ID3retry-bytes",
+            filename="retry.mp3",
+            content_type="audio/mpeg",
+        )
+        ok = await client.post(f"/api/uploads/{session.upload_id}/file", data=form)
+        assert ok.status == 200, await ok.text()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_mime_mismatch() -> None:
+    store = UploadSessionStore(redis=None)
+    storage = FakeStorage()
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application(client_max_size=10 * 1024 * 1024)
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=storage,
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        await client.get(f"/upload/{session.upload_id}?t={session.token}")
+        form = FormData()
+        form.add_field(
+            "file",
+            b"%PDF-1.7 disguised",
+            filename="lecture.mp3",
+            content_type="audio/mpeg",
+        )
+        resp = await client.post(
+            f"/api/uploads/{session.upload_id}/file",
+            data=form,
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert "соответствует" in body["error"]
+        assert storage.objects == {}
+    finally:
+        await client.close()
+
+
 def test_forwarded_proto_requires_trust_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     from types import SimpleNamespace
 

@@ -41,6 +41,7 @@ async def test_confirm_has_no_images_or_tools() -> None:
     assert text == "Готово, поправил."
     assert persona.kwargs["use_tools"] is False
     assert persona.kwargs["max_tokens"] == 300
+    assert persona.kwargs["reasoning"] == {"max_tokens": 64}
     for message in persona.messages:
         assert isinstance(message["content"], str)
 

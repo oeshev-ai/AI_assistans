@@ -7,14 +7,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.llm.assist_ai import image_model_family
+from app.llm.image_ops import image_model_family
 from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     AVAILABLE_TTS_MODELS,
-    ELEVENLABS_TTS_VOICES,
     OPENAI_TTS_VOICES,
-    is_elevenlabs_tts_model,
 )
 from app.storage.assistant_storage import AssistantProfile
 from app.storage.persona_icons import PERSONA_ICONS, normalize_icon
@@ -69,8 +67,8 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "предложи исправленный вариант."
         ),
         text_model="anthropic/claude-sonnet-5-5",
-        image_model="recraft/recraft-v4.1",
-        image_size="16:9",
+        image_model="google/gemini-nano-banana-2.1",
+        image_size="1K",
         voice_mode="off",
     ),
     AssistantPreset(
@@ -101,8 +99,8 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "Если данных для анализа не хватает — прямо укажи пробел и что нужно уточнить."
         ),
         text_model="openai/gpt-6-sol",
-        image_model="recraft/recraft-v4.1",
-        image_size="16:9",
+        image_model="google/gemini-nano-banana-2.1",
+        image_size="1K",
         voice_mode="off",
     ),
     AssistantPreset(
@@ -120,8 +118,8 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
         image_model="openai/gpt-image-2.6-flare",
         image_size="1024x1024",
         voice_mode="auto",
-        tts_model="elevenlabs/eleven-multilingual-v2",
-        tts_voice="alice",
+        tts_model="openai/gpt-4o-mini-tts",
+        tts_voice="nova",
     ),
     AssistantPreset(
         id="translator",
@@ -135,12 +133,12 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "если о них не просили. Язык перевода определяй из запроса, "
             "по умолчанию — английский."
         ),
-        text_model="qwen/qwen3.8-max-0902",
+        text_model="qwen/qwen4-max",
         image_model=None,
         image_size=None,
         voice_mode="auto",
-        tts_model="elevenlabs/eleven-multilingual-v2",
-        tts_voice="matilda",
+        tts_model="openai/gpt-4o-mini-tts",
+        tts_voice="shimmer",
     ),
     AssistantPreset(
         id="artist",
@@ -168,7 +166,7 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
             "предложениями, без вступлений и рассуждений вслух. Уточняющие вопросы "
             "задавай только при крайней необходимости."
         ),
-        text_model="deepseek/deepseek-v4.1-flash",
+        text_model="deepseek/deepseek-v4.1-flash-1017",
         image_model="black-forest-labs/flux-3-image-klein",
         image_size="1K",
         voice_mode="off",
@@ -205,8 +203,8 @@ ASSISTANT_PRESETS: tuple[AssistantPreset, ...] = (
         image_model="qwen/qwen-image-2.1-pro",
         image_size="1:1",
         voice_mode="always",
-        tts_model="elevenlabs/eleven-multilingual-v2",
-        tts_voice="lily",
+        tts_model="openai/gpt-4o-mini-tts",
+        tts_voice="nova",
     ),
 )
 
@@ -262,8 +260,10 @@ def _size_ok(model_id: str, size: str) -> bool:
     family = image_model_family(model_id)
     if family in {"flux", "seedream"}:
         return size in {"1K", "2K"}
-    if family in {"qwen", "recraft"}:
+    if family == "qwen":
         return size in {"1:1", "16:9", "9:16"}
+    if family == "banana":
+        return size in {"1K", "2K", "4K"}
     return size in {
         "1024x1024",
         "1536x1024",
@@ -277,8 +277,6 @@ def _size_ok(model_id: str, size: str) -> bool:
 
 
 def _tts_voices_for_model(model_id: str) -> tuple[str, ...]:
-    if is_elevenlabs_tts_model(model_id):
-        return ELEVENLABS_TTS_VOICES
     if model_id.startswith("openai/") or model_id in AVAILABLE_TTS_MODELS:
         return OPENAI_TTS_VOICES
     return OPENAI_TTS_VOICES

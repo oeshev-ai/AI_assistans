@@ -1,0 +1,20 @@
+{
+  "id": "gen_2234552264826687489",
+  "object": "media.generation",
+  "status": "completed",
+  "created": 1795062781,
+  "model": "openai/gpt-image-2.6-flare",
+  "data": [
+    {
+      "url": "https://s3.polza.ai/f/org_2234532012031086593/2026/11/t_13b728339e461856.png"
+    }
+  ],
+  "usage": {
+    "output_units": 1,
+    "input_tokens": 121,
+    "output_tokens": 664,
+    "total_tokens": 785,
+    "cost_rub": 2.46868821,
+    "cost": 2.46868821
+  }
+}

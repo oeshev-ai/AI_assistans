@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from app.bot import models as M
 from app.bot.constants import (
     _VOICE_MODE_LABELS,
@@ -13,13 +15,106 @@ from app.bot.constants import (
     AssistantProfile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     model_hint,
     persona_label,
     resolve_speechkit_role,
     speechkit_roles_for,
 )
+from app.llm.video_settings import (
+    VIDEO_ASPECT_RATIOS,
+    VIDEO_DURATIONS,
+    VIDEO_RESOLUTIONS,
+    video_settings_from,
+    video_settings_summary,
+)
+
+
+def _choice_rows(
+    items: tuple[object, ...],
+    selected: object,
+    *,
+    prefix: str,
+    label_of: Callable[[object], str],
+    per_row: int,
+) -> list[list[InlineKeyboardButton]]:
+    """Ряды кнопок выбора. Текущее значение помечено галочкой."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for item in items:
+        mark = "✅ " if item == selected else ""
+        row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{label_of(item)}",
+                callback_data=f"{prefix}{item}",
+            )
+        )
+        if len(row) >= per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+def _video_picker_parts(
+    profile: AssistantProfile,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран формата, длины, разрешения и звука ролика активной персоны."""
+    settings = video_settings_from(profile)
+    sound = "вкл" if settings.generate_audio else "выкл"
+    rows = _choice_rows(
+        VIDEO_ASPECT_RATIOS,
+        settings.aspect_ratio,
+        prefix="video:aspect:",
+        label_of=str,
+        per_row=3,
+    )
+    rows.extend(
+        _choice_rows(
+            VIDEO_DURATIONS,
+            settings.duration,
+            prefix="video:dur:",
+            label_of=lambda item: f"{item}с",
+            per_row=6,
+        )
+    )
+    rows.extend(
+        _choice_rows(
+            VIDEO_RESOLUTIONS,
+            settings.resolution,
+            prefix="video:res:",
+            label_of=str,
+            per_row=2,
+        )
+    )
+    audio_row: list[InlineKeyboardButton] = []
+    for enabled, label in ((False, "Без звука"), (True, "Со звуком")):
+        mark = "✅ " if settings.generate_audio is enabled else ""
+        flag = "1" if enabled else "0"
+        audio_row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{label}",
+                callback_data=f"video:audio:{flag}",
+            )
+        )
+    rows.append(audio_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово", callback_data="picker:done", style="success"
+            )
+        ]
+    )
+    text = (
+        f"Видео — «{profile.name}»\n"
+        f"Формат: {settings.aspect_ratio}\n"
+        f"Длительность: {settings.duration} с\n"
+        f"Разрешение: {settings.resolution}\n"
+        f"Звук: {sound}\n\n"
+        "Выберите формат, длительность, разрешение или звук."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _model_picker_parts(
@@ -27,6 +122,8 @@ def _model_picker_parts(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Текст и кнопки выбора модели активной персоны."""
     rows: list[list[InlineKeyboardButton]] = []
+    if kind == "video":
+        return _video_picker_parts(profile)
     if kind == "image":
         current = M._chosen_model_line(
             profile.image_model, assistant.config.default_image_model
@@ -52,6 +149,35 @@ def _model_picker_parts(
                 )
             )
         rows.append(size_row)
+        background = M._image_background_of(profile, assistant)
+        background_line = ""
+        choose = "Выберите модель, размер или получение файлом:"
+        if background is not None:
+            bg_row: list[InlineKeyboardButton] = []
+            for value, label in M._BACKGROUND_LABELS.items():
+                mark = "✅ " if value == background else ""
+                bg_row.append(
+                    InlineKeyboardButton(
+                        text=f"{mark}{label}",
+                        callback_data=f"set_bg:{value}",
+                    )
+                )
+            rows.append(bg_row)
+            background_line = f"Фон: {M._background_label(background)}\n"
+            choose = "Выберите модель, размер, фон или получение файлом:"
+        file_on = M._image_as_file(profile, image_model)
+        file_row: list[InlineKeyboardButton] = []
+        for enabled, label in ((False, "Фото"), (True, "Файлом")):
+            mark = "✅ " if file_on is enabled else ""
+            flag = "1" if enabled else "0"
+            file_row.append(
+                InlineKeyboardButton(
+                    text=f"{mark}{label}",
+                    callback_data=f"set_file:{flag}",
+                )
+            )
+        rows.append(file_row)
+        file_line = f"Получать результат файлом: {M._image_file_label(file_on)}\n"
         rows.append(
             [
                 InlineKeyboardButton(
@@ -62,8 +188,10 @@ def _model_picker_parts(
         text = (
             f"Модель картинок ассистента «{profile.name}»:\n"
             f"{current}\n"
-            f"Размер: {shown_size}\n\n"
-            "Выберите модель или размер:\n\n"
+            f"Размер: {shown_size}\n"
+            f"{background_line}"
+            f"{file_line}\n"
+            f"{choose}\n\n"
             f"{M._hints_block(AVAILABLE_IMAGE_MODELS, image_model)}"
         )
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -133,8 +261,6 @@ def _model_picker_parts(
             else:
                 role_label = "не поддерживается"
             extra = f"Амплуа: {role_label}\nФормат: opus\n"
-        elif is_elevenlabs_tts_model(tts_model):
-            extra = "Формат: mp3\n"
         else:
             fmt = profile.tts_format or assistant.config.default_tts_format
             extra = f"Формат: {fmt}\n"
@@ -158,7 +284,7 @@ def _model_picker_parts(
         profile.text_model, assistant.config.default_text_model
     )
     text_model = M._text_model_of(profile, assistant)
-    keyboard = M._model_keyboard(AVAILABLE_TEXT_MODELS, "set_text")
+    keyboard = M._model_keyboard(AVAILABLE_TEXT_MODELS, "set_text", done="picker:done")
     text = (
         f"Текстовая модель ассистента «{profile.name}»:\n{current}\n\n"
         f"Выберите модель:\n\n{M._hints_block(AVAILABLE_TEXT_MODELS, text_model)}"
@@ -227,6 +353,18 @@ def _settings_persona_view(
     lines.extend(
         [
             f"Размер картинки: {shown_size}",
+        ]
+    )
+    background = M._image_background_of(profile, assistant)
+    if background is not None:
+        lines.append(f"Фон картинки: {M._background_label(background)}")
+    lines.append(
+        "Получать результат файлом: "
+        f"{M._image_file_label(M._image_as_file(profile, image_model))}"
+    )
+    lines.extend(
+        [
+            f"Видео: {video_settings_summary(video_settings_from(profile))}",
             (
                 "TTS модель: "
                 f"{M._chosen_model_line(profile.tts_model, assistant.config.default_tts_model)}"
@@ -259,6 +397,12 @@ def _settings_persona_view(
             InlineKeyboardButton(
                 text="Модель изображений",
                 callback_data="set_image_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Видео",
+                callback_data="video_menu",
             )
         ],
         [

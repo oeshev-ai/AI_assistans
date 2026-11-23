@@ -31,7 +31,18 @@ jobs:
           ruff format --check .
 
       - name: Mypy
-        run: mypy . --ignore-missing-imports
+        # App + entrypoints only; tests use lightweight doubles that fight redis-py 5 stubs.
+        run: mypy app bot.py worker.py --ignore-missing-imports
 
       - name: Pytest
         run: pytest tests/ -v
+
+      - name: Prod requirements install smoke
+        run: |
+          python -m venv /tmp/prod-venv
+          /tmp/prod-venv/bin/python -m pip install --upgrade pip
+          /tmp/prod-venv/bin/pip install -r requirements-prod.txt
+          /tmp/prod-venv/bin/python -c "import aiogram, httpx, redis, arq, boto3, sentry_sdk"
+
+      - name: Docker image build smoke
+        run: docker build -t ai-assistans:ci .

@@ -8,7 +8,8 @@ import httpx
 import pytest
 from respx import MockRouter
 
-from app.llm.assist_ai import AssistAIClient, ImageModelScope
+from app.llm.assist_ai import AssistAIClient
+from app.llm.image_ops import ImageModelScope
 from app.media.media_tools import (
     EditImageTool,
     UserMedia,

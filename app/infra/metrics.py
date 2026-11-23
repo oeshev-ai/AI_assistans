@@ -25,6 +25,18 @@ ERRORS = Counter(
     ["error_type", "module"],
 )
 
+PROVIDER_FALLBACK = Counter(
+    "provider_fallback_total",
+    "Image provider fallbacks (primary unavailable, secondary used)",
+    ["from", "to", "reason"],
+)
+
+
+def note_provider_fallback(source: str, target: str, reason: str) -> None:
+    """Increment ``provider_fallback_total{from,to,reason}``."""
+    PROVIDER_FALLBACK.labels(**{"from": source, "to": target, "reason": reason}).inc()
+
+
 LATENCY = Histogram(
     "api_latency_seconds",
     "API request latency in seconds",

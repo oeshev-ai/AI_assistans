@@ -62,18 +62,15 @@ def test_alias_flag_off_keeps_old_id_until_fallback(
 
 
 def test_from_env_without_image_vars(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "app.llm.assist_ai.load_dotenv", lambda *_args, **_kwargs: False
-    )
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *_args, **_kwargs: False)
     for name in (
-        "PROXYAPI_IMAGE_MODEL",
-        "PROXYAPI_IMAGE_EDIT_MODEL",
-        "IMAGE_COMPLEXITY_EDIT",
+        "IMAGE_MODEL",
+        "IMAGE_EDIT_MODEL",
         "IMAGE_QUALITY",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PROXYAPI_API_KEY", "test-key")
+    monkeypatch.setenv("POLZA_API_KEY", "test-polza-key")
     config = AssistAIConfig.from_env()
     assert config.default_image_model == "openai/gpt-image-2.6-flare"
     assert config.default_image_edit_model == "openai/gpt-image-2.6-flare"
-    assert config.image_complexity_edit == "low"

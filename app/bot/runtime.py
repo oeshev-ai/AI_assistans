@@ -13,7 +13,6 @@ from app.bot.constants import (
     _MENU_ASSISTANTS,
     _MENU_TOPICS,
     _SCREEN_ASSISTANTS,
-    _SCREEN_IMAGE,
     _SCREEN_KEYS,
     _SCREEN_PICKER,
     _SCREEN_SETTINGS,
@@ -22,11 +21,11 @@ from app.bot.constants import (
     DEFAULT_ASSISTANT_NAME,
     MAX_MEDIA_SIZE_MB,
     MSG_HISTORY,
-    MSG_IMAGE_FAILED,
     MSG_INTERNAL,
     MSG_PROFILE,
     MSG_TIMEOUT,
     MSG_UNAVAILABLE,
+    MSG_UPLOAD_PROCESS_FAILED,
     STREAM_EDIT_INTERVAL,
     TELEGRAM_TEXT_LIMIT,
     Any,
@@ -75,7 +74,6 @@ from app.bot.constants import (
     httpx,
     image_model_family,
     io,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     is_upload_feature_ready,
     job_queue,
@@ -122,9 +120,8 @@ from app.bot.models import (  # noqa: F401
     _tts_voices_for,
     _vision_model_of,
 )
-from app.bot.states import (
-    ImageSG,
-)
+from app.infra.cost_tracker import prefer_cost_rub
+from app.llm.video_settings import VideoSettingsScope, video_settings_from
 
 
 async def _active_profile(chat_id: int, storage: AssistantStorage) -> AssistantProfile:
@@ -565,6 +562,65 @@ def _is_http_url(value: str) -> bool:
     return value.startswith(("http://", "https://"))
 
 
+# s3.polza.ai с VPN часто ReadTimeout; s3-alt отдаёт тот же объект за секунды.
+_IMAGE_URL_TIMEOUT = httpx.Timeout(45.0, connect=15.0)
+_POLZA_CDN_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "s3.polza.ai": ("s3-alt.polza.ai",),
+}
+
+
+def _image_url_candidates(url: str) -> list[str]:
+    """Сначала зеркало CDN (если есть), затем исходный URL."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    alts = _POLZA_CDN_FALLBACKS.get(parsed.netloc.casefold(), ())
+    candidates = [urlunparse(parsed._replace(netloc=alt)) for alt in alts]
+    if url not in candidates:
+        candidates.append(url)
+    return candidates
+
+
+async def _download_image_url(url: str) -> bytes:
+    """Скачивает картинку на стороне бота до отправки в Telegram."""
+    from urllib.parse import urlparse
+
+    last_error: Exception | None = None
+    candidates = _image_url_candidates(url)
+    async with httpx.AsyncClient(
+        timeout=_IMAGE_URL_TIMEOUT, follow_redirects=True
+    ) as client:
+        # Оба хоста иногда дают один ReadTimeout на свежий объект.
+        # Второй проход забирает файл, который минутой раньше не открылся.
+        for attempt in (1, 2):
+            for candidate in candidates:
+                try:
+                    response = await client.get(candidate)
+                    response.raise_for_status()
+                    raw = response.content
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "image_cdn_download_failed",
+                        host=urlparse(candidate).netloc,
+                        error=type(exc).__name__,
+                        attempt=attempt,
+                    )
+                    continue
+                if raw:
+                    if candidate != url:
+                        logger.info(
+                            "image_cdn_fallback_used",
+                            from_host=urlparse(url).netloc,
+                            to_host=urlparse(candidate).netloc,
+                        )
+                    return raw
+                last_error = AssistAIError("CDN провайдера вернул пустое изображение.")
+    raise AssistAIError(
+        "Не удалось скачать изображение с CDN провайдера."
+    ) from last_error
+
+
 def _extract_generated_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Достаёт картинки из результатов инструмента ``generate_image``.
 
@@ -621,29 +677,112 @@ def _extract_generated_images(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 async def _send_extracted_images(
-    message: Message, images: list[dict[str, Any]]
+    message: Message,
+    images: list[dict[str, Any]],
+    profile: AssistantProfile | None = None,
 ) -> None:
     """Отправляет картинки из инструмента. Сбой одной не отменяет остальные."""
     for index, image in enumerate(images):
         value = image.get("value")
         if not isinstance(value, str):
             continue
+        model = image.get("model")
+        as_file = profile is not None and M._image_as_file(
+            profile, model if isinstance(model, str) else None
+        )
         try:
-            await _send_generated_image(message, value, index)
+            await _send_generated_image(message, value, index, as_file=as_file)
+        except AssistAIError as exc:
+            logger.warning("generated_image_not_delivered", chat_id=message.chat.id)
+            await message.answer(exc.message)
         except Exception:
             logger.exception("Не удалось отправить изображение из generate_image")
 
 
-async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> None:
+async def _answer_photo_bytes(
+    message: Message, raw: bytes, filename: str, *, as_file: bool = False
+) -> Message | None:
+    """Фото, а при ``IMAGE_PROCESS_FAILED`` — повтор и затем документ.
+
+    ``as_file`` сразу отдаёт исходный файл: так сохраняется альфа-канал.
+    Telegram отдаёт ``IMAGE_PROCESS_FAILED`` и на валидный файл, который
+    через минуту принимает без изменений. ``sendDocument`` картинку не
+    обрабатывает, поэтому оплаченный результат всё равно доходит.
+    Возвращает отправленное сообщение: из него берут ``file_id`` для
+    следующей правки.
+    """
+    from app.bot.image_retry import telegram_photo_needs_document
+
+    if as_file:
+        return await message.answer_document(
+            document=BufferedInputFile(raw, filename=filename),
+            request_timeout=120,
+        )
+    last_error: TelegramBadRequest | None = None
+    for attempt in (1, 2):
+        try:
+            return await message.answer_photo(
+                photo=BufferedInputFile(raw, filename=filename),
+                request_timeout=120,
+            )
+        except TelegramBadRequest as exc:
+            last_error = exc
+            if "IMAGE_PROCESS_FAILED" in str(exc) and attempt == 1:
+                logger.warning(
+                    "telegram_image_process_failed", attempt=attempt, size=len(raw)
+                )
+                continue
+            break
+    if last_error is None or not telegram_photo_needs_document(last_error):
+        if last_error is not None:
+            raise last_error
+        return None
+    return await message.answer_document(
+        document=BufferedInputFile(raw, filename=filename),
+        request_timeout=120,
+    )
+
+
+async def _send_outbound_media(
+    message: Message,
+    items: list[OutboundMedia],
+    profile: AssistantProfile | None = None,
+) -> None:
     """Отправляет файлы из media-tools (видео, аудио, транскрипт, правки)."""
     for item in items:
         try:
             if item.kind == "image":
+                as_file = profile is not None and M._image_as_file(profile, item.model)
                 if item.url:
-                    await message.answer_photo(photo=item.url)
+                    try:
+                        raw = await _download_image_url(item.url)
+                    except AssistAIError:
+                        from app.bot.image_retry import (
+                            IMAGE_RETRY_TEXT,
+                            note_failed_image,
+                        )
+
+                        user_id = (
+                            message.from_user.id
+                            if message.from_user
+                            else message.chat.id
+                        )
+                        if await note_failed_image(
+                            message.chat.id,
+                            user_id,
+                            item.url,
+                            item.filename,
+                            as_file=as_file,
+                        ):
+                            await message.answer(IMAGE_RETRY_TEXT)
+                            continue
+                        raise
+                    await _answer_photo_bytes(
+                        message, raw, item.filename, as_file=as_file
+                    )
                 elif item.data:
-                    await message.answer_photo(
-                        photo=BufferedInputFile(item.data, filename=item.filename)
+                    await _answer_photo_bytes(
+                        message, item.data, item.filename, as_file=as_file
                     )
             elif item.kind == "audio":
                 if not item.data:
@@ -656,9 +795,13 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
             elif item.kind == "video":
                 if not item.data:
                     continue
-                await message.answer_video(
-                    video=BufferedInputFile(item.data, filename=item.filename)
-                )
+                payload = BufferedInputFile(item.data, filename=item.filename)
+                try:
+                    await message.answer_video(video=payload)
+                except TelegramBadRequest:
+                    await message.answer_document(
+                        document=BufferedInputFile(item.data, filename=item.filename)
+                    )
             elif item.kind == "document":
                 if not item.data:
                     continue
@@ -671,19 +814,39 @@ async def _send_outbound_media(message: Message, items: list[OutboundMedia]) -> 
             )
 
 
-async def _send_generated_image(message: Message, image: str, index: int) -> None:
-    """URL уходит как ссылка, base64 — как файл. Оба варианта отдаёт generate_image."""
+async def _send_generated_image(
+    message: Message, image: str, index: int, *, as_file: bool = False
+) -> Message | None:
+    """URL сначала качается ботом, затем уходит файлом; base64 — сразу файлом.
+
+    Сырой URL Telegram часто не достаёт (``failed to get HTTP URL content``).
+    ``URLInputFile`` качает CDN внутри ``sendPhoto`` и при медленном
+    ``s3.polza.ai`` ловит ``Request timeout`` (~30 с). Скачиваем отдельно
+    (до 120 с), в Telegram отдаём уже байты.
+    """
     filename = "image.png" if index == 0 else f"image_{index + 1}.png"
     if _is_http_url(image):
-        await message.answer_photo(photo=image)
-        return
-    try:
-        raw = base64.b64decode(image, validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise AssistAIError("ProxyAPI вернул нечитаемый base64 изображения.") from exc
+        try:
+            raw = await _download_image_url(image)
+        except AssistAIError:
+            from app.bot.image_retry import IMAGE_RETRY_TEXT, note_failed_image
+
+            user_id = message.from_user.id if message.from_user else message.chat.id
+            if await note_failed_image(
+                message.chat.id, user_id, image, filename, as_file=as_file
+            ):
+                raise AssistAIError(IMAGE_RETRY_TEXT) from None
+            raise
+    else:
+        try:
+            raw = base64.b64decode(image, validate=False)
+        except (binascii.Error, ValueError) as exc:
+            raise AssistAIError(
+                "Провайдер вернул нечитаемый base64 изображения."
+            ) from exc
     if not raw:
-        raise AssistAIError("ProxyAPI вернул пустое изображение.")
-    await message.answer_photo(photo=BufferedInputFile(raw, filename=filename))
+        raise AssistAIError("Провайдер вернул пустое изображение.")
+    return await _answer_photo_bytes(message, raw, filename, as_file=as_file)
 
 
 async def _send_voice_reply(
@@ -704,15 +867,11 @@ async def _send_voice_reply(
         fmt = "opus"
         requested_role = profile.tts_role or assistant.config.speechkit_role
         role = resolve_speechkit_role(voice, requested_role) or None
-    elif is_elevenlabs_tts_model(model):
-        # ProxyAPI ElevenLabs отдаёт MP3; opus/alloy-голоса OpenAI не принимаются.
-        fmt = "mp3"
     user_id = message.from_user.id if message.from_user else message.chat.id
     set_billing_user(user_id)
     try:
-        await cost_tracker.check_budget(
-            user_id, cost_tracker.estimate_tts_cost(tts_text)
-        )
+        estimated = cost_tracker.estimate_tts_cost(tts_text)
+        await cost_tracker.check_budget(user_id, estimated)
         speech = await job_queue.synthesize_speech(
             assistant,
             tts_text,
@@ -721,10 +880,24 @@ async def _send_voice_reply(
             response_format=fmt,
             role=role,
         )
+        amount, source, rub = prefer_cost_rub(
+            [
+                (
+                    getattr(speech, "cost_usd", None),
+                    getattr(speech, "cost_source", None),
+                    getattr(speech, "cost_rub", None),
+                )
+            ],
+            estimated,
+        )
         await cost_tracker.record(
             kind="tts",
-            amount_usd=cost_tracker.estimate_tts_cost(tts_text),
+            amount_usd=amount,
             user_id=user_id,
+            provider=getattr(speech, "provider_id", None),
+            model=getattr(speech, "model", None),
+            source=source,
+            cost_rub=rub,
         )
     except BudgetExceededError as exc:
         await message.answer(exc.message)
@@ -737,6 +910,8 @@ async def _send_voice_reply(
         logger.exception("Непредвиденная ошибка TTS")
         await message.answer("⚠️ Не удалось озвучить ответ.")
         return
+    finally:
+        await cost_tracker.release_reservation(user_id)
     audio = BufferedInputFile(speech.audio, filename=speech.filename)
     # MP3 (ElevenLabs) — как audio; OGG — как voice-bubble.
     if speech.mime_type == "audio/mpeg" or speech.filename.casefold().endswith(".mp3"):
@@ -757,6 +932,20 @@ async def _send_voice_reply(
             logger.warning("Не удалось отправить озвучку: %s", nested)
 
 
+_chat_turn_locks: dict[int, asyncio.Lock] = {}
+_chat_turn_locks_guard = asyncio.Lock()
+
+
+async def _chat_turn_lock(chat_id: int) -> asyncio.Lock:
+    """Serialize concurrent turns in one chat to protect history RMW."""
+    async with _chat_turn_locks_guard:
+        lock = _chat_turn_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _chat_turn_locks[chat_id] = lock
+        return lock
+
+
 async def _process_user_message(
     message: Message,
     assistant: AssistAIClient,
@@ -770,13 +959,40 @@ async def _process_user_message(
 ) -> None:
     """Общий pipeline текста и распознанного голоса в активной теме."""
     chat_id = message.chat.id
+    turn_lock = await _chat_turn_lock(chat_id)
+    async with turn_lock:
+        await _process_user_message_locked(
+            message,
+            assistant,
+            topic_storage,
+            assistant_storage,
+            state,
+            user_text=user_text,
+            input_kind=input_kind,
+            status=status,
+            user_media=user_media,
+        )
+
+
+async def _process_user_message_locked(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+    user_text: str,
+    input_kind: InputKind = "text",
+    status: Message | None = None,
+    user_media: list[UserMedia] | None = None,
+) -> None:
+    """History-mutating body of ``_process_user_message`` (caller holds chat lock)."""
+    chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     started = time.perf_counter()
     bind_request_context(user_id=user_id, chat_id=chat_id)
     set_billing_user(user_id)
     note_active_user(user_id)
-    sentry_sdk.set_user({"id": str(user_id)})
-    sentry_sdk.set_context("chat", {"id": chat_id, "type": message.chat.type})
+    # Intentionally omit Telegram user/chat IDs from Sentry (send_default_pii=False).
     media_token = set_user_media(user_media or [])
     upload_ctx_token = set_upload_request_context(
         UploadRequestContext(chat_id=chat_id, user_id=user_id)
@@ -807,11 +1023,17 @@ async def _process_user_message(
             chat_id, profile.id, user_text, topic_id, topic_storage, profile
         )
     except AssistantStorageError:
+        await cost_tracker.release_reservation(user_id)
+        reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
+        clear_request_context()
         await _reply_profile_error(message)
         return
     except TopicStorageError:
+        await cost_tracker.release_reservation(user_id)
+        reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
+        clear_request_context()
         await _reply_history_error(message)
         return
     text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
@@ -827,13 +1049,19 @@ async def _process_user_message(
     parts: list[str] = []
     shown = ""
     last_edit = 0.0
-    scope = ImageModelScope(profile.image_model, profile.image_size)
+    scope = ImageModelScope(
+        profile.image_model,
+        profile.image_size,
+        background=M._image_background_of(profile, assistant),
+        as_file=profile.image_as_file,
+    )
+    video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
     try:
         if message.bot is not None:
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, media_scope:
+        with scope, video_scope, media_scope:
             async for delta in assistant.stream_chat(
                 messages=history_copy, model=text_model
             ):
@@ -893,8 +1121,8 @@ async def _process_user_message(
                     await _reply_history_error(message)
             else:
                 await _reply_history_error(message)
-        await _send_extracted_images(message, images)
-        await _send_outbound_media(message, outbound)
+        await _send_extracted_images(message, images, profile)
+        await _send_outbound_media(message, outbound, profile)
         logger.info(
             "message_answered",
             chars=len(answer),
@@ -905,21 +1133,22 @@ async def _process_user_message(
             await _send_voice_reply(message, assistant, profile, answer)
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
     except Exception as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         sentry_sdk.capture_exception(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_INTERNAL, state)
     finally:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         reset_upload_request_context(upload_ctx_token)
         observe_message(input_kind, time.perf_counter() - started)
@@ -1056,6 +1285,29 @@ def _infer_upload_media_kind(*, mime_type: str, filename: str, preferred: str) -
     return "audio"
 
 
+_upload_process_sem: asyncio.Semaphore | None = None
+
+
+def _upload_process_semaphore() -> asyncio.Semaphore:
+    """Limit concurrent large-upload STT jobs to bound RAM pressure."""
+    global _upload_process_sem
+    if _upload_process_sem is None:
+        from app.infra.envparse import env_int
+
+        _upload_process_sem = asyncio.Semaphore(
+            max(1, env_int("UPLOAD_MAX_CONCURRENT", 2))
+        )
+    return _upload_process_sem
+
+
+def _estimate_upload_stt_cost(*, file_size: int | None, max_upload_mb: int) -> float:
+    """Rough STT estimate from payload size (~4 KB/s), matching media_tools."""
+    size_hint = (
+        file_size if file_size and file_size > 0 else max_upload_mb * 1024 * 1024
+    )
+    return cost_tracker.estimate_stt_cost(max(15.0, size_hint / 4000.0))
+
+
 async def _process_s3_upload_session(
     *,
     bot: Bot,
@@ -1068,6 +1320,7 @@ async def _process_s3_upload_session(
 ) -> None:
     """Скачивает объект из бакета и делает STT → transcript.txt в чат."""
     chat_id = session.chat_id
+    user_id = session.user_id
     object_key = session.object_key
     filename = session.filename or "media.bin"
     mime_type = session.mime_type or "application/octet-stream"
@@ -1080,12 +1333,58 @@ async def _process_s3_upload_session(
         await store.update(session)
         return
 
-    status_msg = await bot.send_message(
-        chat_id, f"Файл «{filename}» получен. Расшифровываю…"
-    )
+    from app.infra.rate_limiter import rate_limiter
+
+    sem = _upload_process_semaphore()
+    await sem.acquire()
     data: bytes | None = None
+    status_msg: Message | None = None
+    reserved = False
     try:
-        data = await storage.download_bytes(object_key)
+        set_billing_user(user_id)
+        if not await rate_limiter.check_media_limit(user_id):
+            retry_after = await rate_limiter.get_retry_after(user_id, "media")
+            await bot.send_message(
+                chat_id,
+                f"⏳ Слишком много медиа-запросов. Подождите "
+                f"{int(retry_after) or 60} секунд и загрузите файл снова.",
+            )
+            session.status = "failed"
+            session.error = "rate_limited"
+            await store.update(session)
+            return
+
+        estimated = _estimate_upload_stt_cost(
+            file_size=session.file_size,
+            max_upload_mb=storage.config.max_upload_mb,
+        )
+        try:
+            await cost_tracker.check_budget(user_id, estimated)
+            reserved = True
+        except BudgetExceededError as exc:
+            await bot.send_message(chat_id, exc.message)
+            session.status = "failed"
+            session.error = "budget_exceeded"
+            await store.update(session)
+            return
+
+        status_msg = await bot.send_message(
+            chat_id, f"Файл «{filename}» получен. Расшифровываю…"
+        )
+        max_bytes = storage.config.max_upload_mb * 1024 * 1024
+        data = await storage.download_bytes(object_key, max_bytes=max_bytes)
+        from app.media.file_magic import mime_compatible
+
+        if not mime_compatible(
+            filename=filename, claimed_mime=mime_type, head=data[:64]
+        ):
+            await bot.send_message(
+                chat_id, "Файл отклонён: содержимое не соответствует типу."
+            )
+            session.status = "failed"
+            session.error = "mime_mismatch"
+            await store.update(session)
+            return
         kind = _infer_upload_media_kind(
             mime_type=mime_type,
             filename=filename,
@@ -1096,17 +1395,40 @@ async def _process_s3_upload_session(
             filename=filename,
             is_video=kind == "video",
         )
+        data = None  # free full object before paid STT round-trips
         parts: list[str] = []
+        facts: list[tuple[float | None, str | None, float | None]] = []
+        providers: list[str | None] = []
+        models: list[str | None] = []
         for audio_bytes, chunk_name in chunks:
-            text = await job_queue.transcribe_audio(
+            recognized = await job_queue.transcribe_audio(
                 assistant,
                 audio_bytes,
                 filename=chunk_name,
                 language=None,
+                billing_user_id=user_id,
             )
-            if text:
-                parts.append(text)
+            facts.append(
+                (recognized.cost_usd, recognized.cost_source, recognized.cost_rub)
+            )
+            providers.append(recognized.provider_id)
+            models.append(recognized.model)
+            if recognized.text:
+                parts.append(recognized.text)
         transcript = "\n\n".join(parts).strip()
+        amount, source, rub = prefer_cost_rub(facts, estimated)
+        provider = providers[0] if providers and len(set(providers)) == 1 else None
+        billed_model = models[0] if models and len(set(models)) == 1 else None
+        await cost_tracker.record(
+            kind="stt",
+            amount_usd=amount,
+            user_id=user_id,
+            provider=provider,
+            model=billed_model,
+            source=source,
+            cost_rub=rub,
+        )
+        reserved = False
         await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
         session.prompt_message_ids = None
         await store.update(session)
@@ -1124,10 +1446,11 @@ async def _process_s3_upload_session(
             ),
             caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
         )
-        try:
-            await status_msg.delete()
-        except Exception:
-            logger.debug("upload_status_delete_failed", chat_id=chat_id)
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                logger.debug("upload_status_delete_failed", chat_id=chat_id)
 
         # Короткая запись в историю активной темы.
         try:
@@ -1169,21 +1492,28 @@ async def _process_s3_upload_session(
             chunks=len(chunks),
         )
     except (S3StorageError, MediaProcessingError, AssistAIError) as exc:
-        message = getattr(exc, "message", None) or str(exc)
-        logger.exception("s3_upload_process_failed", upload_id=session.upload_id)
-        await bot.send_message(chat_id, f"Не удалось обработать файл: {message}")
+        detail = getattr(exc, "message", None) or str(exc)
+        logger.exception(
+            "s3_upload_process_failed",
+            upload_id=session.upload_id,
+            error=detail[:500],
+        )
+        await bot.send_message(chat_id, MSG_UPLOAD_PROCESS_FAILED)
         session.status = "failed"
-        session.error = message[:500]
+        session.error = detail[:500]
         await store.update(session)
     except Exception as exc:
         logger.exception("s3_upload_process_failed", upload_id=session.upload_id)
         sentry_sdk.capture_exception(exc)
-        await bot.send_message(chat_id, "Не удалось обработать загруженный файл.")
+        await bot.send_message(chat_id, MSG_UPLOAD_PROCESS_FAILED)
         session.status = "failed"
         session.error = "internal"
         await store.update(session)
     finally:
         data = None
+        if reserved:
+            await cost_tracker.release_reservation(user_id)
+        sem.release()
         try:
             await storage.delete_object(object_key)
         except Exception:
@@ -1251,6 +1581,45 @@ async def _process_vision_message(
 ) -> None:
     """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
     chat_id = message.chat.id
+    turn_lock = await _chat_turn_lock(chat_id)
+    async with turn_lock:
+        await _process_vision_message_locked(
+            message,
+            assistant,
+            topic_storage,
+            assistant_storage,
+            state,
+            multimodal_content=multimodal_content,
+            history_placeholder=history_placeholder,
+            status_text=status_text,
+            user_media=user_media,
+        )
+
+
+async def _process_vision_message_locked(
+    message: Message,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+    *,
+    multimodal_content: list[dict[str, Any]],
+    history_placeholder: str,
+    status_text: str = "Анализирую изображение…",
+    user_media: list[UserMedia] | None = None,
+) -> None:
+    """History-mutating body of ``_process_vision_message`` (caller holds chat lock)."""
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else chat_id
+    set_billing_user(user_id)
+    try:
+        await cost_tracker.check_budget(
+            user_id,
+            cost_tracker.estimate_chat_cost(input_chars=1200, output_chars=500),
+        )
+    except BudgetExceededError as exc:
+        await message.answer(exc.message)
+        return
     media_token = set_user_media(user_media or [])
     try:
         profile = await _active_profile(chat_id, assistant_storage)
@@ -1265,10 +1634,12 @@ async def _process_vision_message(
             profile,
         )
     except AssistantStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         await _reply_profile_error(message)
         return
     except TopicStorageError:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         await _reply_history_error(message)
         return
@@ -1285,13 +1656,19 @@ async def _process_vision_message(
     parts: list[str] = []
     shown = ""
     last_edit = 0.0
-    scope = ImageModelScope(profile.image_model, profile.image_size)
+    scope = ImageModelScope(
+        profile.image_model,
+        profile.image_size,
+        background=M._image_background_of(profile, assistant),
+        as_file=profile.image_as_file,
+    )
+    video_scope = VideoSettingsScope(video_settings_from(profile))
     media_scope = MediaTurnScope()
     turn_start = len(history_copy)
     try:
         if message.bot is not None:
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, media_scope:
+        with scope, video_scope, media_scope:
             async for delta in assistant.stream_chat(
                 messages=history_copy, model=vision_model
             ):
@@ -1351,8 +1728,8 @@ async def _process_vision_message(
                     await _reply_history_error(message)
             else:
                 await _reply_history_error(message)
-        await _send_extracted_images(message, images)
-        await _send_outbound_media(message, outbound)
+        await _send_extracted_images(message, images, profile)
+        await _send_outbound_media(message, outbound, profile)
         logger.info(
             "Vision-ответ, chat_id=%s topic_id=%s, символов=%s, картинок=%s",
             chat_id,
@@ -1364,19 +1741,20 @@ async def _process_vision_message(
             await _send_voice_reply(message, assistant, profile, answer)
     except (AssistAIError, httpx.TimeoutException) as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, _public_error(exc), state)
     except Exception as exc:
         keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images)
-        await _send_outbound_media(message, media_scope.bucket.items)
+        await _send_extracted_images(message, scope.images, profile)
+        await _send_outbound_media(message, media_scope.bucket.items, profile)
         _log_handler_error(exc)
         await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
         await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
     finally:
+        await cost_tracker.release_reservation(user_id)
         reset_user_media(media_token)
         _release_outgoing(keep)
 
@@ -1479,8 +1857,6 @@ async def _apply_model_choice(
                 )
             else:
                 fields["tts_role"] = None
-                if is_elevenlabs_tts_model(effective):
-                    fields["tts_format"] = "mp3"
             updated = profile.model_copy(update=fields)
         else:
             updated = profile.model_copy(update={"text_model": selected})
@@ -1603,6 +1979,9 @@ async def _delete_bot_message(message: Message) -> None:
     try:
         await message.delete()
     except TelegramBadRequest as exc:
+        if "message to delete not found" in str(exc):
+            logger.debug("Сообщение уже удалено: %s", exc)
+            return
         logger.warning("Не удалось удалить сообщение: %s", exc)
 
 
@@ -1770,6 +2149,21 @@ async def _forget_message_screens(
         await state.set_data(data)
 
 
+async def _dismiss_open_picker(message: Message, state: FSMContext) -> None:
+    """Удаляет отдельный экран выбора, если он ещё висит в чате."""
+    data = await state.get_data()
+    picker_id = data.get(_SCREEN_PICKER)
+    bot = message.bot
+    if not isinstance(picker_id, int) or bot is None or picker_id == message.message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=picker_id)
+    except TelegramBadRequest as exc:
+        logger.warning("Не удалось закрыть выбор модели: %s", exc)
+    data.pop(_SCREEN_PICKER, None)
+    await state.set_data(data)
+
+
 async def _close_screen(message: Message, state: FSMContext, key: str) -> None:
     """Удаляет экран с кнопками и забывает его id, чтобы не править пустое место."""
     try:
@@ -1879,57 +2273,6 @@ async def _open_topics(
     await _upsert_screen(message, state, _SCREEN_TOPICS, text, markup)
 
 
-async def _generate_and_send(
-    message: Message,
-    assistant: AssistAIClient,
-    prompt: str,
-    model: str | None,
-    size: str = "1024x1024",
-    *,
-    reply_markup: ReplyKeyboardMarkup | None = None,
-) -> None:
-    """Просит ProxyAPI нарисовать картинку и отправляет её в чат."""
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    bind_request_context(user_id=user_id, chat_id=message.chat.id)
-    note_active_user(user_id)
-    logger.info(
-        "image_generation",
-        model=model or assistant.config.default_image_model,
-        size=size,
-        prompt_chars=len(prompt),
-    )
-    set_billing_user(user_id)
-    keep = _KEEP_OUTGOING.set(True)
-    try:
-        progress = await message.answer("Генерирую изображение…")
-    finally:
-        _KEEP_OUTGOING.reset(keep)
-    try:
-        await cost_tracker.check_budget(user_id, cost_tracker.estimate_image_cost(1))
-        images = await job_queue.generate_image(assistant, prompt, model, size)
-        await _delete_bot_message(progress)
-        if not images:
-            await message.answer(MSG_IMAGE_FAILED, reply_markup=reply_markup)
-            return
-        for index, image in enumerate(images):
-            await _send_generated_image(message, image, index)
-    except BudgetExceededError as exc:
-        await _delete_bot_message(progress)
-        await message.answer(exc.message, reply_markup=reply_markup)
-    except AssistAIError as exc:
-        logger.error("AssistAI ошибка: %s", exc.message)
-        await _delete_bot_message(progress)
-        await message.answer(MSG_IMAGE_FAILED, reply_markup=reply_markup)
-    except httpx.TimeoutException:
-        logger.error("Таймаут генерации изображения")
-        await _delete_bot_message(progress)
-        await message.answer(MSG_TIMEOUT, reply_markup=reply_markup)
-    except Exception:
-        logger.exception("Непредвиденная ошибка генерации изображения")
-        await _delete_bot_message(progress)
-        await message.answer(MSG_INTERNAL, reply_markup=reply_markup)
-
-
 async def _open_settings(
     message: Message,
     assistant: AssistAIClient,
@@ -2005,29 +2348,6 @@ async def _finish_topic_delete(
     text, markup = await _topics_screen(chat_id, assistant_id, topic_storage)
     menu = await _menu_for(chat_id, assistant_storage, topic_storage)
     return text, markup, menu
-
-
-async def _refresh_image_screen(
-    query: CallbackQuery, state: FSMContext, assistant: AssistAIClient
-) -> None:
-    """Обновляет экран картинки после выбора модели или размера."""
-    message = _query_message(query)
-    if message is None:
-        await query.answer()
-        return
-    data = await state.get_data()
-    selected = M._optional_model(data.get("image_model"))
-    model_id = selected or assistant.config.default_image_model
-    size = data.get("image_size")
-    allowed = M._size_choices(model_id)
-    if not isinstance(size, str) or size not in allowed:
-        size = M._default_image_size(model_id)
-        await state.update_data(image_size=size)
-    await state.set_state(ImageSG.config)
-    await query.answer()
-    text, markup = screens._image_view(selected, size, assistant)
-    await _edit_inline(message, text, markup)
-    await state.update_data({_SCREEN_IMAGE: message.message_id})
 
 
 async def _open_model_menu(

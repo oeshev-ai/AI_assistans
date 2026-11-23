@@ -162,7 +162,6 @@ async def on_preset_edit(query: CallbackQuery, state: FSMContext) -> None:
             "flow_text_model": preset.text_model,
             "flow_image_model": preset.image_model,
             "flow_preset_id": preset.id,
-            "flow_edit_id": None,
         }
     )
     await state.set_data(data)

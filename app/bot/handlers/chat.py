@@ -27,6 +27,7 @@ from app.bot.constants import (
     security,
     set_billing_user,
 )
+from app.infra.cost_tracker import prefer_cost_rub
 from app.storage.pending_media import PendingMediaStorage
 
 
@@ -46,38 +47,54 @@ async def handle_text(
     if not security.validate_message_length(user_text):
         await message.answer("⚠️ Сообщение слишком длинное. Максимум 4000 символов.")
         return
-    if pending_media is not None and user_text.casefold() in {
-        "отмена",
-        "стоп",
-        "cancel",
-    }:
+    if user_text.casefold() in {"отмена", "стоп", "cancel"}:
+        from app.bot.album import get_album_hub
         from app.bot.photo_flow import consume_pending_text
 
-        if await consume_pending_text(
-            message,
-            assistant,
-            topic_storage,
-            assistant_storage,
-            state,
-            pending_media,
-            user_text,
-        ):
+        # Слот и ещё не собранный альбом гасятся вместе. Иначе «Отменено»
+        # снимает старые фото, а новый альбом всё равно уходит в работу.
+        hub = get_album_hub()
+        album_cancelled = False
+        if hub.has_pending(message.chat.id, user_id):
+            album_cancelled = await hub.cancel_chat(message.chat.id, user_id)
+        pending_cancelled = False
+        if pending_media is not None:
+            pending_cancelled = await consume_pending_text(
+                message,
+                assistant,
+                topic_storage,
+                assistant_storage,
+                state,
+                pending_media,
+                user_text,
+            )
+        if pending_cancelled:
             return
+        if album_cancelled:
+            await message.answer("Отменено.")
+            return
+    sanitized_text = security.sanitize_prompt(user_text)
+    from app.bot.album import get_album_hub
+    from app.bot.handlers.photo import deliver_album
+
+    # Album flush consumes the text slot inside route_album — avoid a double hit.
+    hub = get_album_hub()
+    if hub.has_pending(message.chat.id, user_id):
+        flushed = await hub.flush_text(
+            message.chat.id,
+            user_id,
+            sanitized_text,
+            deliver_album,
+        )
+        if flushed:
+            return
+
     if not await rate_limiter.check_text_limit(user_id):
         retry_after = await rate_limiter.get_retry_after(user_id, "text")
         await message.answer(
             f"⏳ Слишком много запросов. Подождите {int(retry_after) or 60} секунд."
         )
         logger.warning("rate_limit_exceeded", user_id=user_id, operation="text")
-        return
-    sanitized_text = security.sanitize_prompt(user_text)
-    from app.bot.album import get_album_hub
-    from app.bot.handlers.photo import deliver_album
-
-    flushed = await get_album_hub().flush_text(
-        message.chat.id, sanitized_text, deliver_album
-    )
-    if flushed:
         return
     if pending_media is not None:
         from app.bot.photo_flow import consume_pending_text
@@ -144,22 +161,30 @@ async def handle_voice(
     status = await message.answer("🎤 Распознаю речь…")
     keep = R._release_outgoing(keep)
     try:
-        await cost_tracker.check_budget(
-            user_id, cost_tracker.estimate_stt_cost(float(voice.duration))
-        )
+        estimated = cost_tracker.estimate_stt_cost(float(voice.duration))
+        await cost_tracker.check_budget(user_id, estimated)
         audio_bytes, filename = await R._download_voice(message)
         await R._active_profile(chat_id, assistant_storage)
-        transcribed = await job_queue.transcribe_audio(
+        recognized = await job_queue.transcribe_audio(
             assistant,
             audio_bytes,
             filename=filename,
             language=None,
         )
+        amount, source, rub = prefer_cost_rub(
+            [(recognized.cost_usd, recognized.cost_source, recognized.cost_rub)],
+            estimated,
+        )
         await cost_tracker.record(
             kind="stt",
-            amount_usd=cost_tracker.estimate_stt_cost(float(voice.duration)),
+            amount_usd=amount,
             user_id=user_id,
+            provider=recognized.provider_id,
+            model=recognized.model,
+            source=source,
+            cost_rub=rub,
         )
+        transcribed = recognized.text
     except BudgetExceededError as exc:
         await R._edit_stream(status, exc.message, "")
         await R._append_chrome(state, [status.message_id])
@@ -189,6 +214,8 @@ async def handle_voice(
         await R._edit_stream(status, MSG_INTERNAL, "")
         await R._append_chrome(state, [status.message_id])
         return
+    finally:
+        await cost_tracker.release_reservation(user_id)
     logger.info(
         "Распознано, chat_id=%s duration=%s size=%s chars=%s",
         chat_id,

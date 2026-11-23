@@ -68,8 +68,7 @@ async def test_edit_image_sanitizes_prompt(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("app.infra.job_queue.edit_images", fake_edit)
 
     class FakeClient:
-        def __init__(self) -> None:
-            self._generation_ids: list[str] = []
+        pass
 
     tool = EditImageTool(FakeClient())  # type: ignore[arg-type]
     token = set_user_media(

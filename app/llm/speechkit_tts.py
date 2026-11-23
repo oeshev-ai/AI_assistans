@@ -96,9 +96,12 @@ class SpeechKitConfig:
         except ValueError:
             speed = DEFAULT_SPEED
         voice = os.getenv("SPEECHKIT_VOICE", DEFAULT_VOICE).strip() or DEFAULT_VOICE
-        url = (
-            os.getenv("SPEECHKIT_URL", DEFAULT_SPEECHKIT_URL).strip()
-            or DEFAULT_SPEECHKIT_URL
+        from app.infra.envparse import ensure_https_url
+
+        url = ensure_https_url(
+            os.getenv("SPEECHKIT_URL", "").strip(),
+            name="SPEECHKIT_URL",
+            default=DEFAULT_SPEECHKIT_URL,
         )
         return cls(
             api_key=api_key,

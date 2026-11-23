@@ -55,6 +55,7 @@ class AsyncCircuitBreaker:
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._opened_at = 0.0
+        self._half_open_permits = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -62,12 +63,17 @@ class AsyncCircuitBreaker:
         return self._state
 
     async def ensure_allows_call(self) -> None:
-        """Raise ``CircuitBreakerError`` if the circuit is currently open."""
+        """Raise ``CircuitBreakerError`` if the circuit is open or probe taken."""
         async with self._lock:
             self._maybe_half_open()
             if self._state == CircuitState.OPEN:
                 logger.error("circuit_open", circuit=self.name)
                 raise CircuitBreakerError(f"Circuit '{self.name}' is open")
+            if self._state == CircuitState.HALF_OPEN:
+                if self._half_open_permits <= 0:
+                    logger.error("circuit_open", circuit=self.name, reason="probe_busy")
+                    raise CircuitBreakerError(f"Circuit '{self.name}' is open")
+                self._half_open_permits -= 1
 
     async def call(
         self, func: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
@@ -88,6 +94,7 @@ class AsyncCircuitBreaker:
             return
         if time.monotonic() - self._opened_at >= self.recovery_timeout:
             self._state = CircuitState.HALF_OPEN
+            self._half_open_permits = 1
             logger.info("circuit_half_open", circuit=self.name)
 
     async def _on_success(self) -> None:
@@ -95,6 +102,7 @@ class AsyncCircuitBreaker:
             if self._state != CircuitState.CLOSED:
                 logger.info("circuit_closed", circuit=self.name)
             self._failure_count = 0
+            self._half_open_permits = 0
             self._state = CircuitState.CLOSED
 
     async def _on_failure(self, exc: BaseException) -> None:
@@ -113,6 +121,7 @@ class AsyncCircuitBreaker:
             ):
                 self._state = CircuitState.OPEN
                 self._opened_at = time.monotonic()
+                self._half_open_permits = 0
                 logger.error("circuit_opened", circuit=self.name)
 
 
@@ -144,9 +153,27 @@ def circuit(
     return decorator
 
 
-llm_breaker = AsyncCircuitBreaker(
-    name="llm_api", failure_threshold=5, recovery_timeout=60.0
-)
+_provider_breakers: dict[str, AsyncCircuitBreaker] = {}
+# Историческое имя breaker-а ProxyAPI в логах и дашбордах.
+_PROVIDER_BREAKER_NAMES = {"proxyapi": "llm_api"}
+
+
+def get_breaker(provider_id: str) -> AsyncCircuitBreaker:
+    """Breaker провайдера (создаётся лениво, один на id)."""
+    key = provider_id.strip().casefold()
+    breaker = _provider_breakers.get(key)
+    if breaker is None:
+        breaker = AsyncCircuitBreaker(
+            name=_PROVIDER_BREAKER_NAMES.get(key, f"{key}_api"),
+            failure_threshold=5,
+            recovery_timeout=60.0,
+        )
+        _provider_breakers[key] = breaker
+    return breaker
+
+
+# Алиас на breaker ProxyAPI: имя остаётся импортируемым.
+llm_breaker = get_breaker("proxyapi")
 weather_breaker = AsyncCircuitBreaker(
     name="weather_api", failure_threshold=5, recovery_timeout=60.0
 )
@@ -160,10 +187,24 @@ async def safe_api_call(
     func: Callable[..., Awaitable[Any]],
     *args: Any,
     user_message: str = "Сервис временно недоступен",
+    failure_filter: Callable[[BaseException], bool] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Call ``func`` through ``breaker`` and map open-circuit to a user error."""
+    """Call ``func`` through ``breaker`` and map open-circuit to a user error.
+
+    ``failure_filter`` — если задан, сбой учитывается в breaker только когда
+    фильтр возвращает True (например, пропускать клиентские 4xx LLM).
+    """
     try:
-        return await breaker.call(func, *args, **kwargs)
+        await breaker.ensure_allows_call()
+        try:
+            result = await func(*args, **kwargs)
+        except breaker.expected_exception as exc:
+            if failure_filter is None or failure_filter(exc):
+                await breaker._on_failure(exc)
+            raise
+        else:
+            await breaker._on_success()
+            return result
     except CircuitBreakerError as exc:
         raise APIUnavailableError(user_message) from exc

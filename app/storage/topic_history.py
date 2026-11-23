@@ -55,7 +55,8 @@ class TopicConfig(BaseModel):
     @classmethod
     def from_env(cls) -> TopicConfig:
         """Читает ``REDIS_URL``, ``TOPIC_TTL_DAYS`` и ``MAX_HISTORY_LENGTH``."""
-        load_dotenv(Path(__file__).resolve().parent / ".env")
+        # Project root .env, then cwd fallback (same pattern as history_storage).
+        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         load_dotenv()
         return cls(
             redis_url=os.getenv("REDIS_URL", ""),
@@ -905,9 +906,15 @@ class RedisTopicStorage(TopicHistoryStorage):
 async def create_topic_storage(config: TopicConfig) -> TopicHistoryStorage:
     """Возвращает Redis, если ``REDIS_URL`` задан и сервер отвечает.
 
-    Пустой URL или недоступный Redis дают память процесса.
+    Пустой URL или недоступный Redis дают память процесса вне production.
+    В production — fail-closed (как FSM), без тихой деградации.
     """
+    from app.infra.access import is_production
+
     if not config.redis_url:
+        if is_production():
+            logger.error("topic_redis_required_in_production")
+            raise SystemExit(1)
         logger.info("REDIS_URL не задан, темы диалогов хранятся в памяти процесса")
         return InMemoryTopicStorage(config.max_history_length)
 
@@ -915,11 +922,14 @@ async def create_topic_storage(config: TopicConfig) -> TopicHistoryStorage:
     try:
         await storage.ping()
     except TopicStorageError as exc:
+        await storage.close()
+        if is_production():
+            logger.error("topic_redis_failed_fatal", error=exc.message)
+            raise SystemExit(1) from exc
         logger.warning(
             "Redis недоступен, темы диалогов переключены на память процесса: %s",
             exc.message,
         )
-        await storage.close()
         return InMemoryTopicStorage(config.max_history_length)
     logger.info("Темы диалогов хранятся в Redis, ttl_days=%s", config.topic_ttl_days)
     return storage

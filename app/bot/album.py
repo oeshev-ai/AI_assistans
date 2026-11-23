@@ -1,16 +1,26 @@
-"""Сборка альбома: сортировка, лимиты и debounce без сети."""
+"""Сборка альбома: сортировка, лимиты и debounce.
+
+С метаданными фото (без байтов). При ``attach_redis`` буфер дублируется в
+Redis, чтобы несколько реплик могли склеить один ``media_group_id``.
+Debounce и ``services`` остаются process-local; flush берёт lock в Redis.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import structlog
 
 logger = structlog.get_logger("album")
+
+AlbumKey = tuple[int, int, str]  # chat_id, user_id, media_group_id
+_REDIS_TTL_SEC = 60
+_LOCK_TTL_SEC = 5
 
 
 def album_debounce_seconds() -> float:
@@ -52,6 +62,21 @@ class IncomingPhoto:
     caption: str = ""
     filename: str = "photo.jpg"
     mime: str = "image/jpeg"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, raw: str) -> IncomingPhoto:
+        data = json.loads(raw)
+        return cls(
+            message_id=int(data["message_id"]),
+            file_id=str(data["file_id"]),
+            size=int(data.get("size") or 0),
+            caption=str(data.get("caption") or ""),
+            filename=str(data.get("filename") or "photo.jpg"),
+            mime=str(data.get("mime") or "image/jpeg"),
+        )
 
 
 @dataclass
@@ -104,120 +129,316 @@ ReadyCallback = Callable[[AlbumBuild, Any], Awaitable[None]]
 class AlbumHub:
     """Копит media_group_id и сбрасывает пачку после паузы.
 
-    Одиночное фото обрабатывается сразу и отменяет открытый буфер чата.
-    Текст во время паузы сбрасывает буфер и становится инструкцией.
+    Одиночное фото обрабатывается сразу и отменяет открытый буфер
+    того же пользователя в чате. Текст во время паузы сбрасывает
+    буфер пользователя и становится инструкцией.
 
-    Буфер process-local: при нескольких репликах бота альбом может
-    разъехаться по процессам. Держите один экземпляр ``bot`` (без
-    горизонтального масштабирования polling) или sticky routing.
+    Ключ включает ``user_id``, чтобы в группах чужой текст/фото не
+    трогали чужой альбом.
+
+    Без Redis буфер process-local. С ``attach_redis`` метаданные фото
+    пишутся в Redis, flush под lock — реплики могут склеить один альбом.
     """
 
     def __init__(self, debounce: float | None = None) -> None:
         self.debounce = album_debounce_seconds() if debounce is None else debounce
-        self._buf: dict[tuple[int, str], list[IncomingPhoto]] = {}
-        self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
-        self._latest: dict[tuple[int, str], Any] = {}
+        self._buf: dict[AlbumKey, list[IncomingPhoto]] = {}
+        self._tasks: dict[AlbumKey, asyncio.Task[None]] = {}
+        self._latest: dict[AlbumKey, Any] = {}
+        self._append_failed: set[AlbumKey] = set()
         self._lock = asyncio.Lock()
+        self._redis: Any | None = None
 
-    def _keys_for(self, chat_id: int) -> list[tuple[int, str]]:
-        return [key for key in self._buf if key[0] == chat_id]
+    def attach_redis(self, redis_client: Any | None) -> None:
+        """Optional Redis for cross-replica album metadata."""
+        self._redis = redis_client
+        if redis_client is not None:
+            logger.info("album_hub_using_redis")
+        else:
+            logger.warning(
+                "album_hub_memory_only",
+                hint="Multi-replica polling can split albums without Redis",
+            )
 
-    def _cancel_chat_unlocked(self, chat_id: int) -> bool:
-        """Сброс буфера. Вызывать только под ``self._lock``."""
-        keys = self._keys_for(chat_id)
-        if not keys:
-            return False
+    @staticmethod
+    def _redis_key(key: AlbumKey) -> str:
+        return f"album:buf:{key[0]}:{key[1]}:{key[2]}"
+
+    @staticmethod
+    def _lock_key(key: AlbumKey) -> str:
+        return f"album:lock:{key[0]}:{key[1]}:{key[2]}"
+
+    def _keys_for(self, chat_id: int, user_id: int | None = None) -> list[AlbumKey]:
+        return [
+            key
+            for key in self._buf
+            if key[0] == chat_id and (user_id is None or key[1] == user_id)
+        ]
+
+    def has_pending(self, chat_id: int, user_id: int) -> bool:
+        """True if this user has an open album debounce buffer in the chat."""
+        return any(key[0] == chat_id and key[1] == user_id for key in self._buf)
+
+    async def _redis_append(self, key: AlbumKey, photo: IncomingPhoto) -> None:
+        if self._redis is None:
+            return
+        rkey = self._redis_key(key)
+        try:
+            pipe = self._redis.pipeline()
+            pipe.rpush(rkey, photo.to_json())
+            pipe.expire(rkey, _REDIS_TTL_SEC)
+            await pipe.execute()
+            self._append_failed.discard(key)
+        except Exception as exc:
+            self._append_failed.add(key)
+            logger.warning("album_redis_append_failed", error=str(exc))
+
+    @staticmethod
+    def _merge_photos(
+        remote: list[IncomingPhoto], local: list[IncomingPhoto]
+    ) -> list[IncomingPhoto]:
+        """Union by message_id; local fills gaps after a partial Redis append."""
+        by_id: dict[int, IncomingPhoto] = {item.message_id: item for item in remote}
+        for item in local:
+            by_id.setdefault(item.message_id, item)
+        return sorted(by_id.values(), key=lambda item: item.message_id)
+
+    async def _redis_take(
+        self, key: AlbumKey
+    ) -> tuple[bool | None, list[IncomingPhoto]]:
+        """Atomically claim album photos.
+
+        Returns ``(won, photos)``.
+        ``won=False`` — peer holds the lock (drop local to avoid double delivery).
+        ``won=None`` — Redis error (caller must fail closed when Redis is attached).
+        When Redis is healthy, the list is the source of truth.
+        """
+        if self._redis is None:
+            return True, []
+        rkey = self._redis_key(key)
+        lock = self._lock_key(key)
+        try:
+            got_lock = await self._redis.set(lock, "1", nx=True, ex=_LOCK_TTL_SEC)
+            if not got_lock:
+                return False, []
+            try:
+                # Atomic claim: MULTI/EXEC so RPUSH cannot land between LRANGE and DEL.
+                pipe = self._redis.pipeline(transaction=True)
+                pipe.lrange(rkey, 0, -1)
+                pipe.delete(rkey)
+                results = await pipe.execute()
+                raw_items = results[0] if results else []
+            finally:
+                await self._redis.delete(lock)
+        except Exception as exc:
+            logger.warning("album_redis_take_failed", error=str(exc))
+            return None, []
+        photos: list[IncomingPhoto] = []
+        for raw in raw_items or []:
+            text = (
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            )
+            try:
+                photos.append(IncomingPhoto.from_json(text))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                logger.warning("album_redis_photo_invalid")
+        return True, photos
+
+    async def _claim_photos(
+        self, key: AlbumKey, local: list[IncomingPhoto]
+    ) -> tuple[list[IncomingPhoto] | None, bool]:
+        """Photos to flush, and whether Redis refused the claim.
+
+        ``(None, False)`` — a peer holds the lock or already flushed.
+        ``(None, True)`` — Redis error: do not deliver a local copy, tell the user.
+        """
+        won, remote = await self._redis_take(key)
+        append_failed = key in self._append_failed
+        self._append_failed.discard(key)
+        if won is None:
+            # Fail closed with Redis attached: local fallback duplicates paid work
+            # across replicas. Without Redis, local is the only source of truth.
+            if self._redis is not None:
+                logger.warning(
+                    "album_redis_claim_fail_closed",
+                    local_count=len(local),
+                    chat_id=key[0],
+                    user_id=key[1],
+                )
+                return None, True
+            return local, False
+        if not won:
+            return None, False
+        if self._redis is None:
+            return local, False
+        if append_failed:
+            merged = self._merge_photos(remote, local)
+            logger.warning(
+                "album_redis_append_incomplete_using_merge",
+                remote_count=len(remote),
+                local_count=len(local),
+                merged_count=len(merged),
+                chat_id=key[0],
+                user_id=key[1],
+            )
+            return merged, False
+        # Redis SoT: empty after a won lock ⇒ peer already flushed.
+        return remote, False
+
+    async def _redis_clear(self, key: AlbumKey) -> None:
+        if self._redis is None:
+            return
+        try:
+            await self._redis.delete(self._redis_key(key), self._lock_key(key))
+        except Exception as exc:
+            logger.warning("album_redis_clear_failed", error=str(exc))
+
+    def _cancel_user_unlocked(self, chat_id: int, user_id: int) -> list[AlbumKey]:
+        """Сброс локального буфера. Вызывать только под ``self._lock``."""
+        keys = self._keys_for(chat_id, user_id)
         for key in keys:
             self._buf.pop(key, None)
             self._latest.pop(key, None)
             task = self._tasks.pop(key, None)
             if task is not None and not task.done():
                 task.cancel()
-        return True
+        return keys
 
-    async def cancel_chat(self, chat_id: int) -> bool:
+    async def cancel_chat(self, chat_id: int, user_id: int | None = None) -> bool:
         """Сбрасывает открытый буфер, не вызывая обработчик."""
         async with self._lock:
-            return self._cancel_chat_unlocked(chat_id)
+            if user_id is None:
+                keys = self._keys_for(chat_id)
+                if not keys:
+                    return False
+                for key in keys:
+                    self._buf.pop(key, None)
+                    self._latest.pop(key, None)
+                    task = self._tasks.pop(key, None)
+                    if task is not None and not task.done():
+                        task.cancel()
+            else:
+                keys = self._cancel_user_unlocked(chat_id, user_id)
+                if not keys:
+                    return False
+        for key in keys:
+            await self._redis_clear(key)
+        return True
 
     async def add(
         self,
         chat_id: int,
+        user_id: int,
         group_id: str | None,
         photo: IncomingPhoto,
         services: Any,
         on_ready: ReadyCallback,
     ) -> None:
         if group_id is None:
+            cleared: list[AlbumKey] = []
             async with self._lock:
-                self._cancel_chat_unlocked(chat_id)
+                cleared = self._cancel_user_unlocked(chat_id, user_id)
+            for key in cleared:
+                await self._redis_clear(key)
             built = assemble_album([photo])
             await on_ready(built, services)
             return
+        stale: list[AlbumKey] = []
         async with self._lock:
-            for key in self._keys_for(chat_id):
-                if key[1] == group_id:
+            for key in self._keys_for(chat_id, user_id):
+                if key[2] == group_id:
                     continue
                 self._buf.pop(key, None)
                 self._latest.pop(key, None)
                 task = self._tasks.pop(key, None)
                 if task is not None and not task.done():
                     task.cancel()
-            key = (chat_id, group_id)
+                stale.append(key)
+            key = (chat_id, user_id, group_id)
             self._buf.setdefault(key, []).append(photo)
             self._latest[key] = services
             previous = self._tasks.get(key)
             if previous is not None and not previous.done():
                 previous.cancel()
             self._tasks[key] = asyncio.create_task(self._fire(key, on_ready))
+        for stale_key in stale:
+            await self._redis_clear(stale_key)
+        await self._redis_append(key, photo)
 
     async def flush_text(
-        self, chat_id: int, text: str, on_ready: ReadyCallback
+        self,
+        chat_id: int,
+        user_id: int,
+        text: str,
+        on_ready: ReadyCallback,
     ) -> bool:
-        """Если буфер открыт, закрывает его и отдаёт ``text`` как инструкцию."""
+        """Если буфер пользователя открыт, закрывает его и отдаёт ``text`` как инструкцию."""
         async with self._lock:
-            keys = self._keys_for(chat_id)
+            keys = self._keys_for(chat_id, user_id)
             if not keys:
                 return False
-            batches: list[tuple[list[IncomingPhoto], Any]] = []
+            batches: list[tuple[AlbumKey, list[IncomingPhoto], Any]] = []
             for key in keys:
                 task = self._tasks.pop(key, None)
                 if task is not None and not task.done():
                     task.cancel()
                 photos = self._buf.pop(key, [])
                 services = self._latest.pop(key, None)
-                batches.append((photos, services))
+                batches.append((key, photos, services))
         delivered = False
-        for photos, services in batches:
-            if not photos or services is None:
+        for key, photos, services in batches:
+            claimed, failed_closed = await self._claim_photos(key, photos)
+            if failed_closed:
+                await _notify_album_lost(services)
+                delivered = True
                 continue
-            built = assemble_album(photos, caption_override=text)
+            if claimed is None or not claimed or services is None:
+                continue
+            built = assemble_album(claimed, caption_override=text)
             await on_ready(built, services)
             delivered = True
         return delivered
 
-    async def _fire(self, key: tuple[int, str], on_ready: ReadyCallback) -> None:
+    async def _fire(self, key: AlbumKey, on_ready: ReadyCallback) -> None:
         try:
             await asyncio.sleep(self.debounce)
         except asyncio.CancelledError:
             return
         async with self._lock:
-            photos = self._buf.pop(key, None)
+            photos = self._buf.pop(key, None) or []
             services = self._latest.pop(key, None)
             self._tasks.pop(key, None)
-        if not photos or services is None:
+        claimed, failed_closed = await self._claim_photos(key, photos)
+        if failed_closed:
+            await _notify_album_lost(services)
             return
-        built = assemble_album(photos)
+        if claimed is None or not claimed or services is None:
+            return
+        built = assemble_album(claimed)
         logger.info(
             "album_flushed",
             chat_id=key[0],
+            user_id=key[1],
             count=len(built.photos),
             trimmed=built.notice is not None,
+            redis=self._redis is not None,
         )
         try:
             await on_ready(built, services)
         except Exception:
-            logger.exception("album_flush_failed", chat_id=key[0])
+            logger.exception("album_flush_failed", chat_id=key[0], user_id=key[1])
+
+
+async def _notify_album_lost(services: Any) -> None:
+    """Redis не отдал альбом: не молчим и не отдаём локальную копию."""
+    message = getattr(services, "message", None)
+    answer = getattr(message, "answer", None)
+    if answer is None:
+        return
+    try:
+        await answer("Не удалось собрать альбом. Пришлите фото ещё раз.")
+    except Exception:
+        logger.exception("album_claim_notify_failed")
 
 
 _hub: AlbumHub | None = None

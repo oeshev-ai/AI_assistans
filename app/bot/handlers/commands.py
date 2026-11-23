@@ -52,12 +52,15 @@ async def cmd_cancel(
     pending_media: PendingMediaStorage,
 ) -> None:
     """Сбрасывает текущий пошаговый ввод. Без шага отвечает, что отменять нечего."""
-    had_album = await get_album_hub().cancel_chat(message.chat.id)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    had_album = await get_album_hub().cancel_chat(message.chat.id, user_id)
     had_pending = False
     try:
         profile = await R._active_profile(message.chat.id, assistant_storage)
-        had_pending = await pending_media.get(message.chat.id, profile.id) is not None
-        await pending_media.clear(message.chat.id, profile.id)
+        had_pending = (
+            await pending_media.get(message.chat.id, profile.id, user_id) is not None
+        )
+        await pending_media.clear(message.chat.id, profile.id, user_id)
     except Exception:
         had_pending = False
     menu = await R._menu_for(message.chat.id, assistant_storage, topic_storage)

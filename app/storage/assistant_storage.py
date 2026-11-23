@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
@@ -23,18 +22,17 @@ from app.llm.models_config import (
     LEGACY_TEXT_MODEL_ALIASES,
     resolve_image_model,
     resolve_text_model,
+    resolve_tts_model,
+)
+from app.llm.video_settings import (
+    coerce_aspect_ratio,
+    coerce_duration,
+    coerce_generate_audio,
+    coerce_resolution,
 )
 from app.storage.history_storage import RedisConfig
 
 logger = structlog.get_logger("AssistantStorage")
-
-
-def legacy_aliases_enabled() -> bool:
-    """``IMAGE_LEGACY_ALIASES=0`` оставляет старый image-id до soft-fallback."""
-    raw = os.getenv("IMAGE_LEGACY_ALIASES")
-    if raw is None or not raw.strip():
-        return True
-    return raw.strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def alias_model(model: str | None, table: dict[str, str], kind: str) -> str | None:
@@ -70,6 +68,16 @@ DEFAULT_SYSTEM_PROMPT = (
     "Если пользователь просит нарисовать, сгенерировать или создать изображение, схему или иллюстрацию, вызови generate_image и не отказывайся. "
     "Если нужно изменить уже присланную картинку — вызови edit_image. "
     "Если просят ролик, клип или видео — вызови generate_video. "
+    "Если у ролика есть референсы — фото пользователя или кадры из generate_image — "
+    "передай их номера в generate_video параметром reference_indexes. "
+    "Номера приходят в ответе generate_image; фото в сообщении нумеруются с нуля. "
+    "В prompt называй их «первая картинка», «вторая картинка» в порядке этих номеров. "
+    "Без reference_indexes в сервис уходит только текст. "
+    "Формат, длительность, разрешение и звук ролика берутся из настроек персоны. "
+    "Если generate_video вернул ошибку, передай её смысл точно. "
+    "Если в ошибке сказано, что попытки скачать готовый ролик продолжатся, "
+    "так и скажи: новая генерация не запускается. "
+    "Если сказано, что ролик не придёт, повтори это и не предлагай просто подождать. "
     "Если просят расшифровать аудио/видео или сделать транскрипт — вызови transcribe_media "
     "(полный текст уйдёт пользователю файлом, не копируй его целиком в ответ). "
     "Если файл слишком большой для Telegram (~20 МБ), не влезает, пользователь просит "
@@ -123,6 +131,12 @@ class AssistantProfile(BaseModel):
     text_model: str | None = None
     image_model: str | None = None
     image_size: str | None = None
+    image_background: Literal["auto", "transparent", "opaque"] | None = None
+    image_as_file: dict[str, bool] = Field(default_factory=dict)
+    video_aspect_ratio: str | None = None
+    video_duration: int | None = None
+    video_resolution: str | None = None
+    video_generate_audio: bool | None = None
     vision_model: str | None = None
     voice_mode: Literal["off", "auto", "always"] = "auto"
     tts_model: str | None = None
@@ -131,11 +145,58 @@ class AssistantProfile(BaseModel):
     tts_format: str | None = None
     stt_language: str | None = None
 
+    @field_validator("image_background", mode="before")
+    @classmethod
+    def _image_background(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        cleaned = str(value).strip().casefold()
+        if cleaned in {"auto", "transparent", "opaque"}:
+            return cleaned
+        return None
+
+    @field_validator("image_as_file", mode="before")
+    @classmethod
+    def _image_as_file(cls, value: object) -> dict[str, bool]:
+        """Какие модели отдавать файлом. Чужие значения не ломают загрузку."""
+        if not isinstance(value, dict):
+            return {}
+        cleaned: dict[str, bool] = {}
+        for key, flag in value.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            if flag is True or (
+                isinstance(flag, str)
+                and flag.strip().casefold() in {"1", "true", "yes"}
+            ):
+                cleaned[key.strip()] = True
+        return cleaned
+
     @field_validator("icon")
     @classmethod
     def _normalize_icon(cls, value: str) -> str:
         cleaned = value.strip() if isinstance(value, str) else ""
         return cleaned or "🤖"
+
+    @field_validator("video_aspect_ratio", mode="before")
+    @classmethod
+    def _video_aspect(cls, value: object) -> str | None:
+        return coerce_aspect_ratio(value)
+
+    @field_validator("video_duration", mode="before")
+    @classmethod
+    def _video_duration(cls, value: object) -> int | None:
+        return coerce_duration(value)
+
+    @field_validator("video_resolution", mode="before")
+    @classmethod
+    def _video_resolution(cls, value: object) -> str | None:
+        return coerce_resolution(value)
+
+    @field_validator("video_generate_audio", mode="before")
+    @classmethod
+    def _video_audio(cls, value: object) -> bool | None:
+        return coerce_generate_audio(value)
 
     @model_validator(mode="after")
     def _alias_legacy_models(self) -> AssistantProfile:
@@ -148,6 +209,11 @@ class AssistantProfile(BaseModel):
         self.vision_model = alias_model(
             self.vision_model, LEGACY_TEXT_MODEL_ALIASES, "text"
         )
+        if self.tts_model:
+            resolved_tts = resolve_tts_model(self.tts_model)
+            if resolved_tts and resolved_tts != self.tts_model:
+                logger.info("tts_model_aliased", old=self.tts_model, new=resolved_tts)
+                self.tts_model = resolved_tts
         return self
 
 
@@ -165,6 +231,9 @@ def _dump_profile(profile: AssistantProfile) -> str:
     return json.dumps(profile.model_dump(), ensure_ascii=False, separators=(",", ":"))
 
 
+_MODEL_FIELDS = ("text_model", "image_model", "vision_model", "tts_model")
+
+
 def _load_profile(raw: str) -> AssistantProfile | None:
     try:
         payload = json.loads(raw)
@@ -175,6 +244,26 @@ def _load_profile(raw: str) -> AssistantProfile | None:
     except (ValueError, TypeError):
         logger.error("Пропущен повреждённый профиль ассистента")
         return None
+
+
+def _aliased_model_fields(
+    raw: str, profile: AssistantProfile
+) -> dict[str, dict[str, str | None]]:
+    """Поля моделей, которые валидатор переписал относительно JSON в Redis."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    drift: dict[str, dict[str, str | None]] = {}
+    for field in _MODEL_FIELDS:
+        before = payload.get(field)
+        stored = before if isinstance(before, str) or before is None else None
+        current = getattr(profile, field)
+        if stored != current:
+            drift[field] = {"old": stored, "new": current}
+    return drift
 
 
 async def _redis_value(value: Awaitable[_T] | _T) -> _T:
@@ -375,6 +464,7 @@ class RedisAssistantStorage(AssistantStorage):
             ) from exc
 
         profiles: dict[str, AssistantProfile] = {}
+        rewritten: list[tuple[str, AssistantProfile]] = []
         if isinstance(raw_map, dict):
             for field, payload in raw_map.items():
                 text = payload if isinstance(payload, str) else str(payload)
@@ -383,6 +473,27 @@ class RedisAssistantStorage(AssistantStorage):
                     continue
                 profile_id = field if isinstance(field, str) else str(field)
                 profiles[profile_id] = loaded
+                if _aliased_model_fields(text, loaded):
+                    rewritten.append((profile_id, loaded))
+        if rewritten:
+            try:
+                pipe = self._redis.pipeline(transaction=True)
+                for profile_id, profile in rewritten:
+                    pipe.hset(hash_key, profile_id, _dump_profile(profile))
+                await pipe.execute()
+            except RedisError as exc:
+                logger.exception(
+                    "Ошибка Redis при записи актуальных моделей, chat_id=%s",
+                    chat_id,
+                )
+                raise AssistantStorageError(
+                    "Профили ассистентов временно недоступны."
+                ) from exc
+            logger.info(
+                "legacy_models_persisted",
+                chat_id=chat_id,
+                profiles=len(rewritten),
+            )
 
         if DEFAULT_ASSISTANT_ID not in profiles:
             default = default_assistant_profile()
@@ -502,10 +613,15 @@ class RedisAssistantStorage(AssistantStorage):
 async def create_assistant_storage(config: RedisConfig) -> AssistantStorage:
     """Возвращает Redis, если ``REDIS_URL`` задан и сервер отвечает.
 
-    Пустой URL или недоступный Redis дают память процесса: бот стартует
-    и без общих профилей.
+    Пустой URL или недоступный Redis дают память процесса вне production.
+    В production — fail-closed (как FSM), без тихой деградации.
     """
+    from app.infra.access import is_production
+
     if not config.redis_url:
+        if is_production():
+            logger.error("assistant_redis_required_in_production")
+            raise SystemExit(1)
         logger.info(
             "REDIS_URL не задан, профили ассистентов хранятся в памяти процесса"
         )
@@ -515,11 +631,14 @@ async def create_assistant_storage(config: RedisConfig) -> AssistantStorage:
     try:
         await storage.ping()
     except AssistantStorageError as exc:
+        await storage.close()
+        if is_production():
+            logger.error("assistant_redis_failed_fatal", error=exc.message)
+            raise SystemExit(1) from exc
         logger.warning(
             "Redis недоступен, профили ассистентов переключены на память процесса: %s",
             exc.message,
         )
-        await storage.close()
         return InMemoryAssistantStorage()
     logger.info(
         "Профили ассистентов хранятся в Redis, ttl_days=%s", _ASSISTANT_TTL_DAYS

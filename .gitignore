@@ -41,11 +41,12 @@ Thumbs.db
 *.jpg
 *.jpeg
 *.webp
-!docs/**
 prompt.md
 
 # Redis RDB backups
 backups/
 
-docs/
 artifacts/
+
+# Внутренние ТЗ и контракты, не для репозитория
+app/docs/

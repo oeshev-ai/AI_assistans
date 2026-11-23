@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
 
 from app.bot import runtime as R
@@ -85,10 +86,14 @@ def _redact_sentry_value(value: Any) -> Any:
 
 
 def filter_sensitive_data(event: Any, hint: dict[str, Any]) -> Any:
-    """Strip secrets and URL passwords from Sentry payloads before upload."""
+    """Strip secrets, URL passwords, and Telegram identity from Sentry payloads."""
     _ = hint
     if not isinstance(event, dict):
         return event
+    event.pop("user", None)
+    contexts = event.get("contexts")
+    if isinstance(contexts, dict):
+        contexts.pop("chat", None)
     return _redact_sentry_value(event)
 
 
@@ -96,7 +101,14 @@ def init_sentry() -> None:
     """Initialize Sentry when ``SENTRY_DSN`` is present."""
     dsn = os.getenv("SENTRY_DSN", "").strip()
     if not dsn:
-        logger.warning("sentry_disabled", reason="SENTRY_DSN not set")
+        if is_production():
+            logger.error(
+                "sentry_disabled",
+                reason="SENTRY_DSN not set",
+                hint="Set SENTRY_DSN in .env for production error tracking",
+            )
+        else:
+            logger.warning("sentry_disabled", reason="SENTRY_DSN not set")
         return
     sentry_sdk.init(
         dsn=dsn,
@@ -113,6 +125,18 @@ def init_sentry() -> None:
     logger.info(
         "sentry_initialized",
         environment=os.getenv("ENVIRONMENT", "development"),
+    )
+
+
+def warn_polza_user_hash_secret() -> None:
+    """In production, plain SHA256 user hashes are dictionary-guessable."""
+    if not is_production():
+        return
+    if (os.getenv("POLZA_USER_HASH_SECRET") or "").strip():
+        return
+    logger.error(
+        "polza_user_hash_secret_missing",
+        hint="Set POLZA_USER_HASH_SECRET in .env for HMAC aliases to Polza",
     )
 
 
@@ -151,8 +175,15 @@ async def create_fsm_storage(redis_url: str) -> BaseStorage:
 
 
 async def _open_shared_redis(redis_url: str) -> Redis | None:
-    """Optional Redis client for rate limits and health checks."""
+    """Shared Redis for rate limits, cost tracker, and upload sessions.
+
+    Required in production (same fail-closed policy as FSM/topics). Outside
+    production an empty or unreachable URL falls back to in-process memory.
+    """
     if not redis_url:
+        if is_production():
+            logger.error("shared_redis_required_in_production")
+            raise SystemExit(1)
         return None
     try:
         client = Redis.from_url(
@@ -164,6 +195,9 @@ async def _open_shared_redis(redis_url: str) -> Redis | None:
         await client.ping()
         return client
     except Exception as exc:
+        if is_production():
+            logger.error("shared_redis_failed_fatal", error=str(exc))
+            raise SystemExit(1) from exc
         logger.warning("shared_redis_unavailable", error=str(exc))
         return None
 
@@ -177,14 +211,14 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     shared_redis = await _open_shared_redis(redis_url)
     rate_limiter.attach_redis(shared_redis)
     cost_tracker.attach_redis(shared_redis)
-    if (
-        is_production()
-        and cost_tracker.daily_budget <= 0
-        and cost_tracker.user_daily_budget <= 0
-    ):
+    cost_tracker.require_llm_budgets_configured()
+    from app.bot.album import get_album_hub
+
+    get_album_hub().attach_redis(shared_redis)
+    if os.getenv("PHOTO_ROUTER_FAST_PATH", "0").strip() == "1":
         logger.warning(
-            "llm_budgets_unlimited_in_production",
-            hint="Set LLM_USER_DAILY_BUDGET_USD (e.g. 1.5) to cap spend",
+            "photo_router_fast_path_enabled",
+            hint="Skips LLM router; forces edit at confidence 1.0 — keep 0 in production",
         )
     await job_queue.init_job_queue(redis_url)
     dispatcher.workflow_data["shared_redis"] = shared_redis
@@ -193,14 +227,18 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
         assistant_storage = await create_assistant_storage(RedisConfig.from_env())
         assistant = AssistAIClient(AssistAIConfig.from_env())
         pending_media = await create_pending_media_storage(redis_url)
-    except ValidationError:
-        logger.exception("bot_config_invalid")
+    except (ValidationError, ValueError) as exc:
+        logger.exception("bot_config_invalid", error=str(exc))
         if pending_media is not None:
             await pending_media.close()
         if assistant_storage is not None:
             await assistant_storage.close()
         if topic_storage is not None:
             await topic_storage.close()
+        try:
+            await job_queue.close_job_queue()
+        except Exception as exc:
+            logger.warning("job_queue_close_failed", error=str(exc))
         if shared_redis is not None:
             await shared_redis.aclose()
         raise
@@ -208,9 +246,45 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["assistant_storage"] = assistant_storage
     dispatcher.workflow_data["assistant"] = assistant
     dispatcher.workflow_data["pending_media"] = pending_media
+    from app.bot.image_retry import bind_image_delivery, image_delivery_loop
+    from app.storage.image_delivery import open_image_delivery_store
 
-    metrics_port = int(os.getenv("METRICS_PORT", "8083"))
-    health_port = int(os.getenv("HEALTH_PORT", "8082"))
+    image_store = open_image_delivery_store(shared_redis)
+    bind_image_delivery(image_store)
+
+    async def _resume_image(provider: str, job_id: str) -> bytes:
+        return await assistant.recover_paid_file(provider, job_id, kind="image")
+
+    image_task = asyncio.create_task(
+        image_delivery_loop(
+            bot, image_store, R._download_image_url, resume=_resume_image
+        )
+    )
+    dispatcher.workflow_data["image_delivery_task"] = image_task
+    from app.bot.video_retry import (
+        bind_video_delivery,
+        download_video_for_retry,
+        video_delivery_loop,
+    )
+    from app.storage.video_delivery import open_video_delivery_store
+
+    video_store = open_video_delivery_store(shared_redis)
+    bind_video_delivery(video_store)
+
+    async def _resume_video(provider: str, job_id: str) -> bytes:
+        return await assistant.recover_paid_file(provider, job_id, kind="video")
+
+    video_task = asyncio.create_task(
+        video_delivery_loop(
+            bot, video_store, download_video_for_retry, resume=_resume_video
+        )
+    )
+    dispatcher.workflow_data["video_delivery_task"] = video_task
+
+    from app.infra.envparse import env_int
+
+    metrics_port = env_int("METRICS_PORT", 8083)
+    health_port = env_int("HEALTH_PORT", 8082)
     start_metrics_server(port=metrics_port)
 
     upload_store = UploadSessionStore(shared_redis)
@@ -254,7 +328,12 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     health_runner = await start_health_server(
         port=health_port,
         redis_client=shared_redis,
-        proxy_probe=assistant.test_connection,
+        proxy_probe=lambda: assistant.probe_provider("proxyapi"),
+        provider_probes={
+            provider_id: functools.partial(assistant.probe_provider, provider_id)
+            for provider_id in assistant.provider_ids()
+            if provider_id != "proxyapi"
+        },
         setup_app=_setup_upload_http,
     )
     dispatcher.workflow_data["health_runner"] = health_runner
@@ -270,7 +349,6 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
             [
                 BotCommand(command="settings", description="Настройки персоны"),
                 BotCommand(command="help", description="Что умеет бот"),
-                BotCommand(command="cancel", description="Отмена мастера"),
             ]
         )
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -280,8 +358,33 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
 
 async def on_shutdown(dispatcher: Dispatcher) -> None:
     """Закрывает клиент LLM, темы и профили, если startup успел их создать."""
+    image_task = dispatcher.workflow_data.get("image_delivery_task")
+    if isinstance(image_task, asyncio.Task):
+        image_task.cancel()
+        try:
+            await image_task
+        except asyncio.CancelledError:
+            pass
+    from app.bot.image_retry import bind_image_delivery
+
+    bind_image_delivery(None)
+    video_task = dispatcher.workflow_data.get("video_delivery_task")
+    if isinstance(video_task, asyncio.Task):
+        video_task.cancel()
+        try:
+            await video_task
+        except asyncio.CancelledError:
+            pass
+    from app.bot.video_retry import bind_video_delivery
+
+    bind_video_delivery(None)
     health_runner = dispatcher.workflow_data.get("health_runner")
     if health_runner is not None:
+        app = getattr(health_runner, "app", None)
+        if app is not None:
+            from app.media.upload_server import drain_upload_tasks
+
+            await drain_upload_tasks(app)
         await health_runner.cleanup()
     await job_queue.close_job_queue()
     assistant = dispatcher.workflow_data.get("assistant")
@@ -338,6 +441,7 @@ async def main() -> None:
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     load_dotenv()
     init_sentry()
+    warn_polza_user_hash_secret()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         logger.error("telegram_token_missing")

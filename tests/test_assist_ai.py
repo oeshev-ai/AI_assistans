@@ -10,16 +10,14 @@ import pytest
 from respx import MockRouter
 
 from app.bot.runtime import _extract_generated_images
-from app.llm.assist_ai import (
-    AssistAIClient,
-    AssistAIError,
-    BaseTool,
-    ImageModelScope,
+from app.llm.assist_ai import AssistAIClient, AssistAIError, ImageModelScope
+from app.llm.chat_runtime import (
     _attach_chat_tools,
     _gpt6_chat_omit_tools,
     _gpt6_chat_tools_need_reasoning_none,
     _ToolCallBuilder,
 )
+from app.llm.tooling import BaseTool
 
 CHAT_URL = "https://api.proxyapi.ru/v1/chat/completions"
 
@@ -470,10 +468,19 @@ async def test_generate_image_tool_packs_url_and_base64(
     assert payload["prompt"] == "кот в шляпе"
     assert payload["image_count"] == 2
     assert payload["images"] == [{"type": "url"}, {"type": "base64"}]
+    assert payload["reference_indexes"] == [0, 1]
     assert "aGVsbG8=" not in json.dumps(payload)
     assert scope.images == [
-        {"type": "url", "value": "https://cdn.example/cat.png"},
-        {"type": "base64", "value": "aGVsbG8="},
+        {
+            "type": "url",
+            "value": "https://cdn.example/cat.png",
+            "model": "openai/gpt-image-2.6-flare",
+        },
+        {
+            "type": "base64",
+            "value": "aGVsbG8=",
+            "model": "openai/gpt-image-2.6-flare",
+        },
     ]
 
 
@@ -505,9 +512,11 @@ async def test_image_model_scope_used_when_tool_omits_model(
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         seen["model"] = model
         seen["prompt"] = prompt
+        seen["background"] = background
         return ["https://cdn.example/cat.png"]
 
     assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
@@ -516,6 +525,12 @@ async def test_image_model_scope_used_when_tool_omits_model(
         payload = json.loads(await tool.execute(prompt="кот"))
 
     assert seen["model"] == "openai/gpt-image-2.6-flare"
+    assert seen["background"] is None
+    assert payload["status"] == "success"
+
+    with ImageModelScope("openai/gpt-image-2.6-flare", background="transparent"):
+        payload = json.loads(await tool.execute(prompt="кот"))
+    assert seen["background"] == "transparent"
     assert payload["status"] == "success"
 
 
@@ -531,9 +546,11 @@ async def test_image_size_scope_used_when_tool_omits_size(
         prompt: str,
         model: str | None = None,
         size: str = "1024x1024",
+        background: str | None = None,
     ) -> list[str]:
         sizes.append(size)
         seen["model"] = model
+        seen["background"] = background
         return ["https://cdn.example/cat.png"]
 
     assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
@@ -651,11 +668,11 @@ async def test_seedream_uses_size_preset_or_width_height(
 
 
 @pytest.mark.asyncio
-async def test_recraft_size_is_aspect_ratio(
+async def test_nano_banana_size_is_image_resolution(
     assist_client: AssistAIClient,
     respx_mock: MockRouter,
 ) -> None:
-    """Recraft предпочитает size в формате w:h."""
+    """Nano Banana передаёт image_resolution (1K/2K/4K)."""
     route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
         return_value=httpx.Response(
             200, json={"data": [{"url": "https://cdn.example/cat.png"}]}
@@ -664,12 +681,13 @@ async def test_recraft_size_is_aspect_ratio(
 
     await assist_client.generate_image(
         "логотип",
-        model="recraft/recraft-v4.1",
-        size="1:1",
+        model="google/gemini-nano-banana-2.1",
+        size="1K",
     )
 
     body = json.loads(route.calls.last.request.content)
-    assert body["size"] == "1:1"
+    assert body["image_resolution"] == "1K"
+    assert "quality" not in body
 
 
 def test_extract_generated_images_matches_tool_call_id() -> None:

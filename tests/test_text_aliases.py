@@ -7,13 +7,17 @@ from types import SimpleNamespace
 import pytest
 
 from app.bot.models import _text_model_of, _vision_model_of
-from app.llm.models_config import LEGACY_TEXT_MODEL_ALIASES
+from app.llm.models_config import (
+    LEGACY_TEXT_MODEL_ALIASES,
+    POLZA_TEXT_MODEL_ALIASES,
+    resolve_polza_text_model,
+)
 from app.storage.assistant_storage import DEFAULT_PERSONA_PROMPT, AssistantProfile
 
 
 def _assistant() -> SimpleNamespace:
     return SimpleNamespace(
-        config=SimpleNamespace(default_text_model="deepseek/deepseek-v4.1-flash")
+        config=SimpleNamespace(default_text_model="deepseek/deepseek-v4.1-flash-1017")
     )
 
 
@@ -69,4 +73,15 @@ def test_text_alias_flag_off_keeps_id_until_fallback(
     assert (
         _text_model_of(profile, assistant, chat_id=4)  # type: ignore[arg-type]
         == assistant.config.default_text_model
+    )
+
+
+@pytest.mark.parametrize(
+    ("bot_id", "polza_id"),
+    sorted(POLZA_TEXT_MODEL_ALIASES.items()),
+)
+def test_polza_text_model_aliases(bot_id: str, polza_id: str) -> None:
+    assert resolve_polza_text_model(bot_id) == polza_id
+    assert resolve_polza_text_model("deepseek/deepseek-v4.1-flash-1017") == (
+        "deepseek/deepseek-v4.1-flash-1017"
     )

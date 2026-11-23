@@ -1,8 +1,8 @@
-"""quality и complexity уходят только моделям OpenAI."""
+"""quality уходит только моделям OpenAI. complexity не отправляется."""
 
 from __future__ import annotations
 
-from app.llm.assist_ai import _image_generation_body
+from app.llm.image_ops import _image_generation_body
 
 
 def test_legacy_pixel_sizes_map_to_current() -> None:
@@ -12,43 +12,38 @@ def test_legacy_pixel_sizes_map_to_current() -> None:
     assert wide["size"] == "1536x1024"
 
 
-def test_openai_gets_quality_and_complexity() -> None:
+def test_openai_gets_quality_without_complexity() -> None:
     body = _image_generation_body(
         "openai/gpt-image-2.6-flare",
         "poster",
         "1024x1024",
         quality="high",
-        complexity="low",
     )
     assert body["quality"] == "high"
-    assert body["complexity"] == "low"
+    assert "complexity" not in body
+    assert "background" not in body
+    with_background = _image_generation_body(
+        "openai/gpt-image-2.6-flare",
+        "poster",
+        "1024x1024",
+        quality="high",
+        background="transparent",
+    )
+    assert with_background["background"] == "transparent"
 
 
 def test_other_families_omit_openai_params() -> None:
     for model, size in (
         ("black-forest-labs/flux-3-image", "1K"),
         ("qwen/qwen-image-2.1-pro", "1:1"),
-        ("recraft/recraft-v4.1", "1:1"),
+        ("google/gemini-nano-banana-2.1", "1K"),
     ):
         body = _image_generation_body(
             model,
             "poster",
             size,
             quality="high",
-            complexity="high",
         )
         assert "quality" not in body
         assert "complexity" not in body
-
-
-def test_send_complexity_flag_drops_the_field() -> None:
-    body = _image_generation_body(
-        "openai/gpt-image-2.6-flare",
-        "poster",
-        "1024x1024",
-        quality="high",
-        complexity="low",
-        send_complexity=False,
-    )
-    assert body["quality"] == "high"
-    assert "complexity" not in body
+        assert "background" not in body

@@ -9,11 +9,10 @@ from app.llm.assist_ai import AssistAIConfig
 
 
 def test_edit_model_from_env_aliases_to_flare(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "app.llm.assist_ai.load_dotenv", lambda *_args, **_kwargs: False
-    )
+    monkeypatch.setattr("app.llm.config.load_dotenv", lambda *_args, **_kwargs: False)
     monkeypatch.setenv("PROXYAPI_API_KEY", "test-key")
-    monkeypatch.setenv("PROXYAPI_IMAGE_EDIT_MODEL", "openai/gpt-image-2.5-flare")
+    monkeypatch.setenv("POLZA_API_KEY", "test-polza-key")
+    monkeypatch.setenv("IMAGE_EDIT_MODEL", "openai/gpt-image-2.5-flare")
     monkeypatch.setenv("IMAGE_LEGACY_ALIASES", "1")
     with structlog.testing.capture_logs() as logs:
         config = AssistAIConfig.from_env()

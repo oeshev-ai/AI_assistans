@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from app.bot.constants import (
     _ASPECT_IMAGE_SIZES,
+    _BANANA_IMAGE_SIZES,
     _MENU_ASSISTANTS,
     _MENU_TOPICS,
     _OPENAI_IMAGE_SIZES,
     _TIER_IMAGE_SIZES,
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
-    ELEVENLABS_TTS_VOICES,
     OPENAI_TTS_VOICES,
     PAGE_SIZE,
     SPEECHKIT_VOICES,
@@ -25,13 +25,12 @@ from app.bot.constants import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     image_model_family,
-    is_elevenlabs_tts_model,
     is_speechkit_tts_model,
     logger,
     model_hint,
     resolve_speechkit_voice,
 )
-from app.llm.models_config import resolve_text_model
+from app.llm.models_config import resolve_text_model, resolve_tts_model
 
 
 def _text_model_of(
@@ -113,18 +112,20 @@ def _reply_menu(assistant_name: str, topic_name: str) -> ReplyKeyboardMarkup:
 def _size_choices(model_id: str) -> tuple[str, ...]:
     """Кнопки размера зависят от семейства image-модели."""
     family = image_model_family(model_id)
+    if family == "banana":
+        return _BANANA_IMAGE_SIZES
     if family in {"flux", "seedream"}:
         return _TIER_IMAGE_SIZES
-    if family in {"qwen", "recraft"}:
+    if family == "qwen":
         return _ASPECT_IMAGE_SIZES
     return _OPENAI_IMAGE_SIZES
 
 
 def _default_image_size(model_id: str) -> str:
     family = image_model_family(model_id)
-    if family in {"flux", "seedream"}:
+    if family in {"flux", "seedream", "banana"}:
         return "1K"
-    if family in {"qwen", "recraft"}:
+    if family == "qwen":
         return "1:1"
     return "1024x1024"
 
@@ -135,6 +136,46 @@ def _display_image_size(profile: AssistantProfile, assistant: AssistAIClient) ->
     if profile.image_size in _size_choices(model_id):
         return profile.image_size or _default_image_size(model_id)
     return _default_image_size(model_id)
+
+
+_BACKGROUND_LABELS = {
+    "auto": "авто",
+    "transparent": "прозрачный",
+    "opaque": "непрозрачный",
+}
+
+
+def _image_background_of(
+    profile: AssistantProfile, assistant: AssistAIClient
+) -> str | None:
+    """Фон генерации GPT Image. Для других семейств настройки нет."""
+    model_id = _image_model_of(profile, assistant)
+    if image_model_family(model_id) != "openai":
+        return None
+    stored = profile.image_background
+    if stored in _BACKGROUND_LABELS:
+        return stored
+    return "auto"
+
+
+def _background_label(value: str) -> str:
+    return _BACKGROUND_LABELS.get(value, "авто")
+
+
+def _image_as_file(profile: AssistantProfile, model_id: str | None) -> bool:
+    """Эту модель персона просила присылать файлом, а не фото."""
+    flags = getattr(profile, "image_as_file", None)
+    if (
+        not isinstance(flags, dict)
+        or not isinstance(model_id, str)
+        or not model_id.strip()
+    ):
+        return False
+    return flags.get(model_id.strip()) is True
+
+
+def _image_file_label(enabled: bool) -> str:
+    return "да" if enabled else "нет"
 
 
 def _stored_image_size(profile: AssistantProfile) -> str:
@@ -215,7 +256,8 @@ def _clip_tts_text(text: str) -> str:
 
 def _tts_model_of(profile: AssistantProfile, assistant: AssistAIClient) -> str:
     """Эффективная TTS-модель персоны (пустой выбор = дефолт конфига)."""
-    return profile.tts_model or assistant.config.default_tts_model
+    raw = profile.tts_model or assistant.config.default_tts_model
+    return resolve_tts_model(raw) or raw
 
 
 def _tts_voices_for(
@@ -225,8 +267,6 @@ def _tts_voices_for(
     effective = model_id or assistant.config.default_tts_model
     if is_speechkit_tts_model(effective):
         return SPEECHKIT_VOICES
-    if is_elevenlabs_tts_model(effective):
-        return ELEVENLABS_TTS_VOICES
     return OPENAI_TTS_VOICES
 
 
@@ -269,12 +309,18 @@ def _compatible_tts_voice(
 def _model_keyboard(
     models: tuple[str, ...],
     prefix: str,
+    *,
+    done: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Кнопки моделей. В callback кладётся индекс, не имя."""
     rows = [
         [InlineKeyboardButton(text=model, callback_data=f"{prefix}:{index}")]
         for index, model in enumerate(models)
     ]
+    if done:
+        rows.append(
+            [InlineKeyboardButton(text="Готово", callback_data=done, style="success")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

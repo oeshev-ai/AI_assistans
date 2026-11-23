@@ -1,8 +1,15 @@
-"""Хранилище истории диалогов: Redis или память процесса.
+"""Legacy flat chat history (unused by the bot).
 
-Сообщения лежат в формате OpenAI: ``{"role": "...", "content": "..."}``.
-``AssistAIClient`` получает их как обычный ``list[dict]`` и сам список не
-является хранилищем: в модель уходит копия.
+The bot stores dialogs in ``topic_history.TopicHistoryStorage`` with
+``TOPIC_TTL_DAYS``. This module remains for ``trim_messages``, shared
+``RedisConfig``, and older tests. Do not wire ``ChatHistoryStorage`` into
+new bot paths — prefer topics.
+
+``create_storage`` в production без живого Redis завершает процесс, как
+темы и персоны. Вне production пустой или недоступный URL по-прежнему
+даёт память процесса.
+
+Сообщения: OpenAI ``{"role": "...", "content": "..."}``.
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Awaitable
@@ -380,12 +388,23 @@ class RedisChatHistoryStorage(ChatHistoryStorage):
 
 
 async def create_storage(config: RedisConfig) -> ChatHistoryStorage:
-    """Возвращает Redis, если ``REDIS_URL`` задан и сервер отвечает.
+    """Legacy flat history factory (bot does not call this).
 
-    Пустой URL или недоступный Redis дают память процесса: бот стартует
-    и без общей истории.
+    Prefer ``topic_history.create_topic_storage``. Kept for ``RedisConfig``,
+    ``trim_messages``, and fail-closed tests. Empty/unreachable Redis →
+    in-memory outside production; production stays fail-closed.
     """
+    warnings.warn(
+        "create_storage is legacy; use TopicHistoryStorage / create_topic_storage",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from app.infra.access import is_production
+
     if not config.redis_url:
+        if is_production():
+            logger.error("history_redis_required_in_production")
+            raise SystemExit(1)
         logger.info("REDIS_URL не задан, история диалогов хранится в памяти процесса")
         return InMemoryChatHistoryStorage(config.max_history_length)
 
@@ -393,11 +412,14 @@ async def create_storage(config: RedisConfig) -> ChatHistoryStorage:
     try:
         await storage.ping()
     except HistoryStorageError as exc:
+        await storage.close()
+        if is_production():
+            logger.error("history_redis_failed_fatal: %s", exc.message)
+            raise SystemExit(1) from exc
         logger.warning(
             "Redis недоступен, история диалогов переключена на память процесса: %s",
             exc.message,
         )
-        await storage.close()
         return InMemoryChatHistoryStorage(config.max_history_length)
     logger.info(
         "История диалогов хранится в Redis, ttl_days=%s", config.history_ttl_days
