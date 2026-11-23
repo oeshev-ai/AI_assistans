@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from typing import NoReturn
 from urllib.parse import urlsplit
 
 import structlog
@@ -109,7 +110,7 @@ def _format(scheme: str, host: str, port: int | None) -> str:
     return f"{scheme}://{shown}:{port}"
 
 
-def _reject(host: str | None) -> None:
+def _reject(host: str | None) -> NoReturn:
     logger.error(
         "s3_endpoint_rejected",
         name="YC_S3_ENDPOINT",
@@ -135,7 +136,14 @@ def _assert_resolved(host: str, *, loopback: bool, fatal: bool = True) -> None:
             raise S3StorageError("Не удалось разрешить адрес S3") from exc
         logger.warning("s3_endpoint_dns_failed", host=host, error=type(exc).__name__)
         return
-    addresses = [_address(info[4][0]) for info in infos]
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        raw = info[4][0]
+        # При сборке без IPv6 typeshed даёт sockaddr как (int, bytes).
+        if not isinstance(raw, str):
+            addresses.clear()
+            break
+        addresses.append(_address(raw))
     safe = _is_loopback if loopback else _is_public
     if not addresses or any(not safe(ip) for ip in addresses):
         logger.error("s3_endpoint_private_address", host=host)

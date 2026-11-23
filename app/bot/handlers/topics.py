@@ -118,9 +118,10 @@ async def on_topic_delete_yes(
         assistant_id, topic_id = raw.split(":", 1)
     else:
         topic_id = raw
-        assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
-        if assistant_id is None:
+        resolved_id = await R._persona_id_for_query(query, message, assistant_storage)
+        if resolved_id is None:
             return
+        assistant_id = resolved_id
     if not assistant_id or not topic_id:
         await query.answer("Тема не найдена.", show_alert=True)
         return
