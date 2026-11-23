@@ -278,9 +278,7 @@ class InMemoryPendingMediaStorage(PendingMediaStorage):
     async def clear_user(self, chat_id: int, user_id: int) -> bool:
         async with self._lock:
             keys = [
-                key
-                for key in self._items
-                if key[0] == chat_id and key[1] == user_id
+                key for key in self._items if key[0] == chat_id and key[1] == user_id
             ]
             for key in keys:
                 self._items.pop(key, None)

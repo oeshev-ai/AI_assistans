@@ -54,15 +54,11 @@ async def test_dns_to_private_is_rejected(monkeypatch: pytest.MonkeyPatch) -> No
 async def test_redirect_is_not_followed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "app.llm.media_api.socket.getaddrinfo",
-        lambda *_a, **_k: [
-            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))
-        ],
+        lambda *_a, **_k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
     )
     # Pin подменяет netloc на публичный IP; Host/SNI остаются cdn.example.
     route = respx.get("https://8.8.8.8/out.png").mock(
-        return_value=httpx.Response(
-            302, headers={"Location": "http://127.0.0.1/steal"}
-        )
+        return_value=httpx.Response(302, headers={"Location": "http://127.0.0.1/steal"})
     )
     with pytest.raises(AssistAIError):
         await download_public_image(
@@ -78,9 +74,7 @@ async def test_redirect_is_not_followed(monkeypatch: pytest.MonkeyPatch) -> None
 async def test_public_cdn_bytes_returned(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "app.llm.media_api.socket.getaddrinfo",
-        lambda *_a, **_k: [
-            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))
-        ],
+        lambda *_a, **_k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
     )
     respx.get("https://8.8.8.8/out.png").mock(
         return_value=httpx.Response(200, content=b"PNGDATA")

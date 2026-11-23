@@ -99,7 +99,9 @@ async def test_delete_persona_profile_first_then_topics(
     monkeypatch.setattr(assistants, "delete_assistant", track_delete)
     monkeypatch.setattr(topics, "delete_assistant_topics", track_topics)
     monkeypatch.setattr(runtime, "_query_message", lambda q: q.message)
-    monkeypatch.setattr(runtime, "_active_profile", AsyncMock(return_value=default_assistant_profile()))
+    monkeypatch.setattr(
+        runtime, "_active_profile", AsyncMock(return_value=default_assistant_profile())
+    )
     monkeypatch.setattr(runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace()))
     monkeypatch.setattr(runtime, "_edit_inline", AsyncMock())
     monkeypatch.setattr(handlers.screens, "_settings_hub_view", lambda *_a: ("t", None))

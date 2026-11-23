@@ -85,9 +85,7 @@ async def test_cancel_clears_pending_for_all_personas(
             return False
 
     monkeypatch.setattr(commands, "get_album_hub", lambda: _Hub())
-    monkeypatch.setattr(
-        runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace())
-    )
+    monkeypatch.setattr(runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace()))
     monkeypatch.setattr(runtime, "_apply_reply_menu", AsyncMock())
     monkeypatch.setattr(runtime, "_reset_flow", AsyncMock())
 

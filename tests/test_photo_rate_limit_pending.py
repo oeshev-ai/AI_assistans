@@ -52,9 +52,7 @@ async def test_deliver_album_clears_pending_on_text_rate_limit(
     monkeypatch.setattr(flow, "rate_limiter", _Limiter())
 
     built = AlbumBuild(
-        photos=[
-            IncomingPhoto(message_id=1, file_id="f1", size=10, caption="поправь")
-        ],
+        photos=[IncomingPhoto(message_id=1, file_id="f1", size=10, caption="поправь")],
         caption="поправь",
         notice=None,
         error=None,
