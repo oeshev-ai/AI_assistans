@@ -12,6 +12,7 @@ from prometheus_client import REGISTRY
 
 from app.infra import cost_tracker as ct
 from app.infra.cost_tracker import LLM_SPEND_USD, CostTracker
+from app.infra.settings import get_settings
 from app.llm.assist_ai import AssistAIClient
 from tests.polza_helpers import make_polza_provider
 
@@ -78,7 +79,7 @@ def test_usage_tokens_then_table_then_flat() -> None:
         1, model=_FLARE, quality="auto", size="auto"
     )
     assert flat.source == "flat"
-    assert flat.amount_usd == pytest.approx(ct.IMAGE_USD)
+    assert flat.amount_usd == pytest.approx(get_settings().cost_image_usd)
 
 
 def test_multiplier_applies_to_non_rub_sources_only() -> None:
@@ -96,14 +97,14 @@ def test_multiplier_applies_to_non_rub_sources_only() -> None:
 
 
 def test_non_openai_uses_flat_map_and_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ct, "IMAGE_FLUX_USD", 0.04)
-    monkeypatch.setattr(ct, "IMAGE_FLAT_MAP", {_FLUX.casefold(): 0.004})
+    monkeypatch.setenv("COST_IMAGE_FLUX_USD", "0.04")
+    monkeypatch.setenv("COST_IMAGE_FLAT_MAP", f'{{"{_FLUX}": 0.004}}')
     mapped = CostTracker.estimate_image_cost_detailed(1, model=_FLUX)
     assert mapped.source == "flat"
     assert mapped.amount_usd == pytest.approx(0.004)
     other = CostTracker.estimate_image_cost(1, model="recraft/recraft-v3")
     assert other == pytest.approx(0.04)
-    monkeypatch.setattr(ct, "IMAGE_FLAT_MAP", {})
+    monkeypatch.delenv("COST_IMAGE_FLAT_MAP")
     assert CostTracker.estimate_image_cost(1, model=_FLUX) == pytest.approx(0.04)
 
 
@@ -117,9 +118,11 @@ def test_flat_map_parsing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reserve_equals_fact_after_record() -> None:
+async def test_reserve_equals_fact_after_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_DAILY_BUDGET_USD", "100")
     tracker = CostTracker()
-    tracker.daily_budget = 100.0
     polza = make_polza_provider()
     reserved = tracker.estimate_image_cost(
         1,

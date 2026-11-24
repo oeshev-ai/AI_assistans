@@ -232,3 +232,43 @@ def test_payload_ttl_covers_job_timeout(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ARQ_JOB_TIMEOUT", "900")
     monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
     assert job_queue._payload_ttl_seconds() == 1020
+
+
+def test_payload_ttl_covers_queue_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    monkeypatch.setenv("ARQ_MAX_JOBS", "10")
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    # 30 в очереди: волна in-progress + 3 пачки по 10 слотов.
+    assert job_queue._payload_ttl_seconds(30) == 4 * 450 + 120
+    assert job_queue._payload_ttl_seconds(0) == 600
+
+
+@pytest.mark.asyncio
+async def test_staged_payload_ttl_reads_queue_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    monkeypatch.setenv("ARQ_MAX_JOBS", "10")
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+
+    class Pool:
+        async def zcard(self, key: str) -> int:
+            assert key == "arq:queue"
+            return 30
+
+    assert await job_queue._staged_payload_ttl(Pool()) == 4 * 450 + 120
+
+
+@pytest.mark.asyncio
+async def test_staged_payload_ttl_ignores_depth_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    monkeypatch.setenv("ARQ_MAX_JOBS", "10")
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+
+    class Pool:
+        async def zcard(self, _key: str) -> int:
+            raise ConnectionError("redis down")
+
+    assert await job_queue._staged_payload_ttl(Pool()) == 600

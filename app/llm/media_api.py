@@ -16,7 +16,7 @@ from urllib.parse import quote, urlparse, urlunparse
 import httpx
 import structlog
 
-from app.infra.cost_tracker import VIDEO_USD, cost_tracker, extract_cost_rub
+from app.infra.cost_tracker import cost_tracker, extract_cost_rub, video_usd
 from app.infra.metrics import note_provider_fallback
 from app.infra.security import security
 from app.llm import polza_media
@@ -131,6 +131,9 @@ class VideoResult:
 # Seedance 2.0: до 9 изображений-референсов и на Polza, и на ProxyAPI.
 VIDEO_MAX_REFERENCE_IMAGES = 9
 VIDEO_REFERENCE_MAX_BYTES = 10 * 1024 * 1024
+# Совпадает с app.llm.vision.MAX_IMAGE_SIZE_MB. Видео — запас над лимитом Bot API.
+CDN_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+CDN_VIDEO_MAX_BYTES = 64 * 1024 * 1024
 _IMAGE_MIME = {
     "image/jpeg": "image/jpeg",
     "image/jpg": "image/jpeg",
@@ -509,6 +512,7 @@ async def _download_public_cdn(
                 attempts=attempts,
                 kind=kind,
                 fail_message=fail_message,
+                max_bytes=_cdn_max_bytes(kind),
             )
         except AssistAIError as exc:
             last_code = exc.error_code or last_code
@@ -545,6 +549,48 @@ async def _download_public_cdn(
     )
 
 
+def _cdn_max_bytes(kind: str) -> int:
+    """Потолок тела CDN: картинки отдельно от роликов."""
+    if kind == "image":
+        return CDN_IMAGE_MAX_BYTES
+    return CDN_VIDEO_MAX_BYTES
+
+
+async def _read_capped_body(
+    response: httpx.Response, max_bytes: int, message: str
+) -> bytes:
+    """Читает тело потоком и обрывает его, если оно больше ``max_bytes``."""
+    declared = response.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > max_bytes:
+                logger.warning(
+                    "cdn_payload_too_large",
+                    declared=declared,
+                    max_bytes=max_bytes,
+                )
+                raise AssistAIError(
+                    message,
+                    error_code="PAYLOAD_TOO_LARGE",
+                    job_committed=True,
+                )
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            logger.warning("cdn_payload_too_large", total=total, max_bytes=max_bytes)
+            raise AssistAIError(
+                message,
+                error_code="PAYLOAD_TOO_LARGE",
+                job_committed=True,
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _fetch_public_cdn(
     url: str,
     pinned_ips: tuple[str, ...],
@@ -553,9 +599,11 @@ async def _fetch_public_cdn(
     attempts: int = 2,
     kind: str = "video",
     fail_message: str | None = None,
+    max_bytes: int | None = None,
 ) -> bytes:
     """GET без ключа провайдера. Приватный адрес сюда не доходит."""
     message = fail_message or video_user_error("download")
+    limit = max_bytes if max_bytes is not None else _cdn_max_bytes(kind)
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").strip()
     request_url = url
@@ -575,8 +623,13 @@ async def _fetch_public_cdn(
                 verify=_ssl_context(),
                 headers=headers,
             ) as anon:
-                response = await anon.get(request_url, extensions=extensions or None)
-                response.raise_for_status()
+                async with anon.stream(
+                    "GET", request_url, extensions=extensions or None
+                ) as response:
+                    response.raise_for_status()
+                    data = await _read_capped_body(response, limit, message)
+        except AssistAIError:
+            raise
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code
             if code in {403, 404, 410}:
@@ -589,8 +642,8 @@ async def _fetch_public_cdn(
         except httpx.HTTPError as exc:
             last = exc
         else:
-            if response.content:
-                return bytes(response.content)
+            if data:
+                return data
         if attempt < tries:
             logger.warning("cdn_download_retry", kind=kind, attempt=attempt)
             await asyncio.sleep(_VIDEO_RETRY_PAUSE)
@@ -691,7 +744,7 @@ class MediaApiMixin(ProviderTransportMixin):
             connect=self.config.timeout,
         )
 
-        await cost_tracker.check_budget(estimated=VIDEO_USD)
+        await cost_tracker.check_budget(estimated=video_usd())
         try:
             checked_refs = checked_video_references(references)
 
@@ -731,7 +784,7 @@ class MediaApiMixin(ProviderTransportMixin):
                 generate_audio=generate_audio,
             )
             result = await self._video_with_fallback(attempt)
-            amount = result.cost_usd if result.cost_usd is not None else VIDEO_USD
+            amount = result.cost_usd if result.cost_usd is not None else video_usd()
             await cost_tracker.record(
                 kind="video",
                 amount_usd=amount,
@@ -750,7 +803,7 @@ class MediaApiMixin(ProviderTransportMixin):
                     provider_id = primary.id
                 await cost_tracker.record(
                     kind="video",
-                    amount_usd=VIDEO_USD,
+                    amount_usd=video_usd(),
                     provider=provider_id,
                     model=catalog_model,
                     source="flat",

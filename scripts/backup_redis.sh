@@ -17,21 +17,22 @@ TARGET="${BACKUP_DIR}/dump-${STAMP}.rdb"
 
 mkdir -p "${BACKUP_DIR}"
 
-AUTH_ARGS=""
+# REDISCLI_AUTH is read by redis-cli and stays out of argv (unlike -a, which
+# shows up in ps). Empty password must not set the variable.
 if [ -n "${REDIS_PASSWORD}" ]; then
-  AUTH_ARGS="-a ${REDIS_PASSWORD}"
+  REDISCLI_AUTH="${REDIS_PASSWORD}"
+  export REDISCLI_AUTH
 fi
 
 echo "Triggering BGSAVE on ${REDIS_HOST}:${REDIS_PORT}..."
-# shellcheck disable=SC2086
-redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" ${AUTH_ARGS} BGSAVE >/dev/null
+redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" BGSAVE >/dev/null
 
 # Wait until lastsave advances (max ~60s).
-BEFORE="$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" ${AUTH_ARGS} LASTSAVE)"
+BEFORE="$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" LASTSAVE)"
 i=0
 while [ "$i" -lt 60 ]; do
   sleep 1
-  NOW="$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" ${AUTH_ARGS} LASTSAVE)"
+  NOW="$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" LASTSAVE)"
   if [ "${NOW}" != "${BEFORE}" ]; then
     break
   fi
@@ -40,8 +41,7 @@ done
 
 # Prefer --rdb when available (Redis 6+ redis-cli).
 if redis-cli --version >/dev/null 2>&1; then
-  # shellcheck disable=SC2086
-  if redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" ${AUTH_ARGS} --rdb "${TARGET}"; then
+  if redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" --rdb "${TARGET}"; then
     echo "Saved ${TARGET}"
   else
     echo "redis-cli --rdb failed; trying docker volume copy fallback is required manually" >&2

@@ -19,16 +19,14 @@ _MODEL = "openai/gpt-image-2.6-flare"
 
 
 @pytest.fixture(autouse=True)
-async def _reset_spend() -> AsyncIterator[None]:
-    cost_tracker.daily_budget = 10.0
-    cost_tracker.user_daily_budget = 10.0
+async def _reset_spend(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    monkeypatch.setenv("LLM_DAILY_BUDGET_USD", "10")
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "10")
     cost_tracker._memory.clear()
     await cost_tracker.release_reservation()
     set_billing_user(None)
     yield
     await cost_tracker.release_reservation()
-    cost_tracker.daily_budget = 0.0
-    cost_tracker.user_daily_budget = 0.0
     cost_tracker._memory.clear()
     set_billing_user(None)
 

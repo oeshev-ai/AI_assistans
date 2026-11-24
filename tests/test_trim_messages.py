@@ -72,3 +72,38 @@ def test_trim_keeps_system_and_aligns_to_user() -> None:
     assert out[1]["role"] == "user"
     assert out[1]["content"] == "next"
     assert not any(item.get("role") == "tool" for item in out)
+
+
+def test_long_tool_round_keeps_its_user_instead_of_only_system() -> None:
+    tool_calls = [
+        {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "generate_image", "arguments": "{}"},
+        }
+    ]
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "older"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "draw"},
+        {"role": "assistant", "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": "c1", "content": "1"},
+        {"role": "tool", "tool_call_id": "c1", "content": "2"},
+        {"role": "tool", "tool_call_id": "c1", "content": "3"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    out = trim_messages(messages, 4)
+
+    assert [item["role"] for item in out] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+    assert out[1]["content"] == "draw"
+    assert out[-1]["content"] == "done"

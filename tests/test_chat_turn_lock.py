@@ -1,0 +1,61 @@
+"""Лок хода чата живёт, пока есть активный или ожидающий ход."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterator
+
+import pytest
+
+from app.bot import runtime
+
+
+@pytest.fixture(autouse=True)
+def _clear_chat_turn_locks() -> Iterator[None]:
+    runtime._chat_turn_locks.clear()
+    yield
+    runtime._chat_turn_locks.clear()
+
+
+@pytest.mark.asyncio
+async def test_idle_chat_drops_its_lock() -> None:
+    async with runtime._chat_turn(7):
+        assert 7 in runtime._chat_turn_locks
+    assert runtime._chat_turn_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_overlapping_turns_share_one_lock_then_drop_it() -> None:
+    order: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def first() -> None:
+        async with runtime._chat_turn(3):
+            order.append("first-in")
+            started.set()
+            await release.wait()
+            order.append("first-out")
+
+    async def second() -> None:
+        await started.wait()
+        async with runtime._chat_turn(3):
+            order.append("second-in")
+
+    held = asyncio.create_task(first())
+    await started.wait()
+    waiting = asyncio.create_task(second())
+    for _ in range(50):
+        gate = runtime._chat_turn_locks.get(3)
+        if gate is not None and gate.users == 2:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("второй ход не встал в очередь")
+
+    assert len(runtime._chat_turn_locks) == 1
+    release.set()
+    await held
+    await waiting
+    assert order == ["first-in", "first-out", "second-in"]
+    assert runtime._chat_turn_locks == {}

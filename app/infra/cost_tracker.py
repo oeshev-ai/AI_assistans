@@ -23,7 +23,21 @@ if TYPE_CHECKING:
 logger = structlog.get_logger("cost_tracker")
 
 _billing_user_id: ContextVar[int | None] = ContextVar("billing_user_id", default=None)
-_reserved_usd: ContextVar[float] = ContextVar("cost_reserved_usd", default=0.0)
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetHold:
+    """Сумма резерва и день UTC, на который она легла в Redis."""
+
+    usd: float
+    day: str
+
+
+# День хранится рядом с суммой: record/release не пересчитывают «сегодня»,
+# иначе после полуночи дельта уходит в новый день, а резерв старого висит до TTL.
+_budget_holds: ContextVar[tuple[BudgetHold, ...]] = ContextVar(
+    "cost_budget_holds", default=()
+)
 
 # Atomically reserve ``estimated`` against optional global/user daily caps.
 # KEYS[1]=day, KEYS[2]=user (ignored when ARGV[5]=0).
@@ -74,14 +88,48 @@ async def isolated_budget_reservation() -> AsyncIterator[None]:
     ``ContextVar`` reservation. Without isolation each child ``record`` would
     release the parent's Redis hold and undercount spend.
     """
-    token = _reserved_usd.set(0.0)
+    token = _budget_holds.set(())
     try:
         yield
     finally:
         try:
             await cost_tracker.release_reservation()
         finally:
-            _reserved_usd.reset(token)
+            _budget_holds.reset(token)
+
+
+def _reserved_amount() -> float:
+    return sum(hold.usd for hold in _budget_holds.get())
+
+
+def _add_hold(usd: float, day: str) -> None:
+    holds = _budget_holds.get()
+    if holds and holds[-1].day == day:
+        previous = holds[-1]
+        _budget_holds.set((*holds[:-1], BudgetHold(previous.usd + usd, day)))
+        return
+    _budget_holds.set((*holds, BudgetHold(usd, day)))
+
+
+def _split_holds(
+    holds: tuple[BudgetHold, ...], take: float
+) -> tuple[tuple[BudgetHold, ...], dict[str, float]]:
+    """Списать ``take`` с резервов по порядку. Остаток и сумма по каждому дню."""
+    left = take
+    kept: list[BudgetHold] = []
+    burned: dict[str, float] = {}
+    for hold in holds:
+        if left <= 0:
+            kept.append(hold)
+            continue
+        used = min(hold.usd, left)
+        left -= used
+        if used:
+            burned[hold.day] = burned.get(hold.day, 0.0) + used
+        rest = hold.usd - used
+        if rest > 0:
+            kept.append(BudgetHold(rest, hold.day))
+    return tuple(kept), burned
 
 
 LLM_SPEND_USD = Counter(
@@ -103,17 +151,6 @@ LLM_BUDGET_REMAINING = Gauge(
     "llm_daily_budget_remaining_usd",
     "Remaining global daily LLM budget in USD",
 )
-
-# Approximate ProxyAPI / OpenAI-class rates (USD).
-_rates = get_settings()
-CHAT_INPUT_PER_1K = _rates.cost_chat_input_per_1k
-CHAT_OUTPUT_PER_1K = _rates.cost_chat_output_per_1k
-IMAGE_USD = _rates.cost_image_usd
-# FLUX klein ~1–2 ₽ → ~0.005 условных USD при RUB_PER_USD=304.
-# Уточнять по дашборду: Δ₽ / N / RUB_PER_USD → COST_IMAGE_FLAT_MAP.
-IMAGE_FLUX_USD = _rates.cost_image_flux_usd
-# Условный USD ↔ реальные ₽ (из прайса ProxyAPI: 1520/5, 9100/30, 2430/8).
-RUB_PER_USD = _rates.cost_rub_per_usd
 
 
 def extract_cost_rub(usage: dict[str, Any] | None) -> float | None:
@@ -155,7 +192,7 @@ def chat_cost_usd(
     """
     rub = extract_cost_rub(usage)
     if rub is not None:
-        rate = rub_per_usd if rub_per_usd > 0 else RUB_PER_USD
+        rate = rub_per_usd if rub_per_usd > 0 else get_settings().cost_rub_per_usd
         return rub / rate, "cost_rub", rub
     multiplier = provider.cost_multiplier if provider is not None else 1.0
     if multiplier < 0:
@@ -236,23 +273,22 @@ def _parse_flat_map(raw: str | None) -> dict[str, float]:
     return result
 
 
-# Per-model flat USD when usage missing; empty → COST_IMAGE_FLUX_USD for non-OpenAI.
-IMAGE_FLAT_MAP: dict[str, float] = _parse_flat_map(_rates.cost_image_flat_map)
-
-
 def flat_image_usd(model: str | None) -> float:
-    """Плоская ставка за картинку не-OpenAI модели: карта, затем ``COST_IMAGE_FLUX_USD``."""
+    """Плоская ставка за картинку не-OpenAI модели: карта, затем ``COST_IMAGE_FLUX_USD``.
+
+    FLUX klein ~1–2 ₽ → ~0.005 условных USD при RUB_PER_USD=304.
+    Уточнять по дашборду: Δ₽ / N / RUB_PER_USD → COST_IMAGE_FLAT_MAP.
+    Карта и запасная ставка читаются из окружения при вызове.
+    """
+    settings = get_settings()
     if model:
-        found = IMAGE_FLAT_MAP.get(model.strip().casefold())
+        flat_map = _parse_flat_map(settings.cost_image_flat_map)
+        found = flat_map.get(model.strip().casefold())
         if found is not None:
             return found
-    return IMAGE_FLUX_USD
+    return settings.cost_image_flux_usd
 
 
-IMAGE_OUT_USD_PER_1M = _rates.image_out_usd_per_1m
-IMAGE_IN_USD_PER_1M = _rates.image_in_usd_per_1m
-TEXT_IN_USD_PER_1M = _rates.text_in_usd_per_1m
-TEXT_OUT_USD_PER_1M = _rates.text_out_usd_per_1m
 # Выходные токены GPT Image. Измерено: 1024²/low=824, 1024×1536 и 1536×1024/high=1353.
 # Остальные пары — оценка калькулятора, не проверяли. Ориентация токены не меняет.
 _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
@@ -268,9 +304,11 @@ _IMAGE_OUTPUT_TOKENS: dict[tuple[str, str], int] = {
     ("1024x1536", "max"): 5488,  # оценка
 }
 IMAGE_INPUT_TOKEN_CAP = 1536  # наблюдение: 12 MP → 1452 (44×33); берём верхнюю границу
-VIDEO_USD = _rates.cost_video_usd
-STT_PER_MINUTE = _rates.cost_stt_per_minute
-TTS_PER_1K_CHARS = _rates.cost_tts_per_1k_chars
+
+
+def video_usd() -> float:
+    """Плоская ставка видео. Читается из окружения при вызове."""
+    return get_settings().cost_video_usd
 
 
 def _openai_image_model(model: str) -> bool:
@@ -331,11 +369,12 @@ def cost_from_usage(usage: dict[str, Any]) -> float:
     text_out = _token_count(details_out.get("text_tokens", 0))
     if text_out:
         logger.warning("image_text_output_tokens", tokens=text_out)
+    settings = get_settings()
     return (
-        text_in * TEXT_IN_USD_PER_1M
-        + image_in * IMAGE_IN_USD_PER_1M
-        + image_out * IMAGE_OUT_USD_PER_1M
-        + text_out * TEXT_OUT_USD_PER_1M
+        text_in * settings.text_in_usd_per_1m
+        + image_in * settings.image_in_usd_per_1m
+        + image_out * settings.image_out_usd_per_1m
+        + text_out * settings.text_out_usd_per_1m
     ) / 1_000_000
 
 
@@ -378,9 +417,16 @@ class CostTracker:
         self._redis: Any | None = None
         self._memory: dict[str, float] = {}
         self._lock = asyncio.Lock()
-        settings = get_settings()
-        self.daily_budget = settings.llm_daily_budget_usd
-        self.user_daily_budget = settings.llm_user_daily_budget_usd
+
+    @property
+    def daily_budget(self) -> float:
+        """Глобальный дневной потолок. Читается из окружения при обращении."""
+        return get_settings().llm_daily_budget_usd
+
+    @property
+    def user_daily_budget(self) -> float:
+        """Дневной потолок пользователя. Читается из окружения при обращении."""
+        return get_settings().llm_user_daily_budget_usd
 
     def attach_redis(self, redis_client: Any | None) -> None:
         self._redis = redis_client
@@ -425,9 +471,10 @@ class CostTracker:
             prompt_tokens = max(1, input_chars // 4) if input_chars else 0
         if completion_tokens is None:
             completion_tokens = max(1, output_chars // 4) if output_chars else 0
+        settings = get_settings()
         return (
-            prompt_tokens / 1000.0 * CHAT_INPUT_PER_1K
-            + completion_tokens / 1000.0 * CHAT_OUTPUT_PER_1K
+            prompt_tokens / 1000.0 * settings.cost_chat_input_per_1k
+            + completion_tokens / 1000.0 * settings.cost_chat_output_per_1k
         )
 
     @staticmethod
@@ -450,7 +497,12 @@ class CostTracker:
         для Polza — доля от прайса OpenAI), поэтому резерв и факт на одной шкале.
         """
         copies = max(1, count)
-        rate = rub_per_usd if rub_per_usd and rub_per_usd > 0 else RUB_PER_USD
+        settings = get_settings()
+        rate = (
+            rub_per_usd
+            if rub_per_usd and rub_per_usd > 0
+            else settings.cost_rub_per_usd
+        )
         multiplier = provider.cost_multiplier if provider is not None else 1.0
         priced = _priced_rub(cost_rub, usage)
         if priced is not None:
@@ -464,9 +516,11 @@ class CostTracker:
             return ImageCostEstimate(from_usage * multiplier, "usage")
         tokens = _image_output_tokens(quality, size)
         if tokens is None:
-            return ImageCostEstimate(IMAGE_USD * copies * multiplier, "flat")
+            return ImageCostEstimate(
+                settings.cost_image_usd * copies * multiplier, "flat"
+            )
         return ImageCostEstimate(
-            copies * tokens * IMAGE_OUT_USD_PER_1M / 1_000_000 * multiplier,
+            copies * tokens * settings.image_out_usd_per_1m / 1_000_000 * multiplier,
             "table",
         )
 
@@ -496,11 +550,11 @@ class CostTracker:
 
     @staticmethod
     def estimate_stt_cost(duration_seconds: float) -> float:
-        return max(0.0, duration_seconds) / 60.0 * STT_PER_MINUTE
+        return max(0.0, duration_seconds) / 60.0 * get_settings().cost_stt_per_minute
 
     @staticmethod
     def estimate_tts_cost(text: str) -> float:
-        return max(1, len(text)) / 1000.0 * TTS_PER_1K_CHARS
+        return max(1, len(text)) / 1000.0 * get_settings().cost_tts_per_1k_chars
 
     async def check_budget(
         self, user_id: int | None = None, estimated: float = 0.0
@@ -550,7 +604,7 @@ class CostTracker:
             raise BudgetExceededError(
                 "⚠️ Ваш дневной лимит запросов к LLM исчерпан. Попробуйте завтра."
             )
-        _reserved_usd.set(_reserved_usd.get() + estimated)
+        _add_hold(estimated, day)
         if self.daily_budget > 0:
             spent = await self._get(day_key)
             LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
@@ -563,27 +617,13 @@ class CostTracker:
         """
         if user_id is None:
             user_id = get_billing_user()
-        reserved = _reserved_usd.get()
+        holds = _budget_holds.get()
+        reserved = _reserved_amount()
         if reserved <= 0:
             return 0.0
-        day = self._day_key()
-        day_key = f"cost:day:{day}"
-        user_key = f"cost:user:{user_id}:day:{day}" if user_id is not None else ""
-        ttl = 3 * 86400
-        day_delta, user_delta, has_user = self._release_deltas(
-            reserved, user_id=user_id
-        )
-        await self._settle(
-            day_key=day_key,
-            user_key=user_key if has_user else "",
-            day_delta=day_delta,
-            user_delta=user_delta,
-            ttl_seconds=ttl,
-        )
-        _reserved_usd.set(0.0)
-        if self.daily_budget > 0:
-            spent = await self._get(day_key)
-            LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
+        await self._release_holds(holds, user_id)
+        _budget_holds.set(())
+        await self._refresh_remaining_gauge()
         logger.info(
             "llm_reservation_released",
             amount_usd=round(reserved, 6),
@@ -635,50 +675,46 @@ class CostTracker:
     ) -> None:
         """Persist spend and update Prometheus counters.
 
-        Settles against the current ``check_budget`` hold in one Redis
-        transaction: burns ``min(reserved, amount)`` from the hold and applies
-        only the residual delta. Remaining hold stays for later rounds of the
-        same turn (tool loops) until ``release_reservation``.
+        Settles against the current ``check_budget`` hold: burns
+        ``min(reserved, amount)`` from the hold and applies only the residual
+        delta. The hold keeps the UTC day it was taken, so a turn that crosses
+        midnight settles that day instead of the new one.
+        Remaining hold stays for later rounds of the same turn (tool loops)
+        until ``release_reservation``.
         """
         if amount_usd < 0:
             return
         if user_id is None:
             user_id = get_billing_user()
-        day = self._day_key()
-        day_key = f"cost:day:{day}"
-        user_key = f"cost:user:{user_id}:day:{day}" if user_id is not None else ""
-        ttl = 3 * 86400
-        reserved = _reserved_usd.get()
+        holds = _budget_holds.get()
+        reserved = _reserved_amount()
         if amount_usd <= 0:
             if reserved > 0:
-                day_delta, user_delta, has_user = self._release_deltas(
-                    reserved, user_id=user_id
-                )
-                await self._settle(
-                    day_key=day_key,
-                    user_key=user_key if has_user else "",
-                    day_delta=day_delta,
-                    user_delta=user_delta,
-                    ttl_seconds=ttl,
-                )
-                _reserved_usd.set(0.0)
-                if self.daily_budget > 0:
-                    spent = await self._get(day_key)
-                    LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
+                await self._release_holds(holds, user_id)
+                _budget_holds.set(())
+                await self._refresh_remaining_gauge()
             return
 
         take = min(reserved, amount_usd)
-        day_delta, user_delta, has_user = self._spend_deltas(
-            amount_usd, take=take, user_id=user_id
-        )
-        await self._settle(
-            day_key=day_key,
-            user_key=user_key if has_user else "",
-            day_delta=day_delta,
-            user_delta=user_delta,
-            ttl_seconds=ttl,
-        )
-        _reserved_usd.set(reserved - take)
+        kept, burned = _split_holds(holds, take)
+        charge_day = holds[0].day if holds else self._day_key()
+        days = [charge_day]
+        for day in burned:
+            if day not in days:
+                days.append(day)
+        for day in days:
+            charged = amount_usd if day == charge_day else 0.0
+            day_delta, user_delta, has_user = self._spend_deltas(
+                charged, take=burned.get(day, 0.0), user_id=user_id
+            )
+            await self._settle_on_day(
+                day,
+                user_id=user_id,
+                day_delta=day_delta,
+                user_delta=user_delta,
+                has_user=has_user,
+            )
+        _budget_holds.set(kept)
         LLM_SPEND_USD.labels(kind=kind).inc(amount_usd)
         LLM_COST_USD.labels(
             kind=kind,
@@ -686,9 +722,7 @@ class CostTracker:
             model=model or "unknown",
             source=source or "flat",
         ).inc(amount_usd)
-        if self.daily_budget > 0:
-            spent = await self._get(day_key)
-            LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
+        await self._refresh_remaining_gauge()
         logger.info(
             "llm_spend_recorded",
             kind=kind,
@@ -701,6 +735,47 @@ class CostTracker:
             source=source,
             cost_rub=cost_rub,
         )
+
+    async def _release_holds(
+        self, holds: tuple[BudgetHold, ...], user_id: int | None
+    ) -> None:
+        for hold in holds:
+            day_delta, user_delta, has_user = self._release_deltas(
+                hold.usd, user_id=user_id
+            )
+            await self._settle_on_day(
+                hold.day,
+                user_id=user_id,
+                day_delta=day_delta,
+                user_delta=user_delta,
+                has_user=has_user,
+            )
+
+    async def _settle_on_day(
+        self,
+        day: str,
+        *,
+        user_id: int | None,
+        day_delta: float,
+        user_delta: float,
+        has_user: bool,
+    ) -> None:
+        if day_delta == 0 and (not has_user or user_delta == 0):
+            return
+        user_key = f"cost:user:{user_id}:day:{day}" if user_id is not None else ""
+        await self._settle(
+            day_key=f"cost:day:{day}",
+            user_key=user_key if has_user else "",
+            day_delta=day_delta,
+            user_delta=user_delta,
+            ttl_seconds=3 * 86400,
+        )
+
+    async def _refresh_remaining_gauge(self) -> None:
+        if self.daily_budget <= 0:
+            return
+        spent = await self._get(f"cost:day:{self._day_key()}")
+        LLM_BUDGET_REMAINING.set(max(0.0, self.daily_budget - spent))
 
     async def _settle(
         self,

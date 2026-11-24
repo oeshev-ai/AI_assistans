@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import structlog
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from app.llm.media_api import paid_job_id, public_https_image_url
 from app.storage.redis_await import await_redis
@@ -22,6 +23,7 @@ logger = structlog.get_logger("image_delivery")
 IMAGE_DELIVERY_TTL_SECONDS = 7 * 24 * 3600
 _INDEX_KEY = "image_delivery:index"
 _RECORD_KEY = "image_delivery:{chat_id}:{user_id}"
+_WRITE_ATTEMPTS = 8
 
 
 def retry_delay_seconds(attempts: int) -> int:
@@ -164,6 +166,13 @@ def _remaining_ttl(created_at: float, now: float) -> int:
     return max(left, 1)
 
 
+def _payload_from(raw: object) -> ImageDelivery | None:
+    if not raw:
+        return None
+    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+    return ImageDelivery.from_json(text)
+
+
 @dataclass
 class InMemoryImageDeliveryStore:
     """Память процесса, когда Redis нет (не production)."""
@@ -273,12 +282,11 @@ class RedisImageDeliveryStore:
     ) -> bool:
         if not public_https_image_url(url):
             return False
-        key = self._key(chat_id, user_id)
-        try:
-            current = await self._load(key)
-            name = _safe_filename(filename)
+        name = _safe_filename(filename)
+
+        def merge(current: ImageDelivery | None) -> ImageDelivery | None:
             if current is None or current.expired(now):
-                record = ImageDelivery(
+                return ImageDelivery(
                     chat_id=chat_id,
                     user_id=user_id,
                     urls=[url],
@@ -287,22 +295,15 @@ class RedisImageDeliveryStore:
                     as_files=[as_file],
                     not_before=now + retry_delay_seconds(0),
                 )
-            elif url in current.urls:
-                return True
-            else:
-                current.urls.append(url)
-                current.filenames.append(name)
-                current.as_files = _align_flags(current.as_files, len(current.urls) - 1)
-                current.as_files.append(as_file)
-                record = current
-            await self._redis.set(
-                key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
-            )
-            await await_redis(self._redis.sadd(_INDEX_KEY, key))
-            return True
-        except RedisError:
-            logger.warning("image_delivery_store_failed", chat_id=chat_id)
-            return False
+            if url in current.urls:
+                return None
+            current.urls.append(url)
+            current.filenames.append(name)
+            current.as_files = _align_flags(current.as_files, len(current.urls) - 1)
+            current.as_files.append(as_file)
+            return current
+
+        return await self._update(chat_id, user_id, now, merge)
 
     async def due(self, now: float) -> list[ImageDelivery]:
         try:
@@ -342,6 +343,9 @@ class RedisImageDeliveryStore:
                 key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
             )
             await await_redis(self._redis.sadd(_INDEX_KEY, key))
+            await await_redis(
+                self._redis.expire(_INDEX_KEY, IMAGE_DELIVERY_TTL_SECONDS)
+            )
         except RedisError:
             logger.warning("image_delivery_store_failed", chat_id=record.chat_id)
 
@@ -358,11 +362,10 @@ class RedisImageDeliveryStore:
         job = _stored_job(provider, job_id, as_file=as_file)
         if job is None:
             return False
-        key = self._key(chat_id, user_id)
-        try:
-            current = await self._load(key)
+
+        def merge(current: ImageDelivery | None) -> ImageDelivery | None:
             if current is None or current.expired(now):
-                record = ImageDelivery(
+                return ImageDelivery(
                     chat_id=chat_id,
                     user_id=user_id,
                     urls=[],
@@ -371,19 +374,12 @@ class RedisImageDeliveryStore:
                     jobs=[job],
                     not_before=now + retry_delay_seconds(0),
                 )
-            elif _job_known(current.jobs, job):
-                return True
-            else:
-                current.jobs.append(job)
-                record = current
-            await self._redis.set(
-                key, record.to_json(), ex=_remaining_ttl(record.created_at, now)
-            )
-            await await_redis(self._redis.sadd(_INDEX_KEY, key))
-            return True
-        except RedisError:
-            logger.warning("image_delivery_store_failed", chat_id=chat_id)
-            return False
+            if _job_known(current.jobs, job):
+                return None
+            current.jobs.append(job)
+            return current
+
+        return await self._update(chat_id, user_id, now, merge)
 
     async def delete(self, chat_id: int, user_id: int) -> None:
         key = self._key(chat_id, user_id)
@@ -393,12 +389,50 @@ class RedisImageDeliveryStore:
         except RedisError:
             logger.warning("image_delivery_delete_failed", chat_id=chat_id)
 
+    async def _update(
+        self,
+        chat_id: int,
+        user_id: int,
+        now: float,
+        merge: Callable[[ImageDelivery | None], ImageDelivery | None],
+    ) -> bool:
+        """Читает и пишет одну запись под ``WATCH``.
+
+        ``merge`` возвращает ``None``, если менять запись не нужно.
+        Индекс получает тот же срок, что и запись: без TTL ``volatile-ttl``
+        его не вытеснит. Повторный ``EXPIRE`` не короче жизни любой записи,
+        потому что ``created_at`` не позже момента записи.
+        """
+        key = self._key(chat_id, user_id)
+        for _attempt in range(_WRITE_ATTEMPTS):
+            try:
+                async with self._redis.pipeline() as pipe:
+                    await pipe.watch(key)
+                    current = _payload_from(await pipe.get(key))
+                    record = merge(current)
+                    if record is None:
+                        await pipe.unwatch()
+                        return True
+                    pipe.multi()
+                    pipe.set(
+                        key,
+                        record.to_json(),
+                        ex=_remaining_ttl(record.created_at, now),
+                    )
+                    pipe.sadd(_INDEX_KEY, key)
+                    pipe.expire(_INDEX_KEY, IMAGE_DELIVERY_TTL_SECONDS)
+                    await pipe.execute()
+                    return True
+            except WatchError:
+                continue
+            except RedisError:
+                logger.warning("image_delivery_store_failed", chat_id=chat_id)
+                return False
+        logger.warning("image_delivery_conflict", chat_id=chat_id)
+        return False
+
     async def _load(self, key: str) -> ImageDelivery | None:
-        raw = await self._redis.get(key)
-        if not raw:
-            return None
-        text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
-        return ImageDelivery.from_json(text)
+        return _payload_from(await self._redis.get(key))
 
 
 def open_image_delivery_store(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,7 +26,9 @@ async def test_transcribe_media_sends_transcript_file(
     monkeypatch.setattr("app.media.media_tools.prepare_audio_for_stt", fake_prepare)
 
     class FakeClient:
-        async def transcribe_audio(self, audio_bytes, filename="x", language=None):
+        async def transcribe_audio(
+            self, audio_bytes, filename="x", language=None, model=None
+        ):
             return "hello world " * 20
 
     tool = TranscribeMediaTool(FakeClient())  # type: ignore[arg-type]
@@ -94,3 +97,104 @@ async def test_edit_image_sanitizes_prompt(monkeypatch: pytest.MonkeyPatch) -> N
         from app.media.media_tools import reset_user_media
 
         reset_user_media(token)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_and_speech_go_through_job_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.llm.media_api import SpeechResult, TranscriptionResult
+    from app.media.media_tools import SynthesizeSpeechTool
+
+    async def fake_prepare(data, *, filename, is_video):
+        return [(data, filename)]
+
+    monkeypatch.setattr("app.media.media_tools.prepare_audio_for_stt", fake_prepare)
+
+    class FakeClient:
+        async def transcribe_audio(self, *args, **kwargs):
+            raise AssertionError("STT должен идти через job_queue")
+
+        async def synthesize_speech(self, *args, **kwargs):
+            raise AssertionError("TTS должен идти через job_queue")
+
+    seen: dict[str, object] = {}
+
+    async def queued_stt(assistant, audio_bytes, **kwargs):
+        seen["stt_client"] = assistant
+        seen["language"] = kwargs.get("language")
+        return TranscriptionResult(text="из очереди")
+
+    async def queued_tts(assistant, text, **kwargs):
+        seen["tts_client"] = assistant
+        seen["voice"] = kwargs.get("voice")
+        seen["text"] = text
+        return SpeechResult(audio=b"ogg", filename="a.ogg", mime_type="audio/ogg")
+
+    monkeypatch.setattr("app.infra.job_queue.transcribe_audio", queued_stt)
+    monkeypatch.setattr("app.infra.job_queue.synthesize_speech", queued_tts)
+
+    client = FakeClient()
+    token = set_user_media(
+        [
+            UserMedia(
+                kind="audio",
+                filename="note.ogg",
+                mime_type="audio/ogg",
+                data=b"ogg",
+            )
+        ]
+    )
+    try:
+        with MediaTurnScope():
+            raw = await TranscribeMediaTool(client).execute(  # type: ignore[arg-type]
+                language="ru"
+            )
+        assert json.loads(raw)["status"] == "success"
+        speech = await SynthesizeSpeechTool(client).execute(  # type: ignore[arg-type]
+            text="Привет", voice="alloy"
+        )
+        assert json.loads(speech)["status"] == "success"
+    finally:
+        from app.media.media_tools import reset_user_media
+
+        reset_user_media(token)
+
+    assert seen["stt_client"] is client
+    assert seen["language"] == "ru"
+    assert seen["tts_client"] is client
+    assert seen["voice"] == "alloy"
+    assert seen["text"] == "Привет"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_speech_clips_long_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.bot.constants import TTS_MAX_CHARS
+    from app.bot.models import _clip_tts_text
+    from app.llm.media_api import SpeechResult
+    from app.media.media_tools import SynthesizeSpeechTool
+
+    seen: dict[str, object] = {}
+
+    async def queued_tts(assistant, text, **kwargs):
+        seen["text"] = text
+        return SpeechResult(audio=b"ogg", filename="a.ogg", mime_type="audio/ogg")
+
+    monkeypatch.setattr("app.infra.job_queue.synthesize_speech", queued_tts)
+    from app.media import media_tools as media_tools_mod
+
+    monkeypatch.setattr(media_tools_mod.cost_tracker, "check_budget", AsyncMock())
+    monkeypatch.setattr(media_tools_mod.cost_tracker, "record", AsyncMock())
+    monkeypatch.setattr(
+        media_tools_mod.cost_tracker, "release_reservation", AsyncMock()
+    )
+    raw = ("слово " * 2000).strip()
+    assert len(raw) > TTS_MAX_CHARS
+    speech = await SynthesizeSpeechTool(object()).execute(text=raw)  # type: ignore[arg-type]
+    body = json.loads(speech)
+    assert body["status"] == "success"
+    assert seen["text"] == _clip_tts_text(raw)
+    assert len(seen["text"]) <= TTS_MAX_CHARS
+    assert body["chars"] == len(seen["text"])

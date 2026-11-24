@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import app.bot.screens as screens
 from app.bot import models as M
 from app.bot.constants import (
@@ -887,18 +890,43 @@ async def _send_voice_reply(
             logger.warning("Не удалось отправить озвучку: %s", nested)
 
 
-_chat_turn_locks: dict[int, asyncio.Lock] = {}
+class _ChatTurnGate:
+    """Лок чата и число ходов, которые его держат или ждут."""
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+_chat_turn_locks: dict[int, _ChatTurnGate] = {}
 _chat_turn_locks_guard = asyncio.Lock()
 
 
-async def _chat_turn_lock(chat_id: int) -> asyncio.Lock:
-    """Serialize concurrent turns in one chat to protect history RMW."""
+@asynccontextmanager
+async def _chat_turn(chat_id: int) -> AsyncIterator[None]:
+    """Сериализует ходы одного чата. Пустой чат из словаря убирается.
+
+    ``users`` растёт до захвата лока и падает после выхода, оба раза под
+    общим замком. Иначе между отпусканием лока и удалением записи соседний
+    ход успевает взять тот же лок, а новый ход создаёт второй и идёт параллельно.
+    """
     async with _chat_turn_locks_guard:
-        lock = _chat_turn_locks.get(chat_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _chat_turn_locks[chat_id] = lock
-        return lock
+        gate = _chat_turn_locks.get(chat_id)
+        if gate is None:
+            gate = _ChatTurnGate()
+            _chat_turn_locks[chat_id] = gate
+        gate.users += 1
+        lock = gate.lock
+    try:
+        async with lock:
+            yield
+    finally:
+        async with _chat_turn_locks_guard:
+            gate.users -= 1
+            if gate.users == 0 and _chat_turn_locks.get(chat_id) is gate:
+                del _chat_turn_locks[chat_id]
 
 
 async def _process_user_message(
@@ -914,8 +942,7 @@ async def _process_user_message(
 ) -> None:
     """Общий pipeline текста и распознанного голоса в активной теме."""
     chat_id = message.chat.id
-    turn_lock = await _chat_turn_lock(chat_id)
-    async with turn_lock:
+    async with _chat_turn(chat_id):
         await _process_user_message_locked(
             message,
             assistant,
@@ -1253,12 +1280,14 @@ def _upload_process_semaphore() -> asyncio.Semaphore:
     return _upload_process_sem
 
 
-def _estimate_upload_stt_cost(*, file_size: int | None, max_upload_mb: int) -> float:
-    """Rough STT estimate from payload size (~4 KB/s), matching media_tools."""
-    size_hint = (
-        file_size if file_size and file_size > 0 else max_upload_mb * 1024 * 1024
-    )
-    return cost_tracker.estimate_stt_cost(max(15.0, size_hint / 4000.0))
+# До скачивания длительность неизвестна. 15 с отсекают уже пустой бюджет
+# и не превращают 300 МБ видео в оценку на десяток долларов.
+_UPLOAD_STT_FLOOR_SECONDS = 15.0
+
+
+def _upload_stt_floor_cost() -> float:
+    """Малый резерв до скачивания и извлечения аудио."""
+    return cost_tracker.estimate_stt_cost(_UPLOAD_STT_FLOOR_SECONDS)
 
 
 async def _process_s3_upload_session(
@@ -1292,7 +1321,6 @@ async def _process_s3_upload_session(
     await sem.acquire()
     data: bytes | None = None
     status_msg: Message | None = None
-    reserved = False
     try:
         set_billing_user(user_id)
         if not await rate_limiter.check_media_limit(user_id):
@@ -1307,13 +1335,9 @@ async def _process_s3_upload_session(
             await store.update(session)
             return
 
-        estimated = _estimate_upload_stt_cost(
-            file_size=session.file_size,
-            max_upload_mb=storage.config.max_upload_mb,
-        )
+        floor = _upload_stt_floor_cost()
         try:
-            await cost_tracker.check_budget(user_id, estimated)
-            reserved = True
+            await cost_tracker.check_budget(user_id, floor)
         except BudgetExceededError as exc:
             await bot.send_message(chat_id, exc.message)
             session.status = "failed"
@@ -1349,6 +1373,22 @@ async def _process_s3_upload_session(
             is_video=kind == "video",
         )
         data = None  # free full object before paid STT round-trips
+        from app.media.media_utils import audio_duration_seconds
+
+        duration = await audio_duration_seconds(chunks)
+        estimated = cost_tracker.estimate_stt_cost(
+            max(_UPLOAD_STT_FLOOR_SECONDS, duration)
+        )
+        extra = estimated - floor
+        if extra > 0:
+            try:
+                await cost_tracker.check_budget(user_id, extra)
+            except BudgetExceededError as exc:
+                await bot.send_message(chat_id, exc.message)
+                session.status = "failed"
+                session.error = "budget_exceeded"
+                await store.update(session)
+                return
         parts: list[str] = []
         facts: list[tuple[float | None, str | None, float | None]] = []
         providers: list[str | None] = []
@@ -1381,7 +1421,6 @@ async def _process_s3_upload_session(
             source=source,
             cost_rub=rub,
         )
-        reserved = False
         await _delete_chat_messages(bot, chat_id, session.prompt_message_ids)
         session.prompt_message_ids = None
         await store.update(session)
@@ -1399,11 +1438,6 @@ async def _process_s3_upload_session(
             ),
             caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
         )
-        if status_msg is not None:
-            try:
-                await status_msg.delete()
-            except Exception:
-                logger.debug("upload_status_delete_failed", chat_id=chat_id)
 
         # Короткая запись в историю активной темы.
         try:
@@ -1463,9 +1497,15 @@ async def _process_s3_upload_session(
         session.error = "internal"
         await store.update(session)
     finally:
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                logger.debug("upload_status_delete_failed", chat_id=chat_id)
         data = None
-        if reserved:
-            await cost_tracker.release_reservation(user_id)
+        # record сжигает min(резерв, факт). Длительность может быть короче
+        # добора, поэтому остаток снимается на любом выходе.
+        await cost_tracker.release_reservation(user_id)
         sem.release()
         try:
             await storage.delete_object(object_key)
@@ -1534,8 +1574,7 @@ async def _process_vision_message(
 ) -> None:
     """Стримит ответ модели по multimodal-запросу; в тему пишет только текст."""
     chat_id = message.chat.id
-    turn_lock = await _chat_turn_lock(chat_id)
-    async with turn_lock:
+    async with _chat_turn(chat_id):
         await _process_vision_message_locked(
             message,
             assistant,

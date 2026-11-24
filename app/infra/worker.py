@@ -18,7 +18,7 @@ from __future__ import annotations
 import base64
 import json
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import structlog
 
@@ -53,8 +53,8 @@ def redis_settings() -> Any:
         host=parsed.hostname or "localhost",
         port=parsed.port or 6379,
         database=int((parsed.path or "/0").lstrip("/") or 0),
-        password=parsed.password or None,
-        username=parsed.username or None,
+        password=unquote(parsed.password) if parsed.password else None,
+        username=unquote(parsed.username) if parsed.username else None,
     )
 
 

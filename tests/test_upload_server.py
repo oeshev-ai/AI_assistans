@@ -263,6 +263,55 @@ def test_legacy_presign_routes_off_by_default(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
+async def test_presign_ignores_boolean_file_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UPLOAD_LEGACY_PRESIGN", "1")
+    store = UploadSessionStore(redis=None)
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application()
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=FakeStorage(),
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        for raw_size in (True, False):
+            fresh = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+            resp = await client.post(
+                f"/api/uploads/{fresh.upload_id}/presign",
+                json={
+                    "fileName": "lecture.mp3",
+                    "fileType": "audio/mpeg",
+                    "fileSize": raw_size,
+                },
+                headers={"X-Upload-Token": fresh.token},
+            )
+            assert resp.status == 200, await resp.text()
+            saved = await store.get(fresh.upload_id)
+            assert saved is not None
+            assert saved.file_size is None
+        sized = await client.post(
+            f"/api/uploads/{session.upload_id}/presign",
+            json={
+                "fileName": "lecture.mp3",
+                "fileType": "audio/mpeg",
+                "fileSize": 1200,
+            },
+            headers={"X-Upload-Token": session.token},
+        )
+        assert sized.status == 200, await sized.text()
+        saved_size = await store.get(session.upload_id)
+        assert saved_size is not None
+        assert saved_size.file_size == 1200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_upload_errors_are_opaque() -> None:
     from app.storage.s3_storage import S3StorageError
 

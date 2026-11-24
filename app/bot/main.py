@@ -143,6 +143,12 @@ def warn_polza_user_hash_secret() -> None:
     )
 
 
+# Same horizon as topics and personas. aiogram sets EXPIRE on set_state and
+# set_data. Without a TTL, volatile-ttl never evicts FSM keys, so a full 256mb
+# Redis starts refusing writes.
+_FSM_TTL_SECONDS = 30 * 24 * 60 * 60
+
+
 async def create_fsm_storage(redis_url: str) -> BaseStorage:
     """Redis FSM storage; MemoryStorage only outside production."""
     if not redis_url:
@@ -163,9 +169,13 @@ async def create_fsm_storage(redis_url: str) -> BaseStorage:
             await probe.ping()
         finally:
             await probe.aclose()
-        storage = RedisStorage.from_url(redis_url)
+        storage = RedisStorage.from_url(
+            redis_url,
+            state_ttl=_FSM_TTL_SECONDS,
+            data_ttl=_FSM_TTL_SECONDS,
+        )
         safe_url = redact_url_credentials(redis_url)
-        logger.info("fsm_redis_storage", url=safe_url)
+        logger.info("fsm_redis_storage", url=safe_url, ttl_seconds=_FSM_TTL_SECONDS)
         return storage
     except SystemExit:
         raise
@@ -250,6 +260,33 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
     dispatcher.workflow_data["assistant_storage"] = assistant_storage
     dispatcher.workflow_data["assistant"] = assistant
     dispatcher.workflow_data["pending_media"] = pending_media
+    try:
+        await _start_background(
+            dispatcher,
+            bot,
+            assistant,
+            topic_storage,
+            assistant_storage,
+        )
+    except Exception:
+        logger.exception("startup_failed")
+        try:
+            await on_shutdown(dispatcher)
+        except Exception:
+            logger.exception("startup_cleanup_failed")
+        raise
+
+
+async def _start_background(
+    dispatcher: Dispatcher,
+    bot: Bot,
+    assistant: AssistAIClient,
+    topic_storage: TopicHistoryStorage,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Фоновые задачи и health-сервер. При ошибке вызывающий закрывает клиентов."""
+    settings = get_settings()
+    shared_redis = dispatcher.workflow_data.get("shared_redis")
     from app.bot.image_retry import bind_image_delivery, image_delivery_loop
     from app.storage.image_delivery import open_image_delivery_store
 

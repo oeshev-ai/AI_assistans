@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.infra.cost_tracker import TEXT_OUT_USD_PER_1M, cost_from_usage
+from app.infra.cost_tracker import cost_from_usage
+from app.infra.settings import get_settings
 
 
 def _usage(
@@ -42,5 +43,6 @@ def test_text_output_adds_ten_dollars_per_million() -> None:
     with_text = cost_from_usage(
         _usage(text_in=8, image_in=0, image_out=824, text_out=1000)
     )
-    assert with_text - base == pytest.approx(1000 * TEXT_OUT_USD_PER_1M / 1_000_000)
+    per_million = get_settings().text_out_usd_per_1m
+    assert with_text - base == pytest.approx(1000 * per_million / 1_000_000)
     assert with_text - base == pytest.approx(0.01)

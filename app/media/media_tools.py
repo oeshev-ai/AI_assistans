@@ -21,7 +21,6 @@ from app.llm.image_ops import (
 from app.llm.media_api import (
     VIDEO_MAX_REFERENCE_IMAGES,
     SpeechResult,
-    TranscriptionResult,
     VideoReference,
     decode_image_b64,
     safe_image_mime,
@@ -606,37 +605,31 @@ class TranscribeMediaTool(BaseTool):
             facts: list[tuple[float | None, str | None, float | None]] = []
             providers: list[str | None] = []
             models: list[str | None] = []
-            saw_unpriced = False
+            import app.infra.job_queue as job_queue
+
             for audio_bytes, name in chunks:
-                raw = await self._client.transcribe_audio(
+                recognized = await job_queue.transcribe_audio(
+                    self._client,
                     audio_bytes,
                     filename=name,
                     language=lang,
+                    billing_user_id=user_id,
                 )
-                if isinstance(raw, TranscriptionResult):
-                    text = raw.text
-                    facts.append((raw.cost_usd, raw.cost_source, raw.cost_rub))
-                    providers.append(raw.provider_id)
-                    models.append(raw.model)
-                else:
-                    text = raw if isinstance(raw, str) else str(raw)
-                    saw_unpriced = True
+                text = recognized.text
+                facts.append(
+                    (recognized.cost_usd, recognized.cost_source, recognized.cost_rub)
+                )
+                providers.append(recognized.provider_id)
+                models.append(recognized.model)
                 if text:
                     parts.append(text)
             transcript = "\n\n".join(parts).strip()
             if not transcript:
                 return _error_json("Речь не распознана.")
 
-            if saw_unpriced:
-                amount, cost_source, rub = estimated, None, None
-                provider = None
-                billed_model = None
-            else:
-                amount, cost_source, rub = prefer_cost_rub(facts, estimated)
-                provider = (
-                    providers[0] if providers and len(set(providers)) == 1 else None
-                )
-                billed_model = models[0] if models and len(set(models)) == 1 else None
+            amount, cost_source, rub = prefer_cost_rub(facts, estimated)
+            provider = providers[0] if providers and len(set(providers)) == 1 else None
+            billed_model = models[0] if models and len(set(models)) == 1 else None
             await cost_tracker.record(
                 kind="stt",
                 amount_usd=amount,
@@ -812,7 +805,9 @@ class SynthesizeSpeechTool(BaseTool):
         selected_voice = (
             voice.strip() if isinstance(voice, str) and voice.strip() else None
         )
-        cleaned = text.strip()
+        from app.bot.models import _clip_tts_text
+
+        cleaned = _clip_tts_text(text)
         from app.infra.cost_tracker import get_billing_user
         from app.infra.rate_limiter import rate_limiter
 
@@ -828,9 +823,13 @@ class SynthesizeSpeechTool(BaseTool):
         except BudgetExceededError as exc:
             return _error_json(exc.message)
         try:
-            speech: SpeechResult = await self._client.synthesize_speech(
-                text=cleaned,
+            import app.infra.job_queue as job_queue
+
+            speech: SpeechResult = await job_queue.synthesize_speech(
+                self._client,
+                cleaned,
                 voice=selected_voice,
+                billing_user_id=user_id,
             )
             amount, source, rub = prefer_cost_rub(
                 [(speech.cost_usd, speech.cost_source, speech.cost_rub)],

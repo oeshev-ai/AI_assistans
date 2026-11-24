@@ -31,4 +31,5 @@ USER app
 
 EXPOSE 8082 8083
 
+ENTRYPOINT ["/bin/sh", "/app/scripts/docker-entrypoint.sh"]
 CMD ["python", "-m", "app.bot"]
