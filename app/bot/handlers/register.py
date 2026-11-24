@@ -42,6 +42,7 @@ from app.bot.handlers.chat import handle_text, handle_voice
 from app.bot.handlers.commands import (
     _CommandLeavesWizard,
     cmd_cancel,
+    cmd_help,
     cmd_start,
     cmd_unknown,
 )
@@ -105,7 +106,7 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.middleware(R._CleanChat())
     dispatcher.message.middleware(_CommandLeavesWizard())
     dispatcher.message.register(cmd_start, CommandStart())
-    dispatcher.message.register(cmd_start, Command("help"))
+    dispatcher.message.register(cmd_help, Command("help"))
     dispatcher.message.register(cmd_cancel, Command("cancel"))
     dispatcher.message.register(on_menu_settings, Command("settings"))
     dispatcher.message.register(
