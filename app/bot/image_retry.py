@@ -287,22 +287,27 @@ def _align_delivery_flags(record: ImageDelivery) -> list[bool]:
 async def _send_bytes(
     bot: Bot, chat_id: int, raw: bytes, filename: str, *, as_file: bool = False
 ) -> None:
-    payload = BufferedInputFile(raw, filename=filename)
+    from app.bot.photo_pacer import send_photo_paced
+
     if as_file:
         await bot.send_document(
             chat_id,
-            payload,
+            BufferedInputFile(raw, filename=filename),
             caption=IMAGE_LATE_CAPTION,
             request_timeout=120,
         )
         return
-    try:
+
+    async def _send_photo() -> None:
         await bot.send_photo(
             chat_id,
-            payload,
+            BufferedInputFile(raw, filename=filename),
             caption=IMAGE_LATE_CAPTION,
             request_timeout=120,
         )
+
+    try:
+        await send_photo_paced(chat_id, _send_photo)
     except TelegramBadRequest as exc:
         if not telegram_photo_needs_document(exc):
             raise

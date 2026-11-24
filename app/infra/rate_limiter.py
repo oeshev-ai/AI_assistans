@@ -1,8 +1,13 @@
-"""Per-user rate limits with Redis sliding window and in-memory fallback."""
+"""Per-user rate limits with Redis sliding window and in-memory fallback.
+
+Картинки — отдельные token bucket ``image_generate`` и ``image_edit``.
+Текст, медиа и HTTP-загрузка остаются скользящим окном.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import uuid
 from collections import defaultdict, deque
@@ -36,6 +41,69 @@ redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 return 1
 """
 
+# Token bucket. ARGV: capacity, refill_per_min, now, ttl seconds, consume (1/0).
+# Hash fields: tokens, ts. Missing key starts full. Peek does not create a key.
+_BUCKET_LUA = """
+local capacity = tonumber(ARGV[1])
+local refill_per_min = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local consume = tonumber(ARGV[5])
+local rate = refill_per_min / 60
+
+local raw_tokens = redis.call('HGET', KEYS[1], 'tokens')
+local raw_ts = redis.call('HGET', KEYS[1], 'ts')
+local tokens
+if raw_tokens == false or raw_ts == false then
+  tokens = capacity
+else
+  tokens = tonumber(raw_tokens)
+  local ts = tonumber(raw_ts)
+  if tokens == nil then
+    tokens = capacity
+  end
+  local elapsed = 0
+  if ts ~= nil then
+    elapsed = now - ts
+    if elapsed < 0 then
+      elapsed = 0
+    end
+  end
+  tokens = math.min(capacity, tokens + elapsed * rate)
+end
+
+local allow = 0
+local retry_after = 0
+if tokens >= 1 then
+  allow = 1
+  if consume == 1 then
+    tokens = tokens - 1
+  end
+else
+  local deficit = 1 - tokens
+  if deficit < 0 then
+    deficit = 0
+  end
+  if refill_per_min > 0 then
+    retry_after = math.ceil(deficit * 60 / refill_per_min)
+  else
+    retry_after = 1
+  end
+end
+
+if consume == 1 then
+  redis.call(
+    'HSET', KEYS[1],
+    'tokens', string.format('%.8f', tokens),
+    'ts', string.format('%.6f', now)
+  )
+  redis.call('EXPIRE', KEYS[1], ttl)
+end
+return {allow, retry_after}
+"""
+
+_IMAGE_BUCKET_OPS = frozenset({"image_generate", "image_edit"})
+
 
 class RateLimiter:
     """Sliding-window limiter for LLM text and image generation.
@@ -53,6 +121,7 @@ class RateLimiter:
         self._upload_hits: dict[str, dict[str, deque[float]]] = defaultdict(
             lambda: defaultdict(deque)
         )
+        self._image_buckets: dict[tuple[int, str], tuple[float, float]] = {}
 
     def attach_redis(self, redis_client: Any | None) -> None:
         """Use Redis for durable counters when available."""
@@ -72,13 +141,58 @@ class RateLimiter:
         )
 
     async def check_image_limit(self, user_id: int) -> bool:
-        """Return True and consume a slot if under the image-generation limit."""
+        """Legacy sliding window. Image entry points use ``consume_image_bucket``."""
         return await self._allow(
             user_id,
             operation="image",
             limit=IMAGE_LIMIT,
             window=IMAGE_WINDOW_SECONDS,
         )
+
+    async def consume_image_bucket(self, user_id: int, operation: str) -> bool:
+        """Забирает один токен ``image_generate`` или ``image_edit``.
+
+        В production сбой Redis — отказ, без перехода на память процесса.
+        """
+        capacity, refill, _ttl = self._bucket_params()
+        now = time.time()
+        if self._redis is not None:
+            try:
+                allowed, _retry = await self._bucket_redis(
+                    user_id,
+                    operation,
+                    capacity=capacity,
+                    refill_per_min=refill,
+                    now=now,
+                    consume=True,
+                )
+                return allowed
+            except Exception as exc:
+                from app.infra.access import is_production
+
+                if is_production():
+                    logger.error(
+                        "rate_limiter_redis_failed_deny",
+                        error=str(exc),
+                        operation=operation,
+                        user_id=user_id,
+                    )
+                    return False
+                logger.warning(
+                    "rate_limiter_redis_failed_fallback_memory",
+                    error=str(exc),
+                    operation=operation,
+                    user_id=user_id,
+                )
+        allowed, _retry = await self._bucket_memory(
+            user_id,
+            operation,
+            capacity=capacity,
+            refill_per_min=refill,
+            now=now,
+            consume=True,
+        )
+        return allowed
 
     async def check_media_limit(self, user_id: int) -> bool:
         """Return True and consume a slot if under the STT/TTS/video limit."""
@@ -128,6 +242,8 @@ class RateLimiter:
 
     async def get_retry_after(self, user_id: int, operation: str) -> float:
         """Seconds until the oldest hit leaves the window (0 if capacity free)."""
+        if operation in _IMAGE_BUCKET_OPS:
+            return await self._image_bucket_retry_after(user_id, operation)
         if operation == "text":
             window, limit = TEXT_WINDOW_SECONDS, TEXT_LIMIT
         elif operation == "media":
@@ -158,6 +274,123 @@ class RateLimiter:
             if len(hits) < limit:
                 return 0.0
             return max(0.0, hits[0] + window - now)
+
+    async def _image_bucket_retry_after(self, user_id: int, operation: str) -> float:
+        capacity, refill, _ttl = self._bucket_params()
+        now = time.time()
+        if self._redis is not None:
+            try:
+                allowed, retry = await self._bucket_redis(
+                    user_id,
+                    operation,
+                    capacity=capacity,
+                    refill_per_min=refill,
+                    now=now,
+                    consume=False,
+                )
+                return 0.0 if allowed else retry
+            except Exception as exc:
+                from app.infra.access import is_production
+
+                logger.warning(
+                    "rate_limiter_redis_retry_after_failed",
+                    error=str(exc),
+                    operation=operation,
+                    user_id=user_id,
+                )
+                if is_production():
+                    return self._bucket_one_token_wait(refill)
+        allowed, retry = await self._bucket_memory(
+            user_id,
+            operation,
+            capacity=capacity,
+            refill_per_min=refill,
+            now=now,
+            consume=False,
+        )
+        return 0.0 if allowed else retry
+
+    async def _bucket_redis(
+        self,
+        user_id: int,
+        operation: str,
+        *,
+        capacity: float,
+        refill_per_min: float,
+        now: float,
+        consume: bool,
+    ) -> tuple[bool, float]:
+        if operation not in _IMAGE_BUCKET_OPS:
+            raise ValueError(f"unknown image bucket {operation}")
+        assert self._redis is not None
+        _capacity, _refill, ttl = self._bucket_params()
+        raw = await self._redis.eval(
+            _BUCKET_LUA,
+            1,
+            self._key(user_id, operation),
+            capacity,
+            refill_per_min,
+            now,
+            ttl,
+            1 if consume else 0,
+        )
+        allowed = int(raw[0]) == 1
+        retry = max(0.0, float(raw[1]))
+        return allowed, retry
+
+    async def _bucket_memory(
+        self,
+        user_id: int,
+        operation: str,
+        *,
+        capacity: float,
+        refill_per_min: float,
+        now: float,
+        consume: bool,
+    ) -> tuple[bool, float]:
+        if operation not in _IMAGE_BUCKET_OPS:
+            raise ValueError(f"unknown image bucket {operation}")
+        rate = refill_per_min / 60.0
+        async with self._lock:
+            stored = self._image_buckets.get((user_id, operation))
+            if stored is None:
+                tokens = capacity
+            else:
+                tokens, ts = stored
+                elapsed = max(0.0, now - ts)
+                tokens = min(capacity, tokens + elapsed * rate)
+            allowed = tokens >= 1.0
+            retry = 0.0
+            if consume and allowed:
+                tokens -= 1.0
+            elif not allowed:
+                retry = self._bucket_retry(1.0 - tokens, refill_per_min)
+            if consume:
+                self._image_buckets[(user_id, operation)] = (tokens, now)
+            return allowed, retry
+
+    @staticmethod
+    def _bucket_params() -> tuple[float, float, int]:
+        from app.infra.settings import get_settings
+
+        settings = get_settings()
+        capacity = float(settings.image_bucket_capacity)
+        refill = float(settings.image_bucket_refill_per_min)
+        rate = refill / 60.0
+        ttl = math.ceil(capacity / rate) + 3600 if rate > 0 else 3600
+        return capacity, refill, ttl
+
+    @staticmethod
+    def _bucket_retry(deficit: float, refill_per_min: float) -> float:
+        if deficit <= 0:
+            return 0.0
+        if refill_per_min <= 0:
+            return 1.0
+        return float(math.ceil(deficit * 60.0 / refill_per_min))
+
+    @classmethod
+    def _bucket_one_token_wait(cls, refill_per_min: float) -> float:
+        return cls._bucket_retry(1.0, refill_per_min)
 
     async def _allow(
         self, user_id: int, *, operation: str, limit: int, window: float

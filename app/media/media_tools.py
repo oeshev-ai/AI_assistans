@@ -180,15 +180,6 @@ class EditImageTool(BaseTool):
             return _error_json(
                 "Нет изображения во вложении. Попросите пользователя прислать картинку."
             )
-        from app.infra.cost_tracker import get_billing_user
-        from app.infra.rate_limiter import rate_limiter
-
-        user_id = get_billing_user()
-        if user_id is not None and not await rate_limiter.check_image_limit(user_id):
-            retry_after = await rate_limiter.get_retry_after(user_id, "image")
-            return _error_json(
-                f"Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
-            )
         base, refs, error = _resolve_edit_indexes(images, kwargs)
         if error is not None:
             return _error_json(error)
@@ -218,17 +209,30 @@ class EditImageTool(BaseTool):
             reference_indexes=refs,
             model=selected,
         )
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.image_gate import image_user_slot
+        from app.infra.rate_limiter import rate_limiter
+
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.consume_image_bucket(
+            user_id, "image_edit"
+        ):
+            retry_after = await rate_limiter.get_retry_after(user_id, "image_edit")
+            return _error_json(
+                f"Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
+            )
         try:
             import app.infra.job_queue as job_queue
             from app.infra.cost_tracker import BudgetExceededError
 
-            result = await job_queue.edit_images(
-                self._client,
-                files,
-                prompt,
-                model=selected,
-                labels=labels,
-            )
+            async with image_user_slot(user_id):
+                result = await job_queue.edit_images(
+                    self._client,
+                    files,
+                    prompt,
+                    model=selected,
+                    labels=labels,
+                )
         except BudgetExceededError as exc:
             return _error_json(exc.message)
         except AssistAIError as exc:

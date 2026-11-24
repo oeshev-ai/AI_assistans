@@ -253,7 +253,7 @@ async def test_edit_keeps_result_file_id_not_source(
     async def noop(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    async def allow(_user_id: int) -> bool:
+    async def allow(*_args: object, **_kwargs: object) -> bool:
         return True
 
     monkeypatch.setattr(job_queue, "edit_images", edited)
@@ -263,7 +263,7 @@ async def test_edit_keeps_result_file_id_not_source(
     monkeypatch.setattr(flow, "_drop_status", noop)
     monkeypatch.setattr(flow, "_remember_pair", noop)
     monkeypatch.setattr(flow.R, "_reset_flow", noop)
-    monkeypatch.setattr(flow.rate_limiter, "check_image_limit", allow)
+    monkeypatch.setattr(flow.rate_limiter, "consume_image_bucket", allow)
     monkeypatch.setattr(flow.cost_tracker, "check_budget", noop)
     monkeypatch.setattr(flow.cost_tracker, "release_reservation", noop)
     monkeypatch.setattr(flow.M, "_text_model_of", lambda *_a, **_k: "text")
@@ -349,7 +349,7 @@ async def test_partial_edit_delivery_keeps_the_sent_file(
     async def noop(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    async def allow(_user_id: int) -> bool:
+    async def allow(*_args: object, **_kwargs: object) -> bool:
         return True
 
     monkeypatch.setattr(job_queue, "edit_images", edited)
@@ -359,7 +359,7 @@ async def test_partial_edit_delivery_keeps_the_sent_file(
     monkeypatch.setattr(flow, "_drop_status", noop)
     monkeypatch.setattr(flow, "_remember_pair", noop)
     monkeypatch.setattr(flow.R, "_reset_flow", noop)
-    monkeypatch.setattr(flow.rate_limiter, "check_image_limit", allow)
+    monkeypatch.setattr(flow.rate_limiter, "consume_image_bucket", allow)
     monkeypatch.setattr(flow.cost_tracker, "check_budget", noop)
     monkeypatch.setattr(flow.cost_tracker, "release_reservation", noop)
     monkeypatch.setattr(flow.M, "_text_model_of", lambda *_a, **_k: "text")
@@ -437,7 +437,7 @@ async def test_edit_failure_puts_the_source_album_back(
     async def noop(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    async def allow(_user_id: int) -> bool:
+    async def allow(*_args: object, **_kwargs: object) -> bool:
         return True
 
     async def reset(state: object) -> None:
@@ -447,7 +447,7 @@ async def test_edit_failure_puts_the_source_album_back(
     monkeypatch.setattr(flow, "_status", lambda *_a, **_k: _ready())
     monkeypatch.setattr(flow, "_drop_status", noop)
     monkeypatch.setattr(flow.R, "_reset_flow", reset)
-    monkeypatch.setattr(flow.rate_limiter, "check_image_limit", allow)
+    monkeypatch.setattr(flow.rate_limiter, "consume_image_bucket", allow)
     monkeypatch.setattr(flow.cost_tracker, "release_reservation", noop)
 
     answers: list[str] = []
@@ -515,7 +515,7 @@ async def test_image_rate_limit_restores_album_and_resets_flow(
     )
     resets: list[object] = []
 
-    async def blocked(_user_id: int) -> bool:
+    async def blocked(*_args: object, **_kwargs: object) -> bool:
         return False
 
     async def retry(_user_id: int, _kind: str) -> int:
@@ -524,7 +524,7 @@ async def test_image_rate_limit_restores_album_and_resets_flow(
     async def reset(state: object) -> None:
         resets.append(state)
 
-    monkeypatch.setattr(flow.rate_limiter, "check_image_limit", blocked)
+    monkeypatch.setattr(flow.rate_limiter, "consume_image_bucket", blocked)
     monkeypatch.setattr(flow.rate_limiter, "get_retry_after", retry)
     monkeypatch.setattr(flow.R, "_reset_flow", reset)
 
