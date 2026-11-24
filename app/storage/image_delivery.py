@@ -167,9 +167,14 @@ def _remaining_ttl(created_at: float, now: float) -> int:
 
 
 def _payload_from(raw: object) -> ImageDelivery | None:
-    if not raw:
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, (bytes, bytearray)):
+        text = raw.decode("utf-8")
+    else:
         return None
-    text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+    if not text:
+        return None
     return ImageDelivery.from_json(text)
 
 
