@@ -77,7 +77,7 @@ ALLOWED_EXTENSIONS = (
 
 def _declared_file_size(value: object) -> int | None:
     """Размер из JSON. ``true``/``false`` не размер: ``bool`` — подкласс ``int``."""
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
 

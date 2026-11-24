@@ -198,9 +198,9 @@ pytest tests/ -v
 
 CI на push и pull request в `main`: ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
 
-После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA, затем шаг Deploy over SSH на VPS выполняет `docker compose pull` и `docker compose up -d` в `/home/deploy/AI_assistans`. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
+После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA, затем шаг Deploy over SSH в `/home/deploy/AI_assistans` делает `docker compose --profile arq pull`. `up -d` идёт с тем же профилем, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
 
-Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа. Скрипт не передаёт `--profile arq`: при `ARQ_ENABLED=1` воркер остаётся на старом образе, пока в `deploy.yml` к `pull` и `up` не добавлен этот профиль.
+Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа.
 
 ### Чеклист Deploy over SSH
 
@@ -212,9 +212,9 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
    APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:latest
    ```
 3. Под `deploy`: `docker login ghcr.io` (PAT с `read:packages`), если пакет private.
-4. Вручную: `cd /home/deploy/AI_assistans && docker compose pull && docker compose up -d`. Если в `.env` стоит `ARQ_ENABLED=1`, те же команды с `--profile arq`, иначе воркер не подхватит новый образ. Контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai-assistans-bot`.
+4. Первый раз вручную: `cd /home/deploy/AI_assistans && docker compose --profile arq pull && docker compose up -d`. Если воркер уже запущен, `up` тоже с `--profile arq`. Контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai-assistans-bot`.
 5. Секреты репозитория: `SSH_HOST`, `SSH_USER` (`deploy`), `SSH_PRIVATE_KEY` (отдельный ключ для Actions, pubkey в `authorized_keys` у `deploy`).
-6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` уже включён. При `ARQ_ENABLED=1` в его script нужны `docker compose --profile arq pull` и `docker compose --profile arq up -d`.
+6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` включён и сам выбирает профиль: образ воркера подтягивается всегда, контейнер пересоздаётся только пока он `running` или `restarting`.
 
 Redis в Compose: AOF, потолок `REDIS_MAXMEMORY` (по умолчанию 256mb), политика `volatile-ttl`. У тем, персон, FSM (состояние и data, 30 суток с последней записи), бюджета, лимитов и буферов очереди есть срок жизни. Когда память кончается, Redis снимает ключ с самым коротким остатком TTL: сначала окна лимитов и временные payload, потом давно не открытые темы. Активный чат продлевает TTL при обращении и освобождается последним. Запись истории при этом не останавливается целиком. Пароль — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
 

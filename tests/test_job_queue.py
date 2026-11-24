@@ -141,6 +141,56 @@ def test_image_result_timeout_ignores_short_arq_job_timeout(
     assert job_queue.image_result_timeout() == pytest.approx(450.0)
 
 
+def test_image_result_timeout_covers_queue_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    monkeypatch.setenv("ARQ_MAX_JOBS", "10")
+    # 30 в очереди: волна in-progress + 3 пачки, затем своё выполнение.
+    assert job_queue.image_result_timeout(queued=30) == pytest.approx(5 * 450.0)
+    assert job_queue.image_result_timeout(queued=0) == pytest.approx(450.0)
+    assert job_queue.image_result_timeout(120.0, queued=30) == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
+async def test_generate_image_wait_includes_queue_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLZA_TOTAL_WAIT", "240")
+    monkeypatch.setenv("ARQ_JOB_TIMEOUT", "450")
+    monkeypatch.setenv("ARQ_MAX_JOBS", "10")
+    await job_queue.close_job_queue()
+    job_queue._enabled = True
+    seen: dict[str, float] = {}
+
+    class Job:
+        job_id = "job-1"
+
+        async def result(self, timeout: float) -> list[str]:
+            seen["timeout"] = timeout
+            return ["ok"]
+
+    class Pool:
+        async def zcard(self, key: str) -> int:
+            assert key == "arq:queue"
+            return 30
+
+        async def enqueue_job(self, *args: object, **kwargs: object) -> Job:
+            return Job()
+
+    job_queue._pool = Pool()
+    try:
+        result = await job_queue.generate_image(
+            SimpleNamespace(), "cat", "model-a", "512x512"
+        )
+    finally:
+        job_queue._enabled = False
+        job_queue._pool = None
+    assert result == ["ok"]
+    assert seen["timeout"] == pytest.approx(5 * 450.0)
+
+
 def test_validate_arq_image_timeout_rejects_short_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

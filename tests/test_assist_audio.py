@@ -12,6 +12,7 @@ import structlog
 from prometheus_client import REGISTRY
 from respx import MockRouter
 
+from app.infra.circuit_breaker import CircuitState, get_breaker
 from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
 from app.llm.media_api import SpeechResult
@@ -215,3 +216,52 @@ async def test_synthesize_speech_client_error_no_fallback(
     assert info.value.status_code == 400
     assert len(polza.calls) == 1
     assert not proxy.called
+    assert get_breaker("polza").state == CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_skips_stt_and_falls_back(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"audio": "polza", "image": "polza"},
+        audio_fallback="proxyapi",
+    )
+    polza = get_breaker("polza")
+    for _ in range(polza.failure_threshold):
+        await polza._on_failure(RuntimeError("down"))
+    with respx.mock(assert_all_called=False) as router:
+        primary = router.post("https://polza.ai/api/v1/audio/transcriptions").mock(
+            return_value=httpx.Response(200, json={"text": "не должен"})
+        )
+        proxy = router.post(TRANSCRIBE_URL).mock(
+            return_value=httpx.Response(200, json={"text": "запас"})
+        )
+        heard = await client.transcribe_audio(b"fake-ogg", filename="voice.ogg")
+    assert heard.text == "запас"
+    assert not primary.called
+    assert len(proxy.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_skips_tts_and_falls_back(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"audio": "polza", "image": "polza"},
+        audio_fallback="proxyapi",
+    )
+    polza = get_breaker("polza")
+    for _ in range(polza.failure_threshold):
+        await polza._on_failure(RuntimeError("down"))
+    with respx.mock(assert_all_called=False) as router:
+        primary = router.post(_POLZA_SPEECH).mock(
+            return_value=httpx.Response(200, content=b"nope")
+        )
+        proxy = router.post(SPEECH_URL).mock(
+            return_value=httpx.Response(200, content=b"proxy-ogg")
+        )
+        speech = await client.synthesize_speech("Привет")
+    assert speech.audio == b"proxy-ogg"
+    assert not primary.called
+    assert len(proxy.calls) == 1

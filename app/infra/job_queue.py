@@ -162,18 +162,36 @@ def validate_arq_image_timeout() -> None:
         )
 
 
-def image_result_timeout(explicit: float | None = None) -> float:
+def _waves_until_start(queued: int, max_jobs: int) -> int:
+    """Волны до старта: занятые слоты и пачки backlog по ``max_jobs``.
+
+    Пустая очередь всё равно одна волна: zcard не видит уже идущие задачи.
+    """
+    waiting = max(0, queued)
+    return 1 + math.ceil(waiting / max(1, max_jobs))
+
+
+def image_result_timeout(explicit: float | None = None, *, queued: int = 0) -> float:
     """Бот ждёт задачу не меньше, чем воркеру разрешено её выполнять.
 
     Ниже ``image create + POLZA_TOTAL_WAIT + 30`` не опускается.
     Короткий ``ARQ_JOB_TIMEOUT`` отклоняет ``validate_arq_image_timeout``.
+    Если в очереди уже есть задачи, добавляется их ожидание: текущая волна
+    и пачки по ``ARQ_MAX_JOBS``, затем своё выполнение. Иначе бот сдаётся
+    через один ``job_timeout``, а оплаченная задача остаётся в backlog.
+    Явный ``explicit`` не растягивается.
     """
     if explicit is not None:
         return explicit
     from app.infra.settings import get_settings
 
-    job_timeout = get_settings().arq_job_timeout_seconds
-    return max(_polza_image_wait_needed(), job_timeout)
+    settings = get_settings()
+    job_timeout = max(0.0, settings.arq_job_timeout_seconds)
+    base = max(_polza_image_wait_needed(), job_timeout)
+    if queued <= 0:
+        return base
+    slot = job_timeout if job_timeout > 0 else base
+    return base + _waves_until_start(queued, settings.arq_max_jobs) * slot
 
 
 def audio_result_timeout(explicit: float | None = None) -> float:
@@ -197,9 +215,7 @@ def _payload_ttl_seconds(queued: int = 0) -> int:
     settings = get_settings()
     job_timeout = max(0.0, settings.arq_job_timeout_seconds)
     polza_wait = max(0.0, settings.polza_total_wait_seconds)
-    max_jobs = max(1, settings.arq_max_jobs)
-    waiting = max(0, queued)
-    waves = 1 + math.ceil(waiting / max_jobs)
+    waves = _waves_until_start(queued, settings.arq_max_jobs)
     return int(
         max(
             600.0,
@@ -210,17 +226,21 @@ def _payload_ttl_seconds(queued: int = 0) -> int:
     )
 
 
-async def _staged_payload_ttl(pool: Any) -> int:
-    """TTL с учётом текущего размера очереди arq."""
+async def _queue_depth(pool: Any) -> int:
+    """Сколько задач ждут слот. Уже выполняющиеся в zcard не входят."""
     from arq.constants import default_queue_name
 
-    queued = 0
     try:
         depth = await pool.zcard(default_queue_name)
-        queued = max(0, int(depth))
+        return max(0, int(depth))
     except Exception as exc:
         logger.warning("arq_queue_depth_failed", error=str(exc))
-    return _payload_ttl_seconds(queued)
+        return 0
+
+
+async def _staged_payload_ttl(pool: Any) -> int:
+    """TTL с учётом текущего размера очереди arq."""
+    return _payload_ttl_seconds(await _queue_depth(pool))
 
 
 def _arq_enqueue_failed(task: str) -> Exception:
@@ -251,9 +271,9 @@ async def generate_image(
 ) -> list[str]:
     """Generate an image via arq worker or inline client."""
     user_id = _billing_user_id(billing_user_id)
-    wait = image_result_timeout(timeout)
     if is_queue_enabled():
         assert _pool is not None
+        wait = image_result_timeout(timeout, queued=await _queue_depth(_pool))
         try:
             job = await _pool.enqueue_job(
                 "generate_image_task",
@@ -289,8 +309,9 @@ async def edit_images(
 ) -> list[str]:
     """Правит фото через arq (байты в Redis) или сразу в процессе."""
     user_id = _billing_user_id(billing_user_id)
-    wait = image_result_timeout(timeout)
     if is_queue_enabled() and _pool is not None:
+        queued = await _queue_depth(_pool)
+        wait = image_result_timeout(timeout, queued=queued)
         key = f"arq:edit:{uuid.uuid4().hex}"
         payload = [
             {
@@ -301,9 +322,7 @@ async def edit_images(
             for data, name, mime in files
         ]
         try:
-            await _pool.set(
-                key, json.dumps(payload), ex=await _staged_payload_ttl(_pool)
-            )
+            await _pool.set(key, json.dumps(payload), ex=_payload_ttl_seconds(queued))
             job = await _pool.enqueue_job(
                 "edit_image_task",
                 key,

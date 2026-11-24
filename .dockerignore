@@ -9,7 +9,9 @@ venv
 .ruff_cache
 __pycache__
 tests
-scripts
+# В образ нужен только entrypoint. Остальное в scripts/ — хостовые бэкапы и пробы.
+scripts/*
+!scripts/docker-entrypoint.sh
 artifacts
 backups
 *.md
