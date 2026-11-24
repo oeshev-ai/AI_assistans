@@ -332,8 +332,16 @@ async def test_long_audio_rejected_after_extract_before_stt(
     monkeypatch.setattr(runtime.job_queue, "transcribe_audio", transcribe)
 
     # Пол (~$0.0015) проходит, добор по 10 000 с — нет.
+    # Расход других тестов в общем счётчике не должен съедать этот потолок.
     monkeypatch.setenv("LLM_DAILY_BUDGET_USD", "0.02")
     monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "0.02")
+    day = cost_tracker._day_key()
+    day_key = f"cost:day:{day}"
+    user_key = f"cost:user:{user_id}:day:{day}"
+    before_day = cost_tracker._memory.get(day_key, 0.0)
+    before_user = cost_tracker._memory.get(user_key, 0.0)
+    cost_tracker._memory[day_key] = 0.0
+    cost_tracker._memory[user_key] = 0.0
     token = cost_tracker_mod._budget_holds.set(())
     try:
         await runtime._process_s3_upload_session(
@@ -352,6 +360,8 @@ async def test_long_audio_rejected_after_extract_before_stt(
         assert cost_tracker_mod._reserved_amount() == pytest.approx(0.0)
     finally:
         await cost_tracker.release_reservation(user_id)
+        cost_tracker._memory[day_key] = before_day
+        cost_tracker._memory[user_key] = before_user
         cost_tracker_mod._budget_holds.reset(token)
 
 
