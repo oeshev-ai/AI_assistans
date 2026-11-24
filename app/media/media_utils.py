@@ -219,9 +219,7 @@ async def _run_ffmpeg(
     proc: asyncio.subprocess.Process,
 ) -> tuple[bytes | None, bytes | None]:
     try:
-        return await communicate_with_timeout(
-            proc, timeout=_FFMPEG_TIMEOUT_SECONDS
-        )
+        return await communicate_with_timeout(proc, timeout=_FFMPEG_TIMEOUT_SECONDS)
     except TimeoutError:
         logger.error("ffmpeg_timeout", timeout=_FFMPEG_TIMEOUT_SECONDS)
         raise MediaProcessingError(

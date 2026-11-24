@@ -313,9 +313,7 @@ class ProviderTransportMixin:
                     API_CALLS.labels(
                         service=target.id, endpoint="chat_stream", status="error"
                     ).inc()
-                    ERRORS.labels(
-                        error_type=type(exc).__name__, module=target.id
-                    ).inc()
+                    ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
                     if counts_toward_circuit(exc):
                         await probe.failure(exc)
                     raise
@@ -323,9 +321,7 @@ class ProviderTransportMixin:
                     API_CALLS.labels(
                         service=target.id, endpoint="chat_stream", status="error"
                     ).inc()
-                    ERRORS.labels(
-                        error_type="TimeoutException", module=target.id
-                    ).inc()
+                    ERRORS.labels(error_type="TimeoutException", module=target.id).inc()
                     await probe.failure(exc)
                     logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
                     raise AssistAIError(
@@ -336,9 +332,7 @@ class ProviderTransportMixin:
                     API_CALLS.labels(
                         service=target.id, endpoint="chat_stream", status="error"
                     ).inc()
-                    ERRORS.labels(
-                        error_type=type(exc).__name__, module=target.id
-                    ).inc()
+                    ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
                     await probe.failure(exc)
                     logger.error(
                         "proxy_api_stream_network", path=_CHAT_PATH, error=str(exc)

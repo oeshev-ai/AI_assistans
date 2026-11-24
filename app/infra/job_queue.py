@@ -301,7 +301,9 @@ async def edit_images(
             for data, name, mime in files
         ]
         try:
-            await _pool.set(key, json.dumps(payload), ex=await _staged_payload_ttl(_pool))
+            await _pool.set(
+                key, json.dumps(payload), ex=await _staged_payload_ttl(_pool)
+            )
             job = await _pool.enqueue_job(
                 "edit_image_task",
                 key,

@@ -284,7 +284,10 @@ async def test_early_stream_close_does_not_stick_half_open(
         return_value=httpx.Response(200, text=body)
     )
 
-    messages = {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    messages = {
+        "model": "openai/gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
     agen = assist_client._iter_chat_chunks(messages)
     chunk = await anext(agen)
     assert chunk["choices"][0]["delta"]["content"] == "a"

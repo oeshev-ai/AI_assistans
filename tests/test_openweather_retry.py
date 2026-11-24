@@ -21,9 +21,7 @@ def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _response(status: int, body: dict | None = None) -> httpx.Response:
-    request = httpx.Request(
-        "GET", "https://api.openweathermap.org/data/2.5/weather"
-    )
+    request = httpx.Request("GET", "https://api.openweathermap.org/data/2.5/weather")
     kwargs: dict = {"status_code": status, "request": request}
     if body is not None:
         kwargs["json"] = body
@@ -51,7 +49,9 @@ async def test_retries_503_then_returns_body(fast_retry: None) -> None:
 
     client = await _client_with(get)
     try:
-        assert await client._make_request_raw("https://example.test", {}) == {"ok": True}
+        assert await client._make_request_raw("https://example.test", {}) == {
+            "ok": True
+        }
     finally:
         await client.close()
     assert calls == 3
