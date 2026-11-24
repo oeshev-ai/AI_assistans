@@ -276,16 +276,30 @@ class GenerateImageTool(BaseTool):
         ):
             background = None
         used_model = selected_model or self._client.config.default_image_model
+        from app.infra.cost_tracker import get_billing_user
+        from app.infra.image_gate import image_user_slot
+        from app.infra.rate_limiter import rate_limiter
+
+        user_id = get_billing_user()
+        if user_id is not None and not await rate_limiter.consume_image_bucket(
+            user_id, "image_generate"
+        ):
+            retry_after = await rate_limiter.get_retry_after(user_id, "image_generate")
+            return _error_json(
+                "Слишком много запросов картинок. "
+                f"Подождите {int(retry_after) or 60} секунд."
+            )
         try:
             import app.infra.job_queue as job_queue
 
-            images = await job_queue.generate_image(
-                self._client,
-                prompt.strip(),
-                selected_model,
-                size.strip(),
-                background=background,
-            )
+            async with image_user_slot(user_id):
+                images = await job_queue.generate_image(
+                    self._client,
+                    prompt.strip(),
+                    selected_model,
+                    size.strip(),
+                    background=background,
+                )
         except BudgetExceededError as exc:
             logger.warning("generate_image_budget_exceeded", error=exc.message)
             return _error_json(exc.message)

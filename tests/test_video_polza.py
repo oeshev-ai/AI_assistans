@@ -12,6 +12,7 @@ import respx
 import structlog
 from prometheus_client import REGISTRY
 
+from app.infra.circuit_breaker import get_breaker
 from app.llm.assist_ai import AssistAIClient
 from app.llm.errors import AssistAIError
 from app.llm.media_api import VideoReference
@@ -33,6 +34,25 @@ def _fallback_count(source: str, target: str, reason: str) -> float:
 def test_resolve_polza_video_model_alias() -> None:
     assert resolve_polza_video_model("bytedance/seedance-2.0") == "bytedance/seedance-2"
     assert resolve_polza_video_model("bytedance/seedance-2") == "bytedance/seedance-2"
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_skips_polza_video(
+    multi_client_factory: Callable[..., AssistAIClient],
+) -> None:
+    client = multi_client_factory(
+        routes={"video": "polza", "image": "polza"},
+        video_fallback="",
+    )
+    breaker = get_breaker("polza")
+    for _ in range(breaker.failure_threshold):
+        await breaker._on_failure(RuntimeError("down"))
+    with respx.mock(assert_all_called=False) as router:
+        media = router.post(_POLZA_MEDIA).mock(return_value=httpx.Response(200))
+        with pytest.raises(AssistAIError) as info:
+            await client.generate_video("кот бежит")
+    assert info.value.error_code == "CIRCUIT_OPEN"
+    assert not media.called
 
 
 def test_build_video_body_seedance() -> None:

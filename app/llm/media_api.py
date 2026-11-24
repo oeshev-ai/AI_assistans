@@ -16,11 +16,12 @@ from urllib.parse import quote, urlparse, urlunparse
 import httpx
 import structlog
 
+from app.infra.circuit_breaker import CircuitBreakerError, get_breaker
 from app.infra.cost_tracker import cost_tracker, extract_cost_rub, video_usd
 from app.infra.metrics import note_provider_fallback
 from app.infra.security import security
 from app.llm import polza_media
-from app.llm.errors import AssistAIError, fallback_reason
+from app.llm.errors import AssistAIError, counts_toward_circuit, fallback_reason
 from app.llm.models_config import resolve_polza_video_model
 from app.llm.providers import ProviderConfig
 from app.llm.transport import (
@@ -857,21 +858,27 @@ class MediaApiMixin(ProviderTransportMixin):
         polza_model = resolve_polza_video_model(catalog_model) or catalog_model
         # Video jobs often exceed the image poll budget; floor at ProxyAPI poll max.
         total_wait = max(float(self.config.polza_total_wait), _VIDEO_POLL_MAX_SECONDS)
-        media = await polza_media.generate_video(
-            self._client_for(provider),
-            provider,
-            model=polza_model,
-            prompt=prompt,
-            duration=duration,
-            resolution=resolution,
-            aspect_ratio=aspect_ratio or "16:9",
-            generate_audio=generate_audio,
-            images=polza_reference_images(references) or None,
-            poll_interval=max(
-                float(self.config.polza_poll_interval), _VIDEO_POLL_INTERVAL
+        media = await self._call_under_breaker(
+            provider.id,
+            lambda: polza_media.generate_video(
+                self._client_for(provider),
+                provider,
+                model=polza_model,
+                prompt=prompt,
+                duration=duration,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio or "16:9",
+                generate_audio=generate_audio,
+                images=polza_reference_images(references) or None,
+                poll_interval=max(
+                    float(self.config.polza_poll_interval), _VIDEO_POLL_INTERVAL
+                ),
+                total_wait=total_wait,
+                timeout=timeout,
             ),
-            total_wait=total_wait,
-            timeout=timeout,
+            unavailable=(
+                "⚠️ Сервис генерации видео временно недоступен. Попробуйте через минуту."
+            ),
         )
         # Media job already completed/billed on Polza — download failures stay put.
         first = media.images[0]
@@ -1329,6 +1336,32 @@ class MediaApiMixin(ProviderTransportMixin):
         ) as anon:
             return await anon.get(request_url, extensions=extensions or None)
 
+    async def _call_under_breaker(
+        self,
+        provider_id: str,
+        call: Callable[[], Awaitable[_T]],
+        *,
+        unavailable: str,
+    ) -> _T:
+        """Один вызов провайдера под его circuit breaker.
+
+        4xx и 429 breaker не открывают. Уже открытый контур даёт
+        ``CIRCUIT_OPEN`` без HTTP, и fallback может уйти на другой хост.
+        """
+        breaker = get_breaker(provider_id)
+        try:
+            async with breaker.attempt() as probe:
+                try:
+                    result = await call()
+                except AssistAIError as exc:
+                    if counts_toward_circuit(exc):
+                        await probe.failure(exc)
+                    raise
+                await probe.success()
+                return result
+        except CircuitBreakerError as exc:
+            raise AssistAIError(unavailable, error_code="CIRCUIT_OPEN") from exc
+
     async def _call_with_fallback(
         self,
         primary: ProviderConfig,
@@ -1423,83 +1456,103 @@ class MediaApiMixin(ProviderTransportMixin):
         )
 
         async def attempt(provider: ProviderConfig) -> TranscriptionResult:
-            label = _provider_label(provider)
-            url = f"{_request_base(provider, _TRANSCRIBE_PATH)}/{_TRANSCRIBE_PATH}"
-            try:
-                # Базовый клиент шлёт Content-Type: application/json. Для multipart
-                # нужен отдельный клиент без этого заголовка, иначе boundary пропадёт.
-                async with httpx.AsyncClient(
+            return await self._call_under_breaker(
+                provider.id,
+                lambda: self._transcribe_provider(
+                    provider,
+                    form=form,
+                    files=files,
                     timeout=timeout,
-                    follow_redirects=False,
-                    verify=_ssl_context(),
-                    headers={
-                        "Authorization": f"Bearer {provider.api_key}",
-                        "User-Agent": "AssistAIClient/1.0",
-                    },
-                ) as client:
-                    response = await client.post(url, data=form, files=files)
-                    response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = _response_error_text(exc.response)
-                logger.error(
-                    "audio_http_error",
-                    status_code=exc.response.status_code,
-                    path=_TRANSCRIBE_PATH,
-                    provider=provider.id,
-                    detail=detail,
-                )
-                raise AssistAIError(
-                    f"{label} вернул HTTP {exc.response.status_code}: {detail}",
-                    status_code=exc.response.status_code,
-                ) from exc
-            except httpx.TimeoutException as exc:
-                logger.error(
-                    "audio_timeout", path=_TRANSCRIBE_PATH, provider=provider.id
-                )
-                raise AssistAIError(
-                    f"Превышено время ожидания ответа {label} ({_TRANSCRIBE_PATH}).",
-                    error_code="TIMEOUT",
-                ) from exc
-            except httpx.RequestError as exc:
-                logger.error(
-                    "audio_network_error",
-                    path=_TRANSCRIBE_PATH,
-                    provider=provider.id,
-                    error=str(exc),
-                )
-                raise AssistAIError(
-                    f"Сетевая ошибка при обращении к {label}: {exc}",
-                    error_code="NETWORK_ERROR",
-                ) from exc
-
-            try:
-                data = response.json()
-            except ValueError as exc:
-                logger.error(
-                    "audio_non_json", path=_TRANSCRIBE_PATH, provider=provider.id
-                )
-                raise AssistAIError(f"{label} вернул ответ не в формате JSON.") from exc
-            if not isinstance(data, dict):
-                raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
-            text = data.get("text")
-            recognized_text = text.strip() if isinstance(text, str) else ""
-            usage = data.get("usage")
-            cost_usd, cost_rub, cost_source = _usage_price(
-                usage if isinstance(usage, dict) else None,
-                self.config.rub_per_usd,
-            )
-            return TranscriptionResult(
-                text=recognized_text,
-                cost_usd=cost_usd,
-                cost_rub=cost_rub,
-                cost_source=cost_source,
-                provider_id=provider.id,
-                model=selected_model,
+                    model=selected_model,
+                ),
+                unavailable=(
+                    "⚠️ Сервис распознавания речи временно недоступен. "
+                    "Попробуйте через минуту."
+                ),
             )
 
         recognized = await self._audio_with_fallback(attempt)
         logger.info("transcribe_audio: символов=%s", len(recognized.text))
         return recognized
+
+    async def _transcribe_provider(
+        self,
+        provider: ProviderConfig,
+        *,
+        form: dict[str, str],
+        files: dict[str, tuple[str, bytes, str]],
+        timeout: httpx.Timeout,
+        model: str,
+    ) -> TranscriptionResult:
+        label = _provider_label(provider)
+        url = f"{_request_base(provider, _TRANSCRIBE_PATH)}/{_TRANSCRIBE_PATH}"
+        try:
+            # Базовый клиент шлёт Content-Type: application/json. Для multipart
+            # нужен отдельный клиент без этого заголовка, иначе boundary пропадёт.
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                verify=_ssl_context(),
+                headers={
+                    "Authorization": f"Bearer {provider.api_key}",
+                    "User-Agent": "AssistAIClient/1.0",
+                },
+            ) as client:
+                response = await client.post(url, data=form, files=files)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            logger.error(
+                "audio_http_error",
+                status_code=exc.response.status_code,
+                path=_TRANSCRIBE_PATH,
+                provider=provider.id,
+                detail=detail,
+            )
+            raise AssistAIError(
+                f"{label} вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.error("audio_timeout", path=_TRANSCRIBE_PATH, provider=provider.id)
+            raise AssistAIError(
+                f"Превышено время ожидания ответа {label} ({_TRANSCRIBE_PATH}).",
+                error_code="TIMEOUT",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error(
+                "audio_network_error",
+                path=_TRANSCRIBE_PATH,
+                provider=provider.id,
+                error=str(exc),
+            )
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к {label}: {exc}",
+                error_code="NETWORK_ERROR",
+            ) from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            logger.error("audio_non_json", path=_TRANSCRIBE_PATH, provider=provider.id)
+            raise AssistAIError(f"{label} вернул ответ не в формате JSON.") from exc
+        if not isinstance(data, dict):
+            raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
+        text = data.get("text")
+        recognized_text = text.strip() if isinstance(text, str) else ""
+        usage = data.get("usage")
+        cost_usd, cost_rub, cost_source = _usage_price(
+            usage if isinstance(usage, dict) else None,
+            self.config.rub_per_usd,
+        )
+        return TranscriptionResult(
+            text=recognized_text,
+            cost_usd=cost_usd,
+            cost_rub=cost_rub,
+            cost_source=cost_source,
+            provider_id=provider.id,
+            model=model,
+        )
 
     async def synthesize_speech(
         self,
@@ -1562,100 +1615,121 @@ class MediaApiMixin(ProviderTransportMixin):
         )
 
         async def attempt(provider: ProviderConfig) -> SpeechResult:
-            label = _provider_label(provider)
-            url = f"{_request_base(provider, _SPEECH_PATH)}/{_SPEECH_PATH}"
-            try:
-                response = await self._client_for(provider).post(
-                    url, json=payload, timeout=timeout
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = _response_error_text(exc.response)
-                logger.error(
-                    "audio_http_error",
-                    status_code=exc.response.status_code,
-                    path=_SPEECH_PATH,
-                    provider=provider.id,
-                    detail=detail,
-                )
-                raise AssistAIError(
-                    f"{label} вернул HTTP {exc.response.status_code}: {detail}",
-                    status_code=exc.response.status_code,
-                ) from exc
-            except httpx.TimeoutException as exc:
-                logger.error("audio_timeout", path=_SPEECH_PATH, provider=provider.id)
-                raise AssistAIError(
-                    f"Превышено время ожидания ответа {label} ({_SPEECH_PATH}).",
-                    error_code="TIMEOUT",
-                ) from exc
-            except httpx.RequestError as exc:
-                logger.error(
-                    "audio_network_error",
-                    path=_SPEECH_PATH,
-                    provider=provider.id,
-                    error=str(exc),
-                )
-                raise AssistAIError(
-                    f"Сетевая ошибка при обращении к {label}: {exc}",
-                    error_code="NETWORK_ERROR",
-                ) from exc
-
-            filename, mime_type = _speech_file(selected_format)
-            cost_usd: float | None = None
-            cost_rub: float | None = None
-            cost_source: str | None = None
-            if provider.kind == "polza_media":
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    raise AssistAIError(
-                        f"{label} вернул ответ не в формате JSON."
-                    ) from exc
-                if not isinstance(data, dict):
-                    raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
-                raw_audio = data.get("audio")
-                if not isinstance(raw_audio, str) or not raw_audio.strip():
-                    raise AssistAIError(f"{label} вернул пустой аудиоответ.")
-                try:
-                    audio = base64.b64decode(raw_audio, validate=False)
-                except Exception as exc:
-                    raise AssistAIError(
-                        f"{label} вернул некорректный base64 аудио."
-                    ) from exc
-                if not audio:
-                    raise AssistAIError(f"{label} вернул пустой аудиоответ.")
-                usage = data.get("usage")
-                cost_usd, cost_rub, cost_source = _usage_price(
-                    usage if isinstance(usage, dict) else None,
-                    self.config.rub_per_usd,
-                )
-                content_type = data.get("contentType")
-                if isinstance(content_type, str) and content_type.strip():
-                    mime_type = content_type.strip()
-                    if "mpeg" in mime_type or mime_type.endswith("/mp3"):
-                        filename = "answer.mp3"
-                    elif "ogg" in mime_type or "opus" in mime_type:
-                        filename = "answer.ogg"
-                    elif "wav" in mime_type:
-                        filename = "answer.wav"
-            else:
-                audio = response.content
-                if not audio:
-                    raise AssistAIError(f"{label} вернул пустой аудиоответ.")
-            return SpeechResult(
-                audio=audio,
-                filename=filename,
-                mime_type=mime_type,
-                cost_usd=cost_usd,
-                cost_rub=cost_rub,
-                cost_source=cost_source,
-                provider_id=provider.id,
-                model=selected_model,
+            return await self._call_under_breaker(
+                provider.id,
+                lambda: self._synthesize_provider(
+                    provider,
+                    payload=payload,
+                    selected_format=selected_format,
+                    selected_model=selected_model,
+                    timeout=timeout,
+                ),
+                unavailable=(
+                    "⚠️ Сервис озвучки временно недоступен. Попробуйте через минуту."
+                ),
             )
 
         speech = await self._tts_with_fallback(attempt)
         logger.info("synthesize_speech: байт=%s", len(speech.audio))
         return speech
+
+    async def _synthesize_provider(
+        self,
+        provider: ProviderConfig,
+        *,
+        payload: dict[str, Any],
+        selected_format: str,
+        selected_model: str,
+        timeout: httpx.Timeout,
+    ) -> SpeechResult:
+        label = _provider_label(provider)
+        url = f"{_request_base(provider, _SPEECH_PATH)}/{_SPEECH_PATH}"
+        try:
+            response = await self._client_for(provider).post(
+                url, json=payload, timeout=timeout
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _response_error_text(exc.response)
+            logger.error(
+                "audio_http_error",
+                status_code=exc.response.status_code,
+                path=_SPEECH_PATH,
+                provider=provider.id,
+                detail=detail,
+            )
+            raise AssistAIError(
+                f"{label} вернул HTTP {exc.response.status_code}: {detail}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            logger.error("audio_timeout", path=_SPEECH_PATH, provider=provider.id)
+            raise AssistAIError(
+                f"Превышено время ожидания ответа {label} ({_SPEECH_PATH}).",
+                error_code="TIMEOUT",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error(
+                "audio_network_error",
+                path=_SPEECH_PATH,
+                provider=provider.id,
+                error=str(exc),
+            )
+            raise AssistAIError(
+                f"Сетевая ошибка при обращении к {label}: {exc}",
+                error_code="NETWORK_ERROR",
+            ) from exc
+
+        filename, mime_type = _speech_file(selected_format)
+        cost_usd: float | None = None
+        cost_rub: float | None = None
+        cost_source: str | None = None
+        if provider.kind == "polza_media":
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise AssistAIError(f"{label} вернул ответ не в формате JSON.") from exc
+            if not isinstance(data, dict):
+                raise AssistAIError(f"{label} вернул неожиданный формат ответа.")
+            raw_audio = data.get("audio")
+            if not isinstance(raw_audio, str) or not raw_audio.strip():
+                raise AssistAIError(f"{label} вернул пустой аудиоответ.")
+            try:
+                audio = base64.b64decode(raw_audio, validate=False)
+            except Exception as exc:
+                raise AssistAIError(
+                    f"{label} вернул некорректный base64 аудио."
+                ) from exc
+            if not audio:
+                raise AssistAIError(f"{label} вернул пустой аудиоответ.")
+            usage = data.get("usage")
+            cost_usd, cost_rub, cost_source = _usage_price(
+                usage if isinstance(usage, dict) else None,
+                self.config.rub_per_usd,
+            )
+            content_type = data.get("contentType")
+            if isinstance(content_type, str) and content_type.strip():
+                mime_type = content_type.strip()
+                if "mpeg" in mime_type or mime_type.endswith("/mp3"):
+                    filename = "answer.mp3"
+                elif "ogg" in mime_type or "opus" in mime_type:
+                    filename = "answer.ogg"
+                elif "wav" in mime_type:
+                    filename = "answer.wav"
+        else:
+            audio = response.content
+            if not audio:
+                raise AssistAIError(f"{label} вернул пустой аудиоответ.")
+        return SpeechResult(
+            audio=audio,
+            filename=filename,
+            mime_type=mime_type,
+            cost_usd=cost_usd,
+            cost_rub=cost_rub,
+            cost_source=cost_source,
+            provider_id=provider.id,
+            model=selected_model,
+        )
 
     async def _synthesize_speech_speechkit(
         self,
@@ -1680,17 +1754,39 @@ class MediaApiMixin(ProviderTransportMixin):
             url=self.config.speechkit_url,
         )
         read_timeout = max(self.config.timeout, _SPEECH_READ_TIMEOUT)
-        try:
-            audio = await synthesize(
-                text,
-                config=sk_config,
-                voice=voice,
-                role=role,
-                http=self._http,
-                timeout=read_timeout,
-            )
-        except SpeechKitError as exc:
-            raise AssistAIError(exc.message, status_code=exc.status_code) from exc
+
+        async def call() -> bytes:
+            try:
+                return await synthesize(
+                    text,
+                    config=sk_config,
+                    voice=voice,
+                    role=role,
+                    http=self._http,
+                    timeout=read_timeout,
+                )
+            except SpeechKitError as exc:
+                cause = exc.__cause__
+                error_code = None
+                if isinstance(cause, httpx.TimeoutException):
+                    error_code = "TIMEOUT"
+                elif isinstance(cause, httpx.RequestError) and not isinstance(
+                    cause, httpx.HTTPStatusError
+                ):
+                    error_code = "NETWORK_ERROR"
+                raise AssistAIError(
+                    exc.message,
+                    status_code=exc.status_code,
+                    error_code=error_code,
+                ) from exc
+
+        audio = await self._call_under_breaker(
+            "speechkit",
+            call,
+            unavailable=(
+                "⚠️ Сервис озвучки временно недоступен. Попробуйте через минуту."
+            ),
+        )
         filename, mime_type = _speech_file("opus")
         logger.info("synthesize_speech speechkit: байт=%s", len(audio))
         return SpeechResult(audio=audio, filename=filename, mime_type=mime_type)

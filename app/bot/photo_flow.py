@@ -14,6 +14,7 @@ from app.infra.cost_tracker import (
     cost_tracker,
     set_billing_user,
 )
+from app.infra.image_gate import image_user_slot
 from app.infra.rate_limiter import rate_limiter
 from app.infra.security import security
 from app.llm.errors import AssistAIError
@@ -226,6 +227,34 @@ async def route_album(
         topic_id,
         pending_claimed=pending_claimed,
     )
+
+
+async def _deliver_images(
+    message: Any, images: list[str], *, as_file: bool
+) -> tuple[str | None, AssistAIError | None]:
+    """Отправляет пачку. Уже отправленный file_id сохраняется, если следующая упала.
+
+    Повторный flood control не обрывает остальные кадры.
+    """
+    from aiogram.exceptions import TelegramRetryAfter
+
+    kept: str | None = None
+    for index, image in enumerate(images):
+        try:
+            sent = await R._send_generated_image(message, image, index, as_file=as_file)
+        except TelegramRetryAfter:
+            logger.warning(
+                "telegram_photo_retry_exhausted",
+                chat_id=message.chat.id,
+                index=index,
+            )
+            continue
+        except AssistAIError as exc:
+            return kept, exc
+        file_id = result_file_id(sent)
+        if file_id:
+            kept = file_id
+    return kept, None
 
 
 def result_file_id(sent: Any) -> str | None:
@@ -513,8 +542,8 @@ async def _edit(
 ) -> None:
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
-    if not await rate_limiter.check_image_limit(user_id):
-        retry_after = await rate_limiter.get_retry_after(user_id, "image")
+    if not await rate_limiter.consume_image_bucket(user_id, "image_edit"):
+        retry_after = await rate_limiter.get_retry_after(user_id, "image_edit")
         await message.answer(
             f"⏳ Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
         )
@@ -558,14 +587,15 @@ async def _edit(
         with ImageModelScope(model, None), MediaTurnScope():
             try:
                 # Budget preflight — в AssistAIClient.edit_images.
-                result = await job_queue.edit_images(
-                    turn.assistant,
-                    files,
-                    prompt,
-                    model=model,
-                    labels=labels,
-                    size=None,
-                )
+                async with image_user_slot(user_id):
+                    result = await job_queue.edit_images(
+                        turn.assistant,
+                        files,
+                        prompt,
+                        model=model,
+                        labels=labels,
+                        size=None,
+                    )
             except BudgetExceededError as exc:
                 await message.answer(exc.message)
                 return
@@ -584,19 +614,16 @@ async def _edit(
                     )
                 )
                 return
-        try:
-            for index, image in enumerate(result):
-                sent = await R._send_generated_image(
-                    message, image, index, as_file=as_file
-                )
-                file_id = result_file_id(sent)
-                if file_id:
-                    kept_file_id = file_id
-        except AssistAIError as exc:
+        kept_file_id, delivery_error = await _deliver_images(
+            message, result, as_file=as_file
+        )
+        if delivery_error is not None:
             from app.bot.image_retry import image_failure_reply
 
             await message.answer(
-                await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+                await image_failure_reply(
+                    media.chat_id, user_id, delivery_error, as_file=as_file
+                )
             )
             return
         logger.info("edit_image_done", count=len(result), base_index=base)
@@ -802,8 +829,8 @@ async def _generate(
 ) -> None:
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
-    if not await rate_limiter.check_image_limit(user_id):
-        retry_after = await rate_limiter.get_retry_after(user_id, "image")
+    if not await rate_limiter.consume_image_bucket(user_id, "image_generate"):
+        retry_after = await rate_limiter.get_retry_after(user_id, "image_generate")
         await message.answer(
             f"⏳ Слишком много запросов картинок. Подождите {int(retry_after) or 60} секунд."
         )
@@ -840,36 +867,34 @@ async def _generate(
         as_file = M._image_as_file(profile, model)
         with ImageModelScope(model, size), MediaTurnScope():
             # Budget preflight — в generate_image / edit_images.
-            if files:
-                result = await job_queue.edit_images(
-                    turn.assistant,
-                    files,
-                    prompt,
-                    model=model,
-                    labels=labels,
-                    size=edit_size,
-                )
-            else:
-                result = await job_queue.generate_image(
-                    turn.assistant,
-                    prompt,
-                    model=generate_model,
-                    size=size,
-                    background=M._image_background_of(profile, turn.assistant),
-                )
-        try:
-            for index, image in enumerate(result):
-                sent = await R._send_generated_image(
-                    message, image, index, as_file=as_file
-                )
-                file_id = result_file_id(sent)
-                if file_id:
-                    kept_file_id = file_id
-        except AssistAIError as exc:
+            async with image_user_slot(user_id):
+                if files:
+                    result = await job_queue.edit_images(
+                        turn.assistant,
+                        files,
+                        prompt,
+                        model=model,
+                        labels=labels,
+                        size=edit_size,
+                    )
+                else:
+                    result = await job_queue.generate_image(
+                        turn.assistant,
+                        prompt,
+                        model=generate_model,
+                        size=size,
+                        background=M._image_background_of(profile, turn.assistant),
+                    )
+        kept_file_id, delivery_error = await _deliver_images(
+            message, result, as_file=as_file
+        )
+        if delivery_error is not None:
             from app.bot.image_retry import image_failure_reply
 
             await message.answer(
-                await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+                await image_failure_reply(
+                    media.chat_id, user_id, delivery_error, as_file=as_file
+                )
             )
             return
         fallback = "Готово. Это новое изображение по вашему фото."

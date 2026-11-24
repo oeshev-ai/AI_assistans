@@ -433,6 +433,21 @@ class Settings:
         return _legacy_alias_enabled("IMAGE_LEGACY_ALIASES")
 
     @property
+    def image_bucket_capacity(self) -> float:
+        """Запас token bucket генерации и, отдельно, правки картинок."""
+        return _positive_float("IMAGE_BUCKET_CAPACITY", 15.0)
+
+    @property
+    def image_bucket_refill_per_min(self) -> float:
+        """Скорость пополнения ведра, токенов в минуту. 0.5 ≈ 1 токен / 2 мин."""
+        return _positive_float("IMAGE_BUCKET_REFILL_PER_MIN", 0.5)
+
+    @property
+    def image_max_concurrent_per_user(self) -> int:
+        """Сколько генераций и правок одного пользователя идут одновременно."""
+        return _positive_int("IMAGE_MAX_CONCURRENT_PER_USER", 3)
+
+    @property
     def text_legacy_aliases(self) -> bool:
         return _legacy_alias_enabled("TEXT_LEGACY_ALIASES")
 

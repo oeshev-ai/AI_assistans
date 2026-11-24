@@ -263,7 +263,7 @@ def test_legacy_presign_routes_off_by_default(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_presign_ignores_boolean_file_size(
+async def test_presign_ignores_boolean_and_negative_file_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("UPLOAD_LEGACY_PRESIGN", "1")
@@ -279,7 +279,7 @@ async def test_presign_ignores_boolean_file_size(
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        for raw_size in (True, False):
+        for raw_size in (True, False, -1):
             fresh = await store.create(chat_id=1, user_id=2, purpose="transcribe")
             resp = await client.post(
                 f"/api/uploads/{fresh.upload_id}/presign",

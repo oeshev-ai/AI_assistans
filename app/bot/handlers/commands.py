@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.bot import runtime as R
 from app.bot.album import get_album_hub
 from app.bot.constants import (
+    HELP_TEXT,
     WELCOME,
     Any,
     AssistAIClient,
@@ -41,6 +42,16 @@ async def cmd_start(
         ensure_topic=True,
     )
     await message.answer(WELCOME, reply_markup=menu)
+
+
+async def cmd_help(
+    message: Message,
+    assistant_storage: AssistantStorage,
+    topic_storage: TopicHistoryStorage,
+) -> None:
+    """Справка. Мастер сбрасывает middleware, тему справка не создаёт."""
+    menu = await R._menu_for(message.chat.id, assistant_storage, topic_storage)
+    await message.answer(HELP_TEXT, reply_markup=menu)
 
 
 async def cmd_cancel(

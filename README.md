@@ -100,15 +100,17 @@ SpeechKit (`TTS_PROVIDER=speechkit`) ходит в Yandex TTS v3 и в эту с
 
 `0` в `LLM_DAILY_BUDGET_USD` и `LLM_USER_DAILY_BUDGET_USD` означает «без потолка» только в development. Compose ставит `ENVIRONMENT=production`, и процесс не стартует, пока не задан хотя бы один из этих потолков.
 
-Отдельные скользящие окна на пользователя, счётчики в Redis:
+Текст, аудио и видео — скользящее окно на пользователя, счётчики в Redis. Картинки — два token bucket: генерация и правка не делят запас. Параллельно один пользователь держит не больше `IMAGE_MAX_CONCURRENT_PER_USER` задач (очередь воркера по-прежнему `ARQ_MAX_JOBS`).
 
-| Операция | Лимит | Окно |
-|---|---:|---:|
-| Текст и чат | 10 | 60 с |
-| Картинки | 5 | 1 ч |
-| STT, TTS, видео | 10 | 1 ч |
+| Операция | Лимит |
+|---|---|
+| Текст и чат | 10 за 60 с |
+| Генерация картинок | запас `IMAGE_BUCKET_CAPACITY` (15), пополнение `IMAGE_BUCKET_REFILL_PER_MIN` (0.5/мин, около одной картинки за 2 минуты) |
+| Правка картинок | тот же запас, отдельное ведро |
+| Одновременно картинок | 3 на пользователя |
+| STT, TTS, видео | 10 за 1 ч |
 
-При сбое Redis в production лимитер тоже отказывает, а не переходит на память процесса.
+Всплеск в 15 картинок проходит сразу, дальше устойчивый темп режет пополнение. Между `sendPhoto` одного чата — не меньше секунды. При сбое Redis в production лимитер отказывает, а не переходит на память процесса. Ключи ведра истекают по TTL.
 
 ## Что обязательно в production
 
@@ -198,9 +200,9 @@ pytest tests/ -v
 
 CI на push и pull request в `main`: ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
 
-После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA, затем шаг Deploy over SSH на VPS выполняет `docker compose pull` и `docker compose up -d` в `/home/deploy/AI_assistans`. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
+После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA, затем шаг Deploy over SSH в `/home/deploy/AI_assistans` делает `docker compose --profile arq pull`. `up -d` идёт с тем же профилем, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
 
-Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа. Скрипт не передаёт `--profile arq`: при `ARQ_ENABLED=1` воркер остаётся на старом образе, пока в `deploy.yml` к `pull` и `up` не добавлен этот профиль.
+Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа.
 
 ### Чеклист Deploy over SSH
 
@@ -212,9 +214,9 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
    APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:latest
    ```
 3. Под `deploy`: `docker login ghcr.io` (PAT с `read:packages`), если пакет private.
-4. Вручную: `cd /home/deploy/AI_assistans && docker compose pull && docker compose up -d`. Если в `.env` стоит `ARQ_ENABLED=1`, те же команды с `--profile arq`, иначе воркер не подхватит новый образ. Контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai-assistans-bot`.
+4. Первый раз вручную: `cd /home/deploy/AI_assistans && docker compose --profile arq pull && docker compose up -d`. Если воркер уже запущен, `up` тоже с `--profile arq`. Контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai-assistans-bot`.
 5. Секреты репозитория: `SSH_HOST`, `SSH_USER` (`deploy`), `SSH_PRIVATE_KEY` (отдельный ключ для Actions, pubkey в `authorized_keys` у `deploy`).
-6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` уже включён. При `ARQ_ENABLED=1` в его script нужны `docker compose --profile arq pull` и `docker compose --profile arq up -d`.
+6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` включён и сам выбирает профиль: образ воркера подтягивается всегда, контейнер пересоздаётся только пока он `running` или `restarting`.
 
 Redis в Compose: AOF, потолок `REDIS_MAXMEMORY` (по умолчанию 256mb), политика `volatile-ttl`. У тем, персон, FSM (состояние и data, 30 суток с последней записи), бюджета, лимитов и буферов очереди есть срок жизни. Когда память кончается, Redis снимает ключ с самым коротким остатком TTL: сначала окна лимитов и временные payload, потом давно не открытые темы. Активный чат продлевает TTL при обращении и освобождается последним. Запись истории при этом не останавливается целиком. Пароль — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
 

@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -46,3 +46,15 @@ jobs:
 
       - name: Docker image build smoke
         run: docker build -t ai-assistans:ci .
+
+      - name: Docker entrypoint smoke
+        run: |
+          docker run --rm \
+            -e REDIS_HOST=redis \
+            -e REDIS_PASSWORD='p@ss word' \
+            ai-assistans:ci \
+            python -c "import os; url=os.environ['REDIS_URL']; assert url=='redis://:p%40ss%20word@redis:6379/0', url"
+          docker run --rm \
+            -e REDIS_HOST=redis \
+            ai-assistans:ci \
+            python -c "import os; url=os.environ['REDIS_URL']; assert url=='redis://redis:6379/0', url"

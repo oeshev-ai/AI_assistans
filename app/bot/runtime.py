@@ -670,19 +670,24 @@ async def _answer_photo_bytes(
     следующей правки.
     """
     from app.bot.image_retry import telegram_photo_needs_document
+    from app.bot.photo_pacer import send_photo_paced
 
     if as_file:
         return await message.answer_document(
             document=BufferedInputFile(raw, filename=filename),
             request_timeout=120,
         )
+
+    async def _send_photo() -> Message:
+        return await message.answer_photo(
+            photo=BufferedInputFile(raw, filename=filename),
+            request_timeout=120,
+        )
+
     last_error: TelegramBadRequest | None = None
     for attempt in (1, 2):
         try:
-            return await message.answer_photo(
-                photo=BufferedInputFile(raw, filename=filename),
-                request_timeout=120,
-            )
+            return await send_photo_paced(message.chat.id, _send_photo)
         except TelegramBadRequest as exc:
             last_error = exc
             if "IMAGE_PROCESS_FAILED" in str(exc) and attempt == 1:
