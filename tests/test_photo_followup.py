@@ -317,6 +317,101 @@ async def test_edit_keeps_result_file_id_not_source(
 
 
 @pytest.mark.asyncio
+async def test_partial_edit_delivery_keeps_the_sent_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.bot.photo_flow as flow
+    import app.infra.job_queue as job_queue
+    from app.llm.errors import AssistAIError
+    from app.media.media_tools import UserMedia
+    from app.storage.pending_media import InMemoryPendingMediaStorage
+
+    pending = InMemoryPendingMediaStorage()
+    media = PendingMedia(
+        chat_id=1,
+        user_id=2,
+        assistant_id="a",
+        items=[PendingMediaItem(file_id="source-file", message_id=1)],
+        caption="поправь небо",
+    )
+    await pending.put(media)
+
+    async def send(
+        _message: Any, _image: str, index: int, *, as_file: bool = False
+    ) -> SimpleNamespace:
+        if index > 0:
+            raise AssistAIError("файл не дошёл")
+        return SimpleNamespace(photo=[SimpleNamespace(file_id="result-file")])
+
+    async def edited(*_args: Any, **_kwargs: Any) -> list[str]:
+        return ["first", "second"]
+
+    async def noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def allow(_user_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(job_queue, "edit_images", edited)
+    monkeypatch.setattr(flow.R, "_send_generated_image", send)
+    monkeypatch.setattr(flow, "confirm_reply", lambda *_a, **_k: _ready())
+    monkeypatch.setattr(flow, "_status", lambda *_a, **_k: _ready())
+    monkeypatch.setattr(flow, "_drop_status", noop)
+    monkeypatch.setattr(flow, "_remember_pair", noop)
+    monkeypatch.setattr(flow.R, "_reset_flow", noop)
+    monkeypatch.setattr(flow.rate_limiter, "check_image_limit", allow)
+    monkeypatch.setattr(flow.cost_tracker, "check_budget", noop)
+    monkeypatch.setattr(flow.cost_tracker, "release_reservation", noop)
+    monkeypatch.setattr(flow.M, "_text_model_of", lambda *_a, **_k: "text")
+
+    answers: list[str] = []
+
+    class _Message:
+        chat = SimpleNamespace(id=1)
+        from_user = SimpleNamespace(id=2)
+
+        async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
+            answers.append(text)
+            return SimpleNamespace(message_id=8)
+
+    turn = SimpleNamespace(
+        message=_Message(),
+        assistant=SimpleNamespace(
+            config=SimpleNamespace(default_image_edit_model="edit-model")
+        ),
+        topic_storage=None,
+        assistant_storage=None,
+        state=SimpleNamespace(),
+        pending=pending,
+    )
+    await flow._edit(
+        turn,
+        media,
+        profile=SimpleNamespace(),
+        loaded=[
+            UserMedia(
+                kind="image",
+                filename="photo.jpg",
+                mime_type="image/jpeg",
+                data=b"jpeg",
+            )
+        ],
+        decision=PhotoDecision(
+            intent="edit",
+            base_index=0,
+            instruction_en="fix the sky",
+            instruction_ru="поправь небо",
+            confidence=1.0,
+        ),
+        topic_id="t",
+    )
+    stored = await pending.get(1, "a", 2)
+    assert stored is not None
+    assert [item.file_id for item in stored.items] == ["result-file"]
+    assert answers == ["файл не дошёл"]
+
+
+@pytest.mark.asyncio
 async def test_edit_failure_puts_the_source_album_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

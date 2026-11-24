@@ -75,6 +75,13 @@ ALLOWED_EXTENSIONS = (
 )
 
 
+def _declared_file_size(value: object) -> int | None:
+    """Размер из JSON. ``true``/``false`` не размер: ``bool`` — подкласс ``int``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _allowed_mime_types() -> set[str]:
     from app.infra.settings import get_settings
 
@@ -422,7 +429,7 @@ def setup_upload_routes(
 
         file_name = str(body.get("fileName") or "").strip()
         file_type = str(body.get("fileType") or "").strip().lower()
-        file_size = body.get("fileSize")
+        file_size = _declared_file_size(body.get("fileSize"))
         if not file_name:
             return web.json_response({"error": "fileName обязателен"}, status=400)
         lower_name = file_name.lower()
@@ -438,7 +445,7 @@ def setup_upload_routes(
             return web.json_response(
                 {"error": f"MIME не разрешён: {file_type}"}, status=400
             )
-        if isinstance(file_size, int) and file_size > max_bytes:
+        if file_size is not None and file_size > max_bytes:
             return web.json_response(
                 {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
                 status=400,
@@ -463,7 +470,7 @@ def setup_upload_routes(
         session.object_key = key
         session.filename = file_name
         session.mime_type = effective_type
-        if isinstance(file_size, int):
+        if file_size is not None:
             session.file_size = file_size
         await store.update(session)
 

@@ -272,77 +272,84 @@ class ProviderTransportMixin:
         label = _provider_label(target)
         breaker = get_breaker(target.id)
         try:
-            await breaker.ensure_allows_call()
+            async with breaker.attempt() as probe:
+                url = f"{_chat_base(target)}/{_CHAT_PATH}"
+                read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
+                timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
+                logger.info(
+                    "proxy_api_stream", url=url, path=_CHAT_PATH, provider=target.id
+                )
+                t0 = time.perf_counter()
+                try:
+                    async with self._client_for(target).stream(
+                        "POST", url, json=payload, timeout=timeout
+                    ) as response:
+                        await self._raise_for_stream_status(
+                            response, _CHAT_PATH, label=label
+                        )
+                        async for line in response.aiter_lines():
+                            chunk = _parse_sse_data(line)
+                            if chunk is _SSE_SKIP:
+                                continue
+                            if chunk is _SSE_DONE:
+                                break
+                            if isinstance(chunk, dict):
+                                error = chunk.get("error")
+                                if error:
+                                    if isinstance(error, dict):
+                                        message = str(error.get("message") or error)
+                                    else:
+                                        message = str(error)
+                                    logger.error(
+                                        "proxy_api_stream_error", detail=message
+                                    )
+                                    raise AssistAIError(f"{label}: {message}")
+                                yield chunk
+                    API_CALLS.labels(
+                        service=target.id, endpoint="chat_stream", status="success"
+                    ).inc()
+                    await probe.success()
+                except AssistAIError as exc:
+                    API_CALLS.labels(
+                        service=target.id, endpoint="chat_stream", status="error"
+                    ).inc()
+                    ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
+                    if counts_toward_circuit(exc):
+                        await probe.failure(exc)
+                    raise
+                except httpx.TimeoutException as exc:
+                    API_CALLS.labels(
+                        service=target.id, endpoint="chat_stream", status="error"
+                    ).inc()
+                    ERRORS.labels(error_type="TimeoutException", module=target.id).inc()
+                    await probe.failure(exc)
+                    logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
+                    raise AssistAIError(
+                        f"Превышено время ожидания ответа {label} ({_CHAT_PATH}).",
+                        error_code="TIMEOUT",
+                    ) from exc
+                except httpx.RequestError as exc:
+                    API_CALLS.labels(
+                        service=target.id, endpoint="chat_stream", status="error"
+                    ).inc()
+                    ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
+                    await probe.failure(exc)
+                    logger.error(
+                        "proxy_api_stream_network", path=_CHAT_PATH, error=str(exc)
+                    )
+                    raise AssistAIError(
+                        f"Сетевая ошибка при обращении к {label}: {exc}",
+                        error_code="NETWORK_ERROR",
+                    ) from exc
+                finally:
+                    LATENCY.labels(service=target.id, endpoint="chat_stream").observe(
+                        time.perf_counter() - t0
+                    )
         except CircuitBreakerError as exc:
             raise AssistAIError(
                 "⚠️ LLM сервис временно недоступен. Попробуйте через минуту.",
                 error_code="CIRCUIT_OPEN",
             ) from exc
-
-        url = f"{_chat_base(target)}/{_CHAT_PATH}"
-        read_timeout = max(self.config.timeout, _STREAM_READ_TIMEOUT)
-        timeout = httpx.Timeout(read_timeout, connect=self.config.timeout)
-        logger.info("proxy_api_stream", url=url, path=_CHAT_PATH, provider=target.id)
-        t0 = time.perf_counter()
-        try:
-            async with self._client_for(target).stream(
-                "POST", url, json=payload, timeout=timeout
-            ) as response:
-                await self._raise_for_stream_status(response, _CHAT_PATH, label=label)
-                async for line in response.aiter_lines():
-                    chunk = _parse_sse_data(line)
-                    if chunk is _SSE_SKIP:
-                        continue
-                    if chunk is _SSE_DONE:
-                        break
-                    if isinstance(chunk, dict):
-                        error = chunk.get("error")
-                        if error:
-                            if isinstance(error, dict):
-                                message = str(error.get("message") or error)
-                            else:
-                                message = str(error)
-                            logger.error("proxy_api_stream_error", detail=message)
-                            raise AssistAIError(f"{label}: {message}")
-                        yield chunk
-            API_CALLS.labels(
-                service=target.id, endpoint="chat_stream", status="success"
-            ).inc()
-            await breaker._on_success()
-        except AssistAIError as exc:
-            API_CALLS.labels(
-                service=target.id, endpoint="chat_stream", status="error"
-            ).inc()
-            ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
-            if counts_toward_circuit(exc):
-                await breaker._on_failure(exc)
-            raise
-        except httpx.TimeoutException as exc:
-            API_CALLS.labels(
-                service=target.id, endpoint="chat_stream", status="error"
-            ).inc()
-            ERRORS.labels(error_type="TimeoutException", module=target.id).inc()
-            await breaker._on_failure(exc)
-            logger.error("proxy_api_stream_timeout", path=_CHAT_PATH)
-            raise AssistAIError(
-                f"Превышено время ожидания ответа {label} ({_CHAT_PATH}).",
-                error_code="TIMEOUT",
-            ) from exc
-        except httpx.RequestError as exc:
-            API_CALLS.labels(
-                service=target.id, endpoint="chat_stream", status="error"
-            ).inc()
-            ERRORS.labels(error_type=type(exc).__name__, module=target.id).inc()
-            await breaker._on_failure(exc)
-            logger.error("proxy_api_stream_network", path=_CHAT_PATH, error=str(exc))
-            raise AssistAIError(
-                f"Сетевая ошибка при обращении к {label}: {exc}",
-                error_code="NETWORK_ERROR",
-            ) from exc
-        finally:
-            LATENCY.labels(service=target.id, endpoint="chat_stream").observe(
-                time.perf_counter() - t0
-            )
 
     @staticmethod
     async def _raise_for_stream_status(

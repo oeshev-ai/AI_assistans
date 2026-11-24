@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import math
 from typing import Any
 
 from aiogram import Bot
@@ -14,6 +15,9 @@ logger = logging.getLogger("Vision")
 
 MAX_IMAGE_SIZE_MB = 20
 MAX_PDF_PAGES = 3
+_PDF_RENDER_DPI = 150
+# A0 на 150 dpi ≈ 35 Мп. Выше — crafted MediaBox, pixmap не создаём.
+MAX_PDF_PIXELS = 40_000_000
 IMAGE_DETAIL = "auto"
 _DEFAULT_VISION_PROMPT = "Опиши, что изображено на картинке."
 
@@ -59,8 +63,27 @@ def build_image_content(
     }
 
 
+def _page_pixel_area(page: Any, *, dpi: int) -> float:
+    """Сколько пикселей даст ``get_pixmap(dpi=...)`` до выделения буфера."""
+    rect = page.rect
+    width = float(rect.width)
+    height = float(rect.height)
+    if (
+        width <= 0
+        or height <= 0
+        or not math.isfinite(width)
+        or not math.isfinite(height)
+    ):
+        raise VisionError("Страница PDF имеет недопустимый размер.")
+    scale = dpi / 72.0
+    return width * scale * height * scale
+
+
 def process_pdf(data: bytes, max_pages: int = MAX_PDF_PAGES) -> list[bytes]:
-    """Конвертирует первые страницы PDF в PNG (dpi=150)."""
+    """Конвертирует первые страницы PDF в PNG (dpi=150).
+
+    Страница, чей растр превысил бы ``MAX_PDF_PIXELS``, не рендерится.
+    """
     try:
         import fitz  # type: ignore[import-untyped]
     except ImportError as exc:
@@ -80,7 +103,13 @@ def process_pdf(data: bytes, max_pages: int = MAX_PDF_PAGES) -> list[bytes]:
         pages: list[bytes] = []
         for index in range(limit):
             page = document.load_page(index)
-            pixmap = page.get_pixmap(dpi=150)
+            pixels = _page_pixel_area(page, dpi=_PDF_RENDER_DPI)
+            if pixels > MAX_PDF_PIXELS:
+                logger.warning(
+                    "PDF: страница %s слишком большая (%.0f px)", index + 1, pixels
+                )
+                raise VisionError("Страница PDF слишком большая для распознавания.")
+            pixmap = page.get_pixmap(dpi=_PDF_RENDER_DPI)
             pages.append(pixmap.tobytes("png"))
         logger.info("PDF: страниц=%s, отправлено=%s", page_count, len(pages))
         if not pages:

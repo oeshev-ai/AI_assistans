@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.infra.cost_tracker import (
-    IMAGE_OUT_USD_PER_1M,
-    BudgetExceededError,
-    CostTracker,
-)
+from app.infra.cost_tracker import BudgetExceededError, CostTracker
+from app.infra.settings import get_settings
 
 _MODEL = "openai/gpt-image-2.6-flare"
 
@@ -35,7 +32,8 @@ def test_usage_overrides_table() -> None:
         size="1024x1024",
         usage={"output_tokens": 100},
     )
-    assert used == pytest.approx(100 * IMAGE_OUT_USD_PER_1M / 1_000_000)
+    per_million = get_settings().image_out_usd_per_1m
+    assert used == pytest.approx(100 * per_million / 1_000_000)
     assert used != pytest.approx(table)
 
 
@@ -51,11 +49,13 @@ def test_non_openai_stays_flat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_budget_sees_quality_difference() -> None:
+async def test_budget_sees_quality_difference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tracker = CostTracker()
     low = tracker.estimate_image_cost(1, model=_MODEL, quality="low", size="1024x1024")
     high = tracker.estimate_image_cost(1, model=_MODEL, quality="max", size="1024x1024")
-    tracker.daily_budget = (low + high) / 2
+    monkeypatch.setenv("LLM_DAILY_BUDGET_USD", str((low + high) / 2))
     await tracker.check_budget(1, estimated=low)
     with pytest.raises(BudgetExceededError):
         await tracker.check_budget(1, estimated=high)

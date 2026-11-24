@@ -12,7 +12,7 @@ import json
 import math
 import uuid
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import structlog
 
@@ -65,8 +65,9 @@ def _redis_settings_from_url(redis_url: str) -> Any:
 
     parsed = urlparse(redis_url)
     # Empty userinfo (redis://:@host) must not become AUTH "".
-    password = parsed.password or None
-    username = parsed.username or None
+    # Пароль в URL percent-encoded: urlparse его не раскодирует.
+    password = unquote(parsed.password) if parsed.password else None
+    username = unquote(parsed.username) if parsed.username else None
     return RedisSettings(
         host=parsed.hostname or "localhost",
         port=parsed.port or 6379,
@@ -184,18 +185,42 @@ def audio_result_timeout(explicit: float | None = None) -> float:
     return max(120.0, get_settings().arq_job_timeout_seconds)
 
 
-def _payload_ttl_seconds() -> int:
-    """Redis TTL for staged ARQ payloads (edit/STT bytes).
+def _payload_ttl_seconds(queued: int = 0) -> int:
+    """TTL байтов edit/STT в Redis, пока job не стартовал.
 
-    Must outlive queue delay + worker ``ARQ_JOB_TIMEOUT`` so backlog does not
-    expire the body before the job starts.
+    Одна волна — уже идущие задачи (``ARQ_JOB_TIMEOUT``). Дальше backlog
+    идёт пачками по ``ARQ_MAX_JOBS``. Без этого при всплеске ключ истекает
+    раньше старта и воркер получает «payload missing or expired».
     """
     from app.infra.settings import get_settings
 
     settings = get_settings()
     job_timeout = max(0.0, settings.arq_job_timeout_seconds)
     polza_wait = max(0.0, settings.polza_total_wait_seconds)
-    return int(max(600.0, job_timeout + 120.0, polza_wait + 120.0))
+    max_jobs = max(1, settings.arq_max_jobs)
+    waiting = max(0, queued)
+    waves = 1 + math.ceil(waiting / max_jobs)
+    return int(
+        max(
+            600.0,
+            job_timeout + 120.0,
+            polza_wait + 120.0,
+            waves * job_timeout + 120.0,
+        )
+    )
+
+
+async def _staged_payload_ttl(pool: Any) -> int:
+    """TTL с учётом текущего размера очереди arq."""
+    from arq.constants import default_queue_name
+
+    queued = 0
+    try:
+        depth = await pool.zcard(default_queue_name)
+        queued = max(0, int(depth))
+    except Exception as exc:
+        logger.warning("arq_queue_depth_failed", error=str(exc))
+    return _payload_ttl_seconds(queued)
 
 
 def _arq_enqueue_failed(task: str) -> Exception:
@@ -276,7 +301,9 @@ async def edit_images(
             for data, name, mime in files
         ]
         try:
-            await _pool.set(key, json.dumps(payload), ex=_payload_ttl_seconds())
+            await _pool.set(
+                key, json.dumps(payload), ex=await _staged_payload_ttl(_pool)
+            )
             job = await _pool.enqueue_job(
                 "edit_image_task",
                 key,
@@ -390,7 +417,7 @@ async def transcribe_audio(
     if is_queue_enabled() and _pool is not None:
         key = f"arq:stt:{uuid.uuid4().hex}"
         try:
-            await _pool.set(key, audio_bytes, ex=_payload_ttl_seconds())
+            await _pool.set(key, audio_bytes, ex=await _staged_payload_ttl(_pool))
             job = await _pool.enqueue_job(
                 "transcribe_audio_task",
                 key,

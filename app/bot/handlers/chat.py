@@ -73,6 +73,8 @@ async def handle_text(
         if album_cancelled:
             await message.answer("Отменено.")
             return
+        await message.answer("Нечего отменять.")
+        return
     sanitized_text = security.sanitize_prompt(user_text)
     from app.bot.album import get_album_hub
     from app.bot.handlers.photo import deliver_album
@@ -225,8 +227,17 @@ async def handle_voice(
         voice.file_size,
         len(transcribed),
     )
+    transcribed = transcribed.strip()
     if not transcribed:
         await R._edit_stream(status, "🤷 В голосовом не распознано речи.", "")
+        await R._append_chrome(state, [status.message_id])
+        return
+    if not security.validate_message_length(transcribed):
+        await R._edit_stream(
+            status,
+            "⚠️ Сообщение слишком длинное. Максимум 4000 символов.",
+            "",
+        )
         await R._append_chrome(state, [status.message_id])
         return
     sanitized_voice = security.sanitize_prompt(transcribed)

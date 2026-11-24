@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from enum import Enum
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
@@ -56,16 +57,24 @@ class AsyncCircuitBreaker:
         self._failure_count = 0
         self._opened_at = 0.0
         self._half_open_permits = 0
+        self._half_open_generation = 0
+        self._probe_started_at = 0.0
         self._lock = asyncio.Lock()
 
     @property
     def state(self) -> CircuitState:
         return self._state
 
-    async def ensure_allows_call(self) -> None:
-        """Raise ``CircuitBreakerError`` if the circuit is open or probe taken."""
+    async def ensure_allows_call(self) -> int:
+        """Raise ``CircuitBreakerError`` if the circuit is open or probe taken.
+
+        Returns the half-open probe generation, or ``0`` when the circuit is
+        closed and no permit was consumed. Pass the generation to
+        ``release_probe`` if the call ends without success or failure.
+        """
         async with self._lock:
             self._maybe_half_open()
+            self._reclaim_abandoned_probe()
             if self._state == CircuitState.OPEN:
                 logger.error("circuit_open", circuit=self.name)
                 raise CircuitBreakerError(f"Circuit '{self.name}' is open")
@@ -74,20 +83,55 @@ class AsyncCircuitBreaker:
                     logger.error("circuit_open", circuit=self.name, reason="probe_busy")
                     raise CircuitBreakerError(f"Circuit '{self.name}' is open")
                 self._half_open_permits -= 1
+                self._half_open_generation += 1
+                self._probe_started_at = time.monotonic()
+                return self._half_open_generation
+            return 0
+
+    async def release_probe(self, generation: int) -> None:
+        """Return a half-open permit when the probe produced no outcome.
+
+        ``CancelledError`` and ``GeneratorExit`` are not provider failures.
+        Leaving the permit at 0 would stick the breaker in ``HALF_OPEN``.
+        A generation from an older probe is ignored so a timeout reclaim
+        cannot be undone while a newer probe holds the slot.
+        """
+        if not generation:
+            return
+        async with self._lock:
+            if self._state != CircuitState.HALF_OPEN:
+                return
+            if generation != self._half_open_generation:
+                return
+            if self._half_open_permits > 0:
+                return
+            self._half_open_permits = 1
+            self._probe_started_at = 0.0
+            logger.info("circuit_probe_released", circuit=self.name)
+
+    @asynccontextmanager
+    async def attempt(self) -> AsyncIterator[_Probe]:
+        """Call slot that returns a half-open permit if no outcome is reported."""
+        generation = await self.ensure_allows_call()
+        probe = _Probe(self, generation)
+        try:
+            yield probe
+        finally:
+            if not probe.settled:
+                await self.release_probe(generation)
 
     async def call(
         self, func: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
     ) -> R:
-        await self.ensure_allows_call()
-
-        try:
-            result = await func(*args, **kwargs)
-        except self.expected_exception as exc:
-            await self._on_failure(exc)
-            raise
-        else:
-            await self._on_success()
-            return result
+        async with self.attempt() as probe:
+            try:
+                result = await func(*args, **kwargs)
+            except self.expected_exception as exc:
+                await probe.failure(exc)
+                raise
+            else:
+                await probe.success()
+                return result
 
     def _maybe_half_open(self) -> None:
         if self._state != CircuitState.OPEN:
@@ -95,18 +139,45 @@ class AsyncCircuitBreaker:
         if time.monotonic() - self._opened_at >= self.recovery_timeout:
             self._state = CircuitState.HALF_OPEN
             self._half_open_permits = 1
+            self._probe_started_at = 0.0
             logger.info("circuit_half_open", circuit=self.name)
 
-    async def _on_success(self) -> None:
+    def _reclaim_abandoned_probe(self) -> None:
+        """Hand out a new permit if the in-flight probe never reported back."""
+        if self._state != CircuitState.HALF_OPEN or self._half_open_permits > 0:
+            return
+        if time.monotonic() - self._probe_started_at < self.recovery_timeout:
+            return
+        self._half_open_generation += 1
+        self._half_open_permits = 1
+        self._probe_started_at = 0.0
+        logger.warning(
+            "circuit_probe_abandoned",
+            circuit=self.name,
+            timeout=self.recovery_timeout,
+        )
+
+    def _accepts_outcome(self, generation: int) -> bool:
+        """False when a newer probe already owns the half-open slot."""
+        if generation == 0 or generation == self._half_open_generation:
+            return True
+        return self._state == CircuitState.HALF_OPEN and self._half_open_permits > 0
+
+    async def _on_success(self, generation: int = 0) -> None:
         async with self._lock:
+            if not self._accepts_outcome(generation):
+                return
             if self._state != CircuitState.CLOSED:
                 logger.info("circuit_closed", circuit=self.name)
             self._failure_count = 0
             self._half_open_permits = 0
+            self._probe_started_at = 0.0
             self._state = CircuitState.CLOSED
 
-    async def _on_failure(self, exc: BaseException) -> None:
+    async def _on_failure(self, exc: BaseException, generation: int = 0) -> None:
         async with self._lock:
+            if not self._accepts_outcome(generation):
+                return
             self._failure_count += 1
             logger.error(
                 "circuit_call_failed",
@@ -122,6 +193,7 @@ class AsyncCircuitBreaker:
                 self._state = CircuitState.OPEN
                 self._opened_at = time.monotonic()
                 self._half_open_permits = 0
+                self._probe_started_at = 0.0
                 logger.error("circuit_opened", circuit=self.name)
 
 
@@ -196,15 +268,34 @@ async def safe_api_call(
     фильтр возвращает True (например, пропускать клиентские 4xx LLM).
     """
     try:
-        await breaker.ensure_allows_call()
-        try:
-            result = await func(*args, **kwargs)
-        except breaker.expected_exception as exc:
-            if failure_filter is None or failure_filter(exc):
-                await breaker._on_failure(exc)
-            raise
-        else:
-            await breaker._on_success()
-            return result
+        async with breaker.attempt() as probe:
+            try:
+                result = await func(*args, **kwargs)
+            except breaker.expected_exception as exc:
+                if failure_filter is None or failure_filter(exc):
+                    await probe.failure(exc)
+                raise
+            else:
+                await probe.success()
+                return result
     except CircuitBreakerError as exc:
         raise APIUnavailableError(user_message) from exc
+
+
+class _Probe:
+    """One guarded call. Outcomes are idempotent; cancel returns the permit."""
+
+    __slots__ = ("_breaker", "_generation", "settled")
+
+    def __init__(self, breaker: AsyncCircuitBreaker, generation: int) -> None:
+        self._breaker = breaker
+        self._generation = generation
+        self.settled = False
+
+    async def success(self) -> None:
+        await self._breaker._on_success(self._generation)
+        self.settled = True
+
+    async def failure(self, exc: BaseException) -> None:
+        await self._breaker._on_failure(exc, self._generation)
+        self.settled = True

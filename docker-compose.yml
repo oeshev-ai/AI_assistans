@@ -1,5 +1,6 @@
-# APP_IMAGE: GHCR tag published by Deploy workflow (docker compose pull).
-# Local default tags the build as ai-assistans:local so build+up still work.
+# APP_IMAGE: тег GHCR, который публикует workflow Deploy (docker compose pull).
+# Локально по умолчанию образ собирается как ai-assistans:local, чтобы build и up
+# работали без реестра.
 x-app: &app
   image: ${APP_IMAGE:-ai-assistans:local}
   build: .
@@ -8,12 +9,16 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # volatile-ttl: every app key has EXPIRE. Under the cap Redis drops the
-    # shortest remaining TTL first (rate limits, album/arq payloads, then
-    # stale topics). Active chats refresh TTL, so they go last. noeviction
-    # rejected every write once 256mb was full, including a new history line.
-    # REDIS_MAXMEMORY is digits plus a unit (256mb, 1gb). Optional
-    # REDIS_PASSWORD → requirepass (set matching REDIS_URL on bot/worker).
+    # volatile-ttl: у каждого ключа приложения есть EXPIRE (темы, персоны, FSM,
+    # бюджеты, лимиты, тела очереди). При упоре в потолок Redis первым выселяет
+    # ключ с наименьшим остатком TTL. Активные чаты обновляют TTL при записи,
+    # поэтому уходят последними. noeviction при заполненных 256mb отвергал
+    # любую запись, в том числе новую строку истории.
+    # REDIS_MAXMEMORY — число и единица (256mb, 1gb). Необязательный
+    # REDIS_PASSWORD → requirepass (тот же пароль в REDIS_URL бота и воркера).
+    # Потолок контейнера выше maxmemory: AOF и фрагментация, но не память VPS.
+    mem_limit: 512m
+    memswap_limit: 512m
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-256mb}
@@ -52,20 +57,35 @@ services:
     env_file:
       - .env
     environment:
-      # Host is compose service; omit userinfo when REDIS_PASSWORD is empty
-      # (redis://:@host breaks arq AUTH). Password set → redis://:pass@redis:6379/0
+      # Хост — сервис compose. REDIS_URL собирает entrypoint: пароль
+      # percent-encoding, пустой пароль без userinfo (redis://:@host ломает arq).
       # Пустой REDIS_PASSWORD при ENVIRONMENT=production завершает процесс бота.
-      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
+      REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ENVIRONMENT: production
-      # Keep in sync with .env; worker profile alone is not enough.
+      # Держать в соответствии с .env: одного профиля worker недостаточно.
       ARQ_ENABLED: ${ARQ_ENABLED:-0}
       METRICS_PORT: ${METRICS_PORT:-8083}
       METRICS_BIND: "0.0.0.0"
       HEALTH_PORT: ${HEALTH_PORT:-8082}
       HEALTH_BIND: "0.0.0.0"
-      # nginx terminates TLS and forwards X-Forwarded-Proto
+      # nginx завершает TLS и передаёт X-Forwarded-Proto
       TRUST_PROXY: "1"
+    # Два upload по 512 МБ держатся в памяти. cgroup режет контейнер, не VPS.
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; port=os.environ.get('HEALTH_PORT','8082'); urllib.request.urlopen('http://127.0.0.1:%s/live' % port, timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
     ports:
       # Только localhost: наружу отдаёт nginx (assist.mrischool.ru → 8082)
       - "127.0.0.1:${METRICS_PORT:-8083}:${METRICS_PORT:-8083}"
@@ -74,17 +94,20 @@ services:
       redis:
         condition: service_healthy
 
-  # Optional: docker compose --profile arq up -d  (also set ARQ_ENABLED=1 in .env)
+  # Необязательно: docker compose --profile arq up -d (и ARQ_ENABLED=1 в .env)
   worker:
     <<: *app
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
+      REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ARQ_ENABLED: "1"
       ENVIRONMENT: production
+    # Тот же образ: картинки и STT тоже держат байты файла в памяти.
+    mem_limit: 1024m
+    memswap_limit: 1024m
     command: ["arq", "worker.WorkerSettings"]
     profiles: ["arq"]
     depends_on:

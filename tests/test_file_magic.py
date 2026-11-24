@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import subprocess
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
 import pytest
 
+from app.media import file_magic
 from app.media.file_magic import container_mime, mime_compatible
 from app.media.media_utils import MediaProcessingError, find_ffmpeg
 
@@ -118,3 +121,74 @@ async def test_accepts_m4a_with_unknown_major_brand() -> None:
         claimed_mime="audio/mp4",
         source=_m4a_with_custom_brand(),
     )
+
+
+class _HungProc:
+    def __init__(self) -> None:
+        self.killed = False
+        self.returncode: int | None = None
+
+    async def communicate(self) -> tuple[None, bytes]:
+        await asyncio.Event().wait()
+        return None, b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.returncode = -9
+        return -9
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_kills_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    proc = _HungProc()
+
+    async def fake_exec(*_args: object, **_kwargs: object) -> _HungProc:
+        return proc
+
+    monkeypatch.setattr(file_magic, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(file_magic, "_PROBE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(file_magic.asyncio, "create_subprocess_exec", fake_exec)
+    target = tmp_path / "clip.mp3"
+    target.write_bytes(b"not-a-container")
+
+    assert await file_magic._probe(target) is None
+    assert proc.killed
+
+
+@pytest.mark.asyncio
+async def test_bytes_probe_is_written_off_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    caller = threading.current_thread()
+    seen: dict[str, object] = {}
+
+    def spill(data: bytes, suffix: str) -> Path:
+        path = tmp_path / f"probe{suffix}"
+        path.write_bytes(data)
+        seen["path"] = path
+        seen["thread"] = threading.current_thread()
+        return path
+
+    async def probe(path: Path) -> None:
+        seen["probed"] = path
+        return None
+
+    monkeypatch.setattr(file_magic, "_spill_probe_file", spill)
+    monkeypatch.setattr(file_magic, "_probe", probe)
+
+    assert (
+        await mime_compatible(
+            filename="voice.mp3",
+            claimed_mime="audio/mpeg",
+            source=b"id3-bytes",
+        )
+        is False
+    )
+    assert seen["thread"] is not caller
+    assert seen["probed"] == seen["path"]
+    assert not Path(str(seen["path"])).exists()

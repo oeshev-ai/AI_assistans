@@ -585,13 +585,13 @@ async def _edit(
                 )
                 return
         try:
-            sent_last = None
             for index, image in enumerate(result):
-                sent_last = await R._send_generated_image(
+                sent = await R._send_generated_image(
                     message, image, index, as_file=as_file
                 )
-            if sent_last is not None:
-                kept_file_id = result_file_id(sent_last)
+                file_id = result_file_id(sent)
+                if file_id:
+                    kept_file_id = file_id
         except AssistAIError as exc:
             from app.bot.image_retry import image_failure_reply
 
@@ -640,33 +640,46 @@ async def _edit(
         await _settle_album(turn, media, kept_file_id)
 
 
-def video_references(loaded: list[UserMedia]) -> list[Any]:
-    """Все фото альбома по порядку, не больше лимита Seedance."""
+def video_references(
+    loaded: list[UserMedia], indexes: list[int] | None = None
+) -> tuple[list[Any], list[int]]:
+    """Кадры ролика и их номера в альбоме (с 1), не больше лимита Seedance.
+
+    Непустой ``indexes`` — выбор роутера в его порядке. Пустой список
+    оставляет весь альбом: роутер не назвал подмножество.
+    """
     from app.llm.media_api import (
         VIDEO_MAX_REFERENCE_IMAGES,
         VideoReference,
         safe_image_mime,
     )
 
+    positions = list(indexes) if indexes else list(range(len(loaded)))
     refs: list[VideoReference] = []
-    for item in loaded:
+    numbers: list[int] = []
+    for index in positions:
+        if index < 0 or index >= len(loaded):
+            continue
+        item = loaded[index]
         if item.kind != "image" or not item.data:
             continue
         refs.append(
             VideoReference(data=item.data, mime_type=safe_image_mime(item.mime_type))
         )
+        numbers.append(index + 1)
         if len(refs) >= VIDEO_MAX_REFERENCE_IMAGES:
             break
-    return refs
+    return refs, numbers
 
 
-def video_prompt(instruction: str, count: int) -> str:
-    """Промпт ролика и порядок кадров: первая картинка = фото 1."""
+def video_prompt(instruction: str, photo_numbers: list[int]) -> str:
+    """Промпт ролика: «image N» — порядок вложений, «photo M» — номер в альбоме."""
     text = security.sanitize_prompt(instruction.strip())
-    if count <= 0:
+    if not photo_numbers:
         return text
     order = ", ".join(
-        f"image {index + 1} is photo {index + 1}" for index in range(count)
+        f"image {offset + 1} is photo {number}"
+        for offset, number in enumerate(photo_numbers)
     )
     return f"{text}\nAttached reference images, in order: {order}."
 
@@ -698,8 +711,8 @@ async def _generate_video(
         await _restore_album(turn, media)
         await R._reset_flow(turn.state)
         return
-    refs = video_references(loaded)
-    prompt = video_prompt(instruction, len(refs))
+    refs, photo_numbers = video_references(loaded, decision.reference_indexes)
+    prompt = video_prompt(instruction, photo_numbers)
     if not prompt.strip():
         await message.answer("Опишите, что должно происходить в ролике.")
         await _restore_album(turn, media)
@@ -754,7 +767,12 @@ async def _generate_video(
             f"[Альбом: {len(loaded)} фото] {decision.instruction_ru or media.caption}".strip(),
             "Ролик готов.",
         )
-        logger.info("photo_video_done", chat_id=media.chat_id, references=len(refs))
+        logger.info(
+            "photo_video_done",
+            chat_id=media.chat_id,
+            references=len(refs),
+            photo_numbers=photo_numbers,
+        )
     except BudgetExceededError as exc:
         await message.answer(exc.message)
     except AssistAIError as exc:
@@ -840,13 +858,13 @@ async def _generate(
                     background=M._image_background_of(profile, turn.assistant),
                 )
         try:
-            sent_last = None
             for index, image in enumerate(result):
-                sent_last = await R._send_generated_image(
+                sent = await R._send_generated_image(
                     message, image, index, as_file=as_file
                 )
-            if sent_last is not None:
-                kept_file_id = result_file_id(sent_last)
+                file_id = result_file_id(sent)
+                if file_id:
+                    kept_file_id = file_id
         except AssistAIError as exc:
             from app.bot.image_retry import image_failure_reply
 

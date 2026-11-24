@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -15,6 +16,8 @@ logger = structlog.get_logger("health")
 
 HealthProbe = Callable[[], Awaitable[None]]
 AppSetup = Callable[[web.Application], None]
+# Readiness probes hit this often; upstream checks stay fresh within a few seconds.
+READY_CACHE_SECONDS = 5.0
 
 
 async def liveness_check(_request: web.Request) -> web.Response:
@@ -22,17 +25,16 @@ async def liveness_check(_request: web.Request) -> web.Response:
     return web.json_response({"status": "alive", "timestamp": time.time()}, status=200)
 
 
-async def health_check(
+async def readiness_payload(
     request: web.Request,
     redis_client: Any | None,
     proxy_probe: HealthProbe | None,
     provider_probes: Mapping[str, HealthProbe] | None = None,
-) -> web.Response:
-    """Readiness: Redis, ProxyAPI and extra LLM providers.
+) -> tuple[dict[str, Any], int]:
+    """Readiness snapshot: Redis, ProxyAPI and extra LLM providers.
 
     ``components.proxy_api`` is kept for compatibility; ``components.providers``
     lists every provider (``proxyapi`` mirrors ``proxy_api``).
-    Use ``GET /live`` for liveness and ``GET /ready`` (or ``/health``) for readiness.
     """
     health: dict[str, Any] = {
         "status": "healthy",
@@ -85,7 +87,25 @@ async def health_check(
         health["components"]["large_upload"] = "disabled"
 
     status_code = 200 if health["status"] == "healthy" else 503
-    return web.json_response(health, status=status_code)
+    return health, status_code
+
+
+async def health_check(
+    request: web.Request,
+    redis_client: Any | None,
+    proxy_probe: HealthProbe | None,
+    provider_probes: Mapping[str, HealthProbe] | None = None,
+) -> web.Response:
+    """Readiness: Redis, ProxyAPI and extra LLM providers.
+
+    Each call probes upstream. ``GET /ready`` caches that snapshot; use this
+    helper when the caller needs a fresh result.
+    Use ``GET /live`` for liveness and ``GET /ready`` (or ``/health``) for readiness.
+    """
+    body, status_code = await readiness_payload(
+        request, redis_client, proxy_probe, provider_probes
+    )
+    return web.json_response(body, status=status_code)
 
 
 async def start_health_server(
@@ -95,6 +115,7 @@ async def start_health_server(
     setup_app: AppSetup | None = None,
     bind: str | None = None,
     provider_probes: Mapping[str, HealthProbe] | None = None,
+    ready_ttl: float = READY_CACHE_SECONDS,
 ) -> web.AppRunner:
     """Start an aiohttp app with live/ready health endpoints.
 
@@ -111,9 +132,26 @@ async def start_health_server(
     max_mb = settings.upload_max_mb
     app = web.Application(client_max_size=(max_mb + 8) * 1024 * 1024)
     app["upload_enabled"] = False
+    ready_cache: dict[str, Any] = {"until": 0.0, "body": None, "status": 200}
+    ready_lock = asyncio.Lock()
 
     async def _ready(request: web.Request) -> web.Response:
-        return await health_check(request, redis_client, proxy_probe, provider_probes)
+        now = time.monotonic()
+        cached = ready_cache["body"]
+        if cached is not None and now < ready_cache["until"]:
+            return web.json_response(cached, status=ready_cache["status"])
+        async with ready_lock:
+            now = time.monotonic()
+            cached = ready_cache["body"]
+            if cached is not None and now < ready_cache["until"]:
+                return web.json_response(cached, status=ready_cache["status"])
+            body, status = await readiness_payload(
+                request, redis_client, proxy_probe, provider_probes
+            )
+            ready_cache["body"] = body
+            ready_cache["status"] = status
+            ready_cache["until"] = time.monotonic() + ready_ttl
+            return web.json_response(body, status=status)
 
     app.router.add_get("/live", liveness_check)
     app.router.add_get("/ready", _ready)
@@ -124,7 +162,11 @@ async def start_health_server(
     await runner.setup()
     raw = bind if bind is not None else settings.health_bind
     host = (raw or "127.0.0.1").strip() or "127.0.0.1"
-    site = web.TCPSite(runner, host, port)
-    await site.start()
+    try:
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+    except Exception:
+        await runner.cleanup()
+        raise
     logger.info("health_server_started", port=port, bind=host)
     return runner

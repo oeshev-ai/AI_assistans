@@ -21,29 +21,29 @@ def _png(size: tuple[int, int] = (64, 48)) -> bytes:
 
 
 @pytest.fixture(autouse=True)
-async def _reset_budget_state() -> AsyncIterator[None]:
-    cost_tracker.daily_budget = 0.0
-    cost_tracker.user_daily_budget = 0.0
+async def _reset_budget_state(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    monkeypatch.setenv("LLM_DAILY_BUDGET_USD", "0")
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "0")
     cost_tracker._memory.clear()
     await cost_tracker.release_reservation()
     set_billing_user(None)
     yield
     await cost_tracker.release_reservation()
-    cost_tracker.daily_budget = 0.0
-    cost_tracker.user_daily_budget = 0.0
     cost_tracker._memory.clear()
     set_billing_user(None)
 
 
 @pytest.mark.asyncio
 async def test_generate_blocks_before_http_when_budget_exceeded(
-    assist_client: AssistAIClient, respx_mock: MockRouter
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     route = respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
         return_value=httpx.Response(200, json={"data": [{"url": "https://cdn/x.png"}]})
     )
     set_billing_user(42)
-    cost_tracker.user_daily_budget = 0.001
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "0.001")
     await cost_tracker.record(kind="image", amount_usd=0.001, user_id=42)
 
     with pytest.raises(BudgetExceededError):
@@ -57,13 +57,15 @@ async def test_generate_blocks_before_http_when_budget_exceeded(
 
 @pytest.mark.asyncio
 async def test_edit_blocks_before_http_when_budget_exceeded(
-    assist_client: AssistAIClient, respx_mock: MockRouter
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
         return_value=httpx.Response(200, json={"data": [{"url": "https://cdn/e.png"}]})
     )
     set_billing_user(7)
-    cost_tracker.user_daily_budget = 0.001
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "0.001")
     await cost_tracker.record(kind="image", amount_usd=0.001, user_id=7)
 
     with pytest.raises(BudgetExceededError):
@@ -77,13 +79,15 @@ async def test_edit_blocks_before_http_when_budget_exceeded(
 
 @pytest.mark.asyncio
 async def test_edit_image_blocks_before_http_when_budget_exceeded(
-    assist_client: AssistAIClient, respx_mock: MockRouter
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     route = respx_mock.post("https://api.proxyapi.ru/v1/images/edits").mock(
         return_value=httpx.Response(200, json={"data": [{"url": "https://cdn/e.png"}]})
     )
     set_billing_user(8)
-    cost_tracker.user_daily_budget = 0.001
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", "0.001")
     await cost_tracker.record(kind="image", amount_usd=0.001, user_id=8)
 
     with pytest.raises(BudgetExceededError):
@@ -97,7 +101,9 @@ async def test_edit_image_blocks_before_http_when_budget_exceeded(
 
 @pytest.mark.asyncio
 async def test_generate_single_reservation_near_budget_edge(
-    assist_client: AssistAIClient, respx_mock: MockRouter
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Outer+inner check_budget used to reserve ~2× and falsely reject near the cap."""
     respx_mock.post("https://api.proxyapi.ru/v1/images/generations").mock(
@@ -112,7 +118,7 @@ async def test_generate_single_reservation_near_budget_edge(
         provider=assist_client._endpoint("image"),
         rub_per_usd=assist_client.config.rub_per_usd,
     )
-    cost_tracker.user_daily_budget = estimate * 1.5
+    monkeypatch.setenv("LLM_USER_DAILY_BUDGET_USD", str(estimate * 1.5))
     images = await assist_client.generate_image(
         "постер",
         model="openai/gpt-image-2.6-flare",

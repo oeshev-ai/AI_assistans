@@ -38,6 +38,20 @@ _PROVIDER_ENV = (
     "POLZA_TOTAL_WAIT",
     "POLZA_POLL_INTERVAL",
     "RUB_PER_USD",
+    "LLM_DAILY_BUDGET_USD",
+    "LLM_USER_DAILY_BUDGET_USD",
+    "COST_CHAT_INPUT_PER_1K",
+    "COST_CHAT_OUTPUT_PER_1K",
+    "COST_IMAGE_USD",
+    "COST_IMAGE_FLUX_USD",
+    "COST_IMAGE_FLAT_MAP",
+    "IMAGE_OUT_USD_PER_1M",
+    "IMAGE_IN_USD_PER_1M",
+    "TEXT_IN_USD_PER_1M",
+    "TEXT_OUT_USD_PER_1M",
+    "COST_VIDEO_USD",
+    "COST_STT_PER_MINUTE",
+    "COST_TTS_PER_1K_CHARS",
 )
 
 
@@ -57,6 +71,9 @@ def _reset_provider_breakers() -> None:
         breaker._state = CircuitState.CLOSED
         breaker._failure_count = 0
         breaker._opened_at = 0.0
+        breaker._half_open_permits = 0
+        breaker._half_open_generation = 0
+        breaker._probe_started_at = 0.0
 
 
 @pytest_asyncio.fixture

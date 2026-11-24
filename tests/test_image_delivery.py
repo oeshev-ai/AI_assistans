@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
+from redis.exceptions import WatchError
 
 from app.bot.image_retry import (
     IMAGE_EXPIRED_TEXT,
@@ -80,6 +83,74 @@ class _Redis:
 
     async def smembers(self, key: str) -> set[str]:
         return set(self.sets.get(key, set()))
+
+    async def expire(self, key: str, seconds: int) -> None:
+        self.ttl[key] = seconds
+
+    def pipeline(self, transaction: bool = True) -> _Pipe:
+        return _Pipe(self)
+
+
+class _Pipe:
+    def __init__(self, redis: _Redis) -> None:
+        self._redis = redis
+        self._watched: str | None = None
+        self._snapshot: str | None = None
+        self._ops: list[tuple[object, ...]] = []
+
+    async def __aenter__(self) -> _Pipe:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def watch(self, key: str) -> None:
+        self._watched = key
+        self._snapshot = self._redis.kv.get(key)
+
+    async def unwatch(self) -> None:
+        self._watched = None
+
+    async def get(self, key: str) -> str | None:
+        return self._redis.kv.get(key)
+
+    def multi(self) -> None:
+        self._ops = []
+
+    def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self._ops.append(("set", key, value, ex))
+
+    def sadd(self, key: str, member: str) -> None:
+        self._ops.append(("sadd", key, member))
+
+    def expire(self, key: str, seconds: int) -> None:
+        self._ops.append(("expire", key, seconds))
+
+    async def execute(self) -> None:
+        if (
+            self._watched is not None
+            and self._redis.kv.get(self._watched) != self._snapshot
+        ):
+            raise WatchError()
+        for op in self._ops:
+            kind = op[0]
+            if kind == "set":
+                _, key, value, ex = op
+                assert isinstance(key, str)
+                assert isinstance(value, str)
+                assert isinstance(ex, int)
+                await self._redis.set(key, value, ex=ex)
+            elif kind == "sadd":
+                _, key, member = op
+                assert isinstance(key, str)
+                assert isinstance(member, str)
+                await self._redis.sadd(key, member)
+            elif kind == "expire":
+                _, key, seconds = op
+                assert isinstance(key, str)
+                assert isinstance(seconds, int)
+                await self._redis.expire(key, seconds)
+        self._ops = []
 
 
 def test_retry_copy_promises_repeats_without_a_new_generation() -> None:
@@ -224,8 +295,47 @@ async def test_redis_roundtrip_keeps_ttl_from_the_first_save() -> None:
         "https://s3.polza.ai/b.png",
     ]
     assert redis.ttl["image_delivery:3:4"] == IMAGE_DELIVERY_TTL_SECONDS - 100
+    assert redis.ttl["image_delivery:index"] == IMAGE_DELIVERY_TTL_SECONDS
     await store.delete(3, 4)
     assert await store.due(10**12) == []
+
+
+@pytest.mark.asyncio
+async def test_add_retries_when_the_record_changes_under_watch() -> None:
+    redis = _Redis()
+    store = RedisImageDeliveryStore(redis)  # type: ignore[arg-type]
+    await store.add(3, 4, "https://s3.polza.ai/a.png", "image.png", now=100)
+    real_pipeline = redis.pipeline
+    raced = False
+
+    def pipeline(transaction: bool = True) -> _Pipe:
+        pipe = real_pipeline(transaction)
+        real_get = pipe.get
+
+        async def get(key: str) -> str | None:
+            nonlocal raced
+            value = await real_get(key)
+            if raced or not value or "b.png" in value:
+                return value
+            raced = True
+            payload = json.loads(value)
+            payload["urls"].append("https://s3.polza.ai/c.png")
+            payload["filenames"].append("image_3.png")
+            payload["as_files"].append(False)
+            redis.kv[key] = json.dumps(payload, ensure_ascii=False)
+            return value
+
+        pipe.get = get  # type: ignore[method-assign]
+        return pipe
+
+    redis.pipeline = pipeline  # type: ignore[method-assign]
+    assert await store.add(3, 4, "https://s3.polza.ai/b.png", "image_2.png", now=120)
+    record = (await store.due(160))[0]
+    assert record.urls == [
+        "https://s3.polza.ai/a.png",
+        "https://s3.polza.ai/c.png",
+        "https://s3.polza.ai/b.png",
+    ]
 
 
 def test_photo_size_and_type_errors_fall_back_to_document() -> None:

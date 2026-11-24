@@ -222,12 +222,28 @@ def _daily_from_forecast(forecast: dict, days: int, timezone_offset: int) -> lis
     return daily
 
 
-def is_retryable_exception(e: BaseException) -> bool:
-    """Определяет, стоит ли повторять запрос при данной ошибке."""
-    if isinstance(e, httpx.HTTPStatusError):
-        # Повторяем только при 429 (Too Many Requests) и 5xx ошибках сервера
-        return e.response.status_code in (429, 500, 502, 503, 504)
-    return isinstance(e, (httpx.TimeoutException, httpx.RequestError))
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _retryable_httpx(exc: BaseException) -> bool:
+    """429/5xx, таймаут и обрыв сети. Остальные 4xx не повторяем."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return isinstance(exc, (httpx.TimeoutException, httpx.RequestError))
+
+
+def is_retryable_exception(exc: BaseException) -> bool:
+    """Определяет, стоит ли повторять запрос при данной ошибке.
+
+    ``_make_request_raw`` переводит httpx в ``OpenWeatherAPIError`` до tenacity,
+    поэтому смотрим ``status_code``, а для таймаута и сети — исходное исключение.
+    """
+    if isinstance(exc, OpenWeatherAPIError):
+        if exc.status_code in _RETRYABLE_STATUS:
+            return True
+        cause = exc.__cause__ or exc.__context__
+        return cause is not None and _retryable_httpx(cause)
+    return _retryable_httpx(exc)
 
 
 class OpenWeatherClient:
@@ -287,23 +303,25 @@ class OpenWeatherClient:
             response = await self._client.get(url, params=params)
             response.raise_for_status()
             return response.json()
-        except httpx.HTTPStatusError as e:
+        except httpx.HTTPStatusError as exc:
             logger.error(
-                "weather_http_error", status_code=e.response.status_code, url=url
+                "weather_http_error", status_code=exc.response.status_code, url=url
             )
             raise OpenWeatherAPIError(
-                message=f"API вернул ошибку {e.response.status_code}",
-                status_code=e.response.status_code,
-                response_json=e.response.json()
-                if e.response.headers.get("content-type") == "application/json"
+                message=f"API вернул ошибку {exc.response.status_code}",
+                status_code=exc.response.status_code,
+                response_json=exc.response.json()
+                if exc.response.headers.get("content-type") == "application/json"
                 else None,
-            )
-        except httpx.TimeoutException:
+            ) from exc
+        except httpx.TimeoutException as exc:
             logger.error("weather_timeout", url=url)
-            raise OpenWeatherAPIError(message="Превышено время ожидания ответа от API")
-        except httpx.RequestError:
+            raise OpenWeatherAPIError(
+                message="Превышено время ожидания ответа от API"
+            ) from exc
+        except httpx.RequestError as exc:
             logger.error("weather_network_error", url=url)
-            raise OpenWeatherAPIError(message="Ошибка сети при запросе к API")
+            raise OpenWeatherAPIError(message="Ошибка сети при запросе к API") from exc
 
     async def get_weather_by_coords(
         self,

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.infra.health_server import health_check, liveness_check
+from app.infra.health_server import health_check, liveness_check, start_health_server
 
 
 @pytest.mark.asyncio
@@ -95,3 +95,47 @@ async def test_health_errors_are_opaque() -> None:
         assert "xyz" not in raw
     finally:
         await client.close()
+
+
+def _bound_port(runner: web.AppRunner) -> int:
+    for site in runner.sites:
+        server = getattr(site, "_server", None)
+        sockets = getattr(server, "sockets", None) or ()
+        for sock in sockets:
+            return int(sock.getsockname()[1])
+    raise AssertionError("health server has no listening socket")
+
+
+@pytest.mark.asyncio
+async def test_ready_reuses_provider_probe_within_ttl() -> None:
+    calls = {"n": 0}
+
+    class FakeRedis:
+        async def ping(self) -> bool:
+            calls["n"] += 1
+            return True
+
+    async def proxy_ok() -> None:
+        calls["n"] += 1
+
+    runner = await start_health_server(
+        port=0,
+        redis_client=FakeRedis(),
+        proxy_probe=proxy_ok,
+        bind="127.0.0.1",
+        ready_ttl=30,
+    )
+    try:
+        port = _bound_port(runner)
+        async with ClientSession() as session:
+            first = await session.get(f"http://127.0.0.1:{port}/ready")
+            second = await session.get(f"http://127.0.0.1:{port}/ready")
+            live = await session.get(f"http://127.0.0.1:{port}/live")
+            assert first.status == 200
+            assert second.status == 200
+            assert (await first.json())["status"] == "healthy"
+            assert (await second.json())["components"]["proxy_api"] == "ok"
+            assert live.status == 200
+        assert calls["n"] == 2
+    finally:
+        await runner.cleanup()

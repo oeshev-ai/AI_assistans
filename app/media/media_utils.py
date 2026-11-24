@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -14,6 +15,12 @@ logger = structlog.get_logger("media_utils")
 # Whisper-класс API обычно ограничивает размер ~25 МБ.
 _MAX_CHUNK_BYTES = 24 * 1024 * 1024
 _DEFAULT_CHUNK_SECONDS = 600
+# Зависший ffmpeg иначе держит семафор загрузок до рестарта процесса.
+_FFMPEG_TIMEOUT_SECONDS = 600.0
+# extract кодирует дорожку в 64 кбит/с: запасной расчёт, если Duration не прочитался.
+_EXTRACTED_MP3_BYTES_PER_SECOND = 8000.0
+_DURATION_PROBE_TIMEOUT_SECONDS = 30.0
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 
 
 _MIN_IMAGE_AREA = 655_360
@@ -175,6 +182,51 @@ def find_ffmpeg() -> str:
         ) from exc
 
 
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL и ожидание, чтобы отменённый communicate не оставил зомби."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    except OSError:
+        logger.warning("ffmpeg_kill_failed")
+    try:
+        await asyncio.wait_for(proc.wait(), 5)
+    except TimeoutError:
+        logger.warning("ffmpeg_kill_hung")
+
+
+async def communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+) -> tuple[bytes | None, bytes | None]:
+    """Дождаться ffmpeg и убить его, если он не уложился в ``timeout``."""
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        await _terminate_process(proc)
+        raise
+    except asyncio.CancelledError:
+        # Отмена загрузки не должна оставлять ffmpeg в фоне.
+        await asyncio.shield(_terminate_process(proc))
+        raise
+
+
+async def _run_ffmpeg(
+    proc: asyncio.subprocess.Process,
+) -> tuple[bytes | None, bytes | None]:
+    try:
+        return await communicate_with_timeout(proc, timeout=_FFMPEG_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.error("ffmpeg_timeout", timeout=_FFMPEG_TIMEOUT_SECONDS)
+        raise MediaProcessingError(
+            "Обработка файла заняла слишком много времени. Попробуйте файл покороче."
+        ) from None
+
+
 async def extract_audio_from_video(
     video_bytes: bytes,
     *,
@@ -192,7 +244,7 @@ async def extract_audio_from_video(
     with tempfile.TemporaryDirectory(prefix="assist_media_") as tmp:
         src = Path(tmp) / f"input{suffix}"
         dst = Path(tmp) / "audio.mp3"
-        src.write_bytes(video_bytes)
+        await asyncio.to_thread(src.write_bytes, video_bytes)
         # 16 kHz mono — оптимально для Whisper; явный map первой аудиодорожки.
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
@@ -214,7 +266,7 @@ async def extract_audio_from_video(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _stdout, stderr = await proc.communicate()
+        _stdout, stderr = await _run_ffmpeg(proc)
         if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
             # Fallback без map — некоторые контейнеры криво маркируют дорожки.
             detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
@@ -237,14 +289,14 @@ async def extract_audio_from_video(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _stdout, stderr = await proc.communicate()
+            _stdout, stderr = await _run_ffmpeg(proc)
             if proc.returncode != 0 or not dst.exists():
                 detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
                 logger.error("ffmpeg_extract_failed", detail=detail)
                 raise MediaProcessingError(
                     "Не удалось извлечь аудио из видео. Проверьте формат файла."
                 )
-        audio = dst.read_bytes()
+        audio = await asyncio.to_thread(dst.read_bytes)
         if not audio:
             raise MediaProcessingError("В видео нет звуковой дорожки.")
         # ~64 kbit/s → меньше ~8 КБ на секунду; очень маленький файл при
@@ -282,7 +334,7 @@ async def split_audio_for_stt(
     suffix = Path(filename).suffix or ".mp3"
     with tempfile.TemporaryDirectory(prefix="assist_stt_") as tmp:
         src = Path(tmp) / f"input{suffix}"
-        src.write_bytes(audio_bytes)
+        await asyncio.to_thread(src.write_bytes, audio_bytes)
         pattern = str(Path(tmp) / "chunk_%03d.mp3")
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
@@ -299,7 +351,7 @@ async def split_audio_for_stt(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _stdout, stderr = await proc.communicate()
+        _stdout, stderr = await _run_ffmpeg(proc)
         chunks = sorted(Path(tmp).glob("chunk_*.mp3"))
         if proc.returncode != 0 or not chunks:
             # copy может не сработать без ключевых кадров — перекодируем.
@@ -322,13 +374,13 @@ async def split_audio_for_stt(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
+            await _run_ffmpeg(proc)
             chunks = sorted(Path(tmp).glob("chunk_*.mp3"))
         if not chunks:
             raise MediaProcessingError("Не удалось нарезать длинное аудио для STT.")
         result: list[tuple[bytes, str]] = []
         for index, path in enumerate(chunks):
-            data = path.read_bytes()
+            data = await asyncio.to_thread(path.read_bytes)
             if not data:
                 continue
             # Если кусок всё ещё слишком большой — режем ещё раз пополам по времени.
@@ -343,6 +395,67 @@ async def split_audio_for_stt(
             raise MediaProcessingError("После нарезки не осталось аудиоданных.")
         logger.info("audio_split", parts=len(result), source_bytes=len(audio_bytes))
         return result
+
+
+def _duration_from_ffmpeg_text(text: str) -> float | None:
+    match = _DURATION_RE.search(text)
+    if match is None:
+        return None
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+    total = hours * 3600 + minutes * 60 + seconds
+    if total <= 0:
+        return None
+    return total
+
+
+async def probe_duration_seconds(data: bytes, *, filename: str) -> float | None:
+    """Длительность контейнера по строке ``Duration`` ffmpeg. ``None``, если не открылся."""
+    if not data:
+        return None
+    try:
+        ffmpeg = find_ffmpeg()
+    except MediaProcessingError:
+        return None
+    suffix = Path(filename).suffix or ".bin"
+    with tempfile.TemporaryDirectory(prefix="assist_dur_") as tmp:
+        src = Path(tmp) / f"input{suffix}"
+        await asyncio.to_thread(src.write_bytes, data)
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            str(src),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout, stderr = await communicate_with_timeout(
+                proc, timeout=_DURATION_PROBE_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return None
+    text = (stderr or b"").decode("utf-8", errors="replace")
+    return _duration_from_ffmpeg_text(text)
+
+
+async def audio_duration_seconds(chunks: list[tuple[bytes, str]]) -> float:
+    """Суммарная длительность кусков, которые уйдут в STT.
+
+    Если ffmpeg не прочитал контейнер, оценка по 64 кбит/с — битрейт
+    извлечённой дорожки. Для более плотного исходного mp3 это завышение,
+    но не оценка всего видеофайла как аудио.
+    """
+    total = 0.0
+    for data, name in chunks:
+        seconds = await probe_duration_seconds(data, filename=name)
+        if seconds is None:
+            audio_bytes = sum(len(item) for item, _name in chunks)
+            return audio_bytes / _EXTRACTED_MP3_BYTES_PER_SECOND
+        total += seconds
+    return total
 
 
 async def prepare_audio_for_stt(

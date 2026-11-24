@@ -14,7 +14,11 @@ from pathlib import Path
 
 import structlog
 
-from app.media.media_utils import MediaProcessingError, find_ffmpeg
+from app.media.media_utils import (
+    MediaProcessingError,
+    communicate_with_timeout,
+    find_ffmpeg,
+)
 
 logger = structlog.get_logger("file_magic")
 
@@ -102,6 +106,13 @@ def container_mime(
     return None
 
 
+def _spill_probe_file(data: bytes, suffix: str) -> Path:
+    """Пишет байты во временный файл вне event loop."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        return Path(tmp.name)
+
+
 def _claim_ok(claimed_mime: str, family: frozenset[str]) -> bool:
     if not claimed_mime or claimed_mime == "application/octet-stream":
         return True
@@ -124,12 +135,10 @@ async def _probe(path: Path) -> tuple[str, bool, bool] | None:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        _stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_PROBE_TIMEOUT_SECONDS
+        _stdout, stderr = await communicate_with_timeout(
+            proc, timeout=_PROBE_TIMEOUT_SECONDS
         )
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
         logger.warning("mime_probe_timeout")
         return None
     return _parse_probe((stderr or b"").decode("utf-8", errors="replace"))
@@ -158,9 +167,7 @@ async def mime_compatible(
     else:
         if not source:
             return False
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(source)
-            tmp_path = Path(tmp.name)
+        tmp_path = await asyncio.to_thread(_spill_probe_file, source, ext)
         try:
             probed = await _probe(tmp_path)
         finally:
