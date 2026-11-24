@@ -664,11 +664,15 @@ async def _answer_photo_bytes(
 
     ``as_file`` сразу отдаёт исходный файл: так сохраняется альфа-канал.
     Telegram отдаёт ``IMAGE_PROCESS_FAILED`` и на валидный файл, который
-    через минуту принимает без изменений. ``sendDocument`` картинку не
-    обрабатывает, поэтому оплаченный результат всё равно доходит.
-    Возвращает отправленное сообщение: из него берут ``file_id`` для
-    следующей правки.
+    через минуту принимает без изменений. Обрыв соединения
+    (``ServerDisconnectedError``) тоже не должен терять уже скачанный файл:
+    sendPhoto повторяется, затем тот же файл уходит документом.
+    ``sendDocument`` картинку не обрабатывает, поэтому оплаченный результат
+    всё равно доходит. Возвращает отправленное сообщение: из него берут
+    ``file_id`` для следующей правки.
     """
+    from aiogram.exceptions import TelegramNetworkError
+
     from app.bot.image_retry import telegram_photo_needs_document
     from app.bot.photo_pacer import send_photo_paced
 
@@ -684,10 +688,25 @@ async def _answer_photo_bytes(
             request_timeout=120,
         )
 
+    async def _photo_or_retry_network() -> Message:
+        last_network: TelegramNetworkError | None = None
+        for attempt, pause in ((1, 1.0), (2, 4.0), (3, 8.0), (4, 0.0)):
+            try:
+                return await send_photo_paced(message.chat.id, _send_photo)
+            except TelegramNetworkError as exc:
+                last_network = exc
+                logger.warning("telegram_photo_network", attempt=attempt, size=len(raw))
+                if pause <= 0:
+                    raise
+                await asyncio.sleep(pause)
+        assert last_network is not None
+        raise last_network
+
     last_error: TelegramBadRequest | None = None
+    network_error: TelegramNetworkError | None = None
     for attempt in (1, 2):
         try:
-            return await send_photo_paced(message.chat.id, _send_photo)
+            return await _photo_or_retry_network()
         except TelegramBadRequest as exc:
             last_error = exc
             if "IMAGE_PROCESS_FAILED" in str(exc) and attempt == 1:
@@ -696,6 +715,17 @@ async def _answer_photo_bytes(
                 )
                 continue
             break
+        except TelegramNetworkError as exc:
+            network_error = exc
+            break
+    if network_error is not None:
+        try:
+            return await message.answer_document(
+                document=BufferedInputFile(raw, filename=filename),
+                request_timeout=120,
+            )
+        except TelegramNetworkError:
+            raise network_error
     if last_error is None or not telegram_photo_needs_document(last_error):
         if last_error is not None:
             raise last_error
@@ -704,6 +734,51 @@ async def _answer_photo_bytes(
         document=BufferedInputFile(raw, filename=filename),
         request_timeout=120,
     )
+
+
+async def _answer_video_bytes(message: Message, raw: bytes, filename: str) -> Message:
+    """Ролик, а при обрыве Telegram — повтор и затем документ.
+
+    Оплаченный файл уже скачан. ``ServerDisconnectedError`` не должен
+    заканчиваться одной попыткой: sendVideo повторяется, затем те же байты
+    уходят документом.
+    """
+    from aiogram.exceptions import TelegramNetworkError
+
+    async def _send_video() -> Message:
+        return await message.answer_video(
+            video=BufferedInputFile(raw, filename=filename),
+            request_timeout=180,
+        )
+
+    last_network: TelegramNetworkError | None = None
+    bad_request: TelegramBadRequest | None = None
+    for attempt, pause in ((1, 1.0), (2, 4.0), (3, 8.0), (4, 0.0)):
+        try:
+            return await _send_video()
+        except TelegramBadRequest as exc:
+            bad_request = exc
+            logger.warning("telegram_video_rejected", attempt=attempt, size=len(raw))
+            break
+        except TelegramNetworkError as exc:
+            last_network = exc
+            logger.warning("telegram_video_network", attempt=attempt, size=len(raw))
+            if pause <= 0:
+                break
+            await asyncio.sleep(pause)
+    try:
+        return await message.answer_document(
+            document=BufferedInputFile(raw, filename=filename),
+            request_timeout=180,
+        )
+    except TelegramNetworkError:
+        if last_network is not None:
+            raise last_network
+        raise
+    except TelegramBadRequest:
+        if bad_request is not None:
+            raise bad_request
+        raise
 
 
 async def _send_outbound_media(
@@ -715,21 +790,20 @@ async def _send_outbound_media(
     for item in items:
         try:
             if item.kind == "image":
+                from aiogram.exceptions import TelegramNetworkError
+
+                from app.bot.image_retry import (
+                    IMAGE_KEEP_TEXT,
+                    IMAGE_RETRY_TEXT,
+                    note_failed_image,
+                )
+
                 as_file = profile is not None and M._image_as_file(profile, item.model)
+                user_id = message.from_user.id if message.from_user else message.chat.id
                 if item.url:
                     try:
                         raw = await _download_image_url(item.url)
                     except AssistAIError:
-                        from app.bot.image_retry import (
-                            IMAGE_RETRY_TEXT,
-                            note_failed_image,
-                        )
-
-                        user_id = (
-                            message.from_user.id
-                            if message.from_user
-                            else message.chat.id
-                        )
                         if await note_failed_image(
                             message.chat.id,
                             user_id,
@@ -740,37 +814,95 @@ async def _send_outbound_media(
                             await message.answer(IMAGE_RETRY_TEXT)
                             continue
                         raise
-                    await _answer_photo_bytes(
-                        message, raw, item.filename, as_file=as_file
-                    )
+                    try:
+                        await _answer_photo_bytes(
+                            message, raw, item.filename, as_file=as_file
+                        )
+                    except TelegramNetworkError:
+                        if await note_failed_image(
+                            message.chat.id,
+                            user_id,
+                            item.url,
+                            item.filename,
+                            as_file=as_file,
+                        ):
+                            await message.answer(IMAGE_KEEP_TEXT)
+                            continue
+                        raise
                 elif item.data:
                     await _answer_photo_bytes(
                         message, item.data, item.filename, as_file=as_file
                     )
             elif item.kind == "audio":
+                from aiogram.exceptions import TelegramNetworkError
+
+                from app.bot.file_retry import AUDIO_KEEP_TEXT, keep_paid_bytes
+
                 if not item.data:
                     continue
+                user_id = message.from_user.id if message.from_user else message.chat.id
                 audio = BufferedInputFile(item.data, filename=item.filename)
-                if item.filename.endswith((".ogg", ".opus")):
-                    await message.answer_voice(voice=audio)
-                else:
-                    await message.answer_audio(audio=audio)
+                try:
+                    if item.filename.endswith((".ogg", ".opus")):
+                        await message.answer_voice(voice=audio)
+                    else:
+                        await message.answer_audio(audio=audio)
+                except (TelegramBadRequest, TelegramNetworkError):
+                    if await keep_paid_bytes(
+                        message.chat.id,
+                        user_id,
+                        item.data,
+                        item.filename,
+                        kind="audio",
+                        mime=item.mime_type,
+                    ):
+                        await message.answer(AUDIO_KEEP_TEXT)
+                        continue
+                    raise
             elif item.kind == "video":
+                from aiogram.exceptions import TelegramNetworkError
+
+                from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
+
                 if not item.data:
                     continue
-                payload = BufferedInputFile(item.data, filename=item.filename)
+                user_id = message.from_user.id if message.from_user else message.chat.id
                 try:
-                    await message.answer_video(video=payload)
-                except TelegramBadRequest:
+                    await _answer_video_bytes(message, item.data, item.filename)
+                except TelegramNetworkError:
+                    saved = False
+                    if isinstance(item.url, str) and item.url:
+                        saved = await note_failed_video(
+                            message.chat.id, user_id, item.url, item.filename
+                        )
+                    if saved:
+                        await message.answer(VIDEO_KEEP_TEXT)
+                        continue
+                    raise
+            elif item.kind == "document":
+                from aiogram.exceptions import TelegramNetworkError
+
+                from app.bot.file_retry import TEXT_KEEP_TEXT, keep_paid_bytes
+
+                if not item.data:
+                    continue
+                user_id = message.from_user.id if message.from_user else message.chat.id
+                try:
                     await message.answer_document(
                         document=BufferedInputFile(item.data, filename=item.filename)
                     )
-            elif item.kind == "document":
-                if not item.data:
-                    continue
-                await message.answer_document(
-                    document=BufferedInputFile(item.data, filename=item.filename)
-                )
+                except (TelegramBadRequest, TelegramNetworkError):
+                    if await keep_paid_bytes(
+                        message.chat.id,
+                        user_id,
+                        item.data,
+                        item.filename,
+                        kind="document",
+                        mime=item.mime_type,
+                    ):
+                        await message.answer(TEXT_KEEP_TEXT)
+                        continue
+                    raise
         except Exception:
             logger.exception(
                 "outbound_media_send_failed", kind=item.kind, filename=item.filename
@@ -787,14 +919,20 @@ async def _send_generated_image(
     ``s3.polza.ai`` ловит ``Request timeout`` (~30 с). Скачиваем отдельно
     (до 120 с), в Telegram отдаём уже байты.
     """
+    from aiogram.exceptions import TelegramNetworkError
+
+    from app.bot.image_retry import (
+        IMAGE_KEEP_TEXT,
+        IMAGE_RETRY_TEXT,
+        note_failed_image,
+    )
+
     filename = "image.png" if index == 0 else f"image_{index + 1}.png"
+    user_id = message.from_user.id if message.from_user else message.chat.id
     if _is_http_url(image):
         try:
             raw = await _download_image_url(image)
         except AssistAIError:
-            from app.bot.image_retry import IMAGE_RETRY_TEXT, note_failed_image
-
-            user_id = message.from_user.id if message.from_user else message.chat.id
             if await note_failed_image(
                 message.chat.id, user_id, image, filename, as_file=as_file
             ):
@@ -809,7 +947,14 @@ async def _send_generated_image(
             ) from exc
     if not raw:
         raise AssistAIError("Провайдер вернул пустое изображение.")
-    return await _answer_photo_bytes(message, raw, filename, as_file=as_file)
+    try:
+        return await _answer_photo_bytes(message, raw, filename, as_file=as_file)
+    except TelegramNetworkError:
+        if _is_http_url(image) and await note_failed_image(
+            message.chat.id, user_id, image, filename, as_file=as_file
+        ):
+            raise AssistAIError(IMAGE_KEEP_TEXT) from None
+        raise
 
 
 async def _send_voice_reply(
@@ -875,24 +1020,42 @@ async def _send_voice_reply(
         return
     finally:
         await cost_tracker.release_reservation(user_id)
+    from aiogram.exceptions import TelegramNetworkError
+
+    from app.bot.file_retry import AUDIO_KEEP_TEXT, keep_paid_bytes
+
+    async def _keep_speech() -> bool:
+        return await keep_paid_bytes(
+            message.chat.id,
+            user_id,
+            speech.audio,
+            speech.filename,
+            kind="audio",
+            mime=speech.mime_type,
+        )
+
     audio = BufferedInputFile(speech.audio, filename=speech.filename)
     # MP3 (ElevenLabs) — как audio; OGG — как voice-bubble.
     if speech.mime_type == "audio/mpeg" or speech.filename.casefold().endswith(".mp3"):
         try:
             await message.answer_audio(audio=audio)
-        except TelegramBadRequest as exc:
+        except (TelegramBadRequest, TelegramNetworkError) as exc:
             logger.warning("Не удалось отправить озвучку (audio): %s", exc)
+            if await _keep_speech():
+                await message.answer(AUDIO_KEEP_TEXT)
         return
     try:
         await message.answer_voice(voice=audio)
-    except TelegramBadRequest as exc:
+    except (TelegramBadRequest, TelegramNetworkError) as exc:
         logger.warning("Telegram не принял voice, пробую audio: %s", exc)
         try:
             await message.answer_audio(
                 audio=BufferedInputFile(speech.audio, filename=speech.filename)
             )
-        except TelegramBadRequest as nested:
+        except (TelegramBadRequest, TelegramNetworkError) as nested:
             logger.warning("Не удалось отправить озвучку: %s", nested)
+            if await _keep_speech():
+                await message.answer(AUDIO_KEEP_TEXT)
 
 
 class _ChatTurnGate:
@@ -1436,13 +1599,28 @@ async def _process_s3_upload_session(
             await store.update(session)
             return
 
-        await bot.send_document(
-            chat_id,
-            document=BufferedInputFile(
-                transcript.encode("utf-8"), filename="transcript.txt"
-            ),
-            caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
-        )
+        from aiogram.exceptions import TelegramNetworkError
+
+        transcript_bytes = transcript.encode("utf-8")
+        try:
+            await bot.send_document(
+                chat_id,
+                document=BufferedInputFile(transcript_bytes, filename="transcript.txt"),
+                caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
+            )
+        except (TelegramBadRequest, TelegramNetworkError):
+            from app.bot.file_retry import TEXT_KEEP_TEXT, keep_paid_bytes
+
+            if not await keep_paid_bytes(
+                chat_id,
+                user_id,
+                transcript_bytes,
+                "transcript.txt",
+                kind="document",
+                mime="text/plain",
+            ):
+                raise
+            await bot.send_message(chat_id, TEXT_KEEP_TEXT)
 
         # Короткая запись в историю активной темы.
         try:

@@ -720,8 +720,6 @@ async def _generate_video(
     profile: Any | None = None,
 ) -> None:
     """Ролик по присланным фото. Повторный запрос сюда не приходит, пока этот ход жив."""
-    from aiogram.types import BufferedInputFile
-
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_media_limit(user_id):
@@ -760,32 +758,23 @@ async def _generate_video(
             generate_audio=settings.generate_audio,
         )
         filename = video.filename or "video.mp4"
-        payload = BufferedInputFile(video.data, filename=filename)
         try:
-            await message.answer_video(video=payload)
+            await R._answer_video_bytes(message, video.data, filename)
         except Exception:
             logger.exception("photo_video_send_failed", chat_id=media.chat_id)
-            try:
-                await message.answer_document(
-                    document=BufferedInputFile(video.data, filename=filename)
-                )
-            except Exception:
-                logger.exception("photo_video_document_failed", chat_id=media.chat_id)
-                from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
+            from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
 
-                source = getattr(video, "source_url", None)
-                saved = False
-                if isinstance(source, str) and source:
-                    saved = await note_failed_video(
-                        media.chat_id, user_id, source, filename
-                    )
-                if saved:
-                    await message.answer(VIDEO_KEEP_TEXT)
-                else:
-                    await message.answer(
-                        "Ролик готов, но отправить его в чат не удалось."
-                    )
-                return
+            source = getattr(video, "source_url", None)
+            saved = False
+            if isinstance(source, str) and source:
+                saved = await note_failed_video(
+                    media.chat_id, user_id, source, filename
+                )
+            if saved:
+                await message.answer(VIDEO_KEEP_TEXT)
+            else:
+                await message.answer("Ролик готов, но отправить его в чат не удалось.")
+            return
         delivered = True
         await message.answer("Ролик готов.")
         await _remember_pair(

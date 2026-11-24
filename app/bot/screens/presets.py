@@ -13,6 +13,7 @@ from app.bot.constants import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from app.llm.models_config import text_model_supports_vision
 
 
 def _presets_text(page: int = 0) -> str:
@@ -56,11 +57,8 @@ def _preset_preview_parts(
     text_line = M._chosen_model_line(
         preset.text_model, assistant.config.default_text_model
     )
-    vision_line = (
-        M._chosen_model_line(preset.vision_model, assistant.config.default_text_model)
-        if preset.vision_model
-        else "—"
-    )
+    text_model = preset.text_model or assistant.config.default_text_model
+    vision_line = "+" if text_model_supports_vision(text_model) else "—"
     image_line = (
         M._chosen_model_line(preset.image_model, assistant.config.default_image_model)
         if preset.image_model

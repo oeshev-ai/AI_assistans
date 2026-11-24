@@ -7,12 +7,12 @@ import time
 import pytest
 
 from app.infra.rate_limiter import (
-    IMAGE_LIMIT,
     MEDIA_LIMIT,
     TEXT_LIMIT,
     UPLOAD_WRITE_LIMIT,
     RateLimiter,
 )
+from app.infra.settings import get_settings
 
 
 @pytest.mark.asyncio
@@ -27,23 +27,24 @@ async def test_text_limit_blocks_after_threshold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_limit_independent_of_text() -> None:
+async def test_image_bucket_independent_of_text() -> None:
     limiter = RateLimiter()
     user_id = 7
-    for _ in range(IMAGE_LIMIT):
-        assert await limiter.check_image_limit(user_id) is True
-    assert await limiter.check_image_limit(user_id) is False
+    capacity = int(get_settings().image_bucket_capacity)
+    for _ in range(capacity):
+        assert await limiter.consume_image_bucket(user_id, "image_generate") is True
+    assert await limiter.consume_image_bucket(user_id, "image_generate") is False
     assert await limiter.check_text_limit(user_id) is True
 
 
 @pytest.mark.asyncio
-async def test_media_limit_independent_of_image() -> None:
+async def test_media_limit_independent_of_image_bucket() -> None:
     limiter = RateLimiter()
     user_id = 11
     for _ in range(MEDIA_LIMIT):
         assert await limiter.check_media_limit(user_id) is True
     assert await limiter.check_media_limit(user_id) is False
-    assert await limiter.check_image_limit(user_id) is True
+    assert await limiter.consume_image_bucket(user_id, "image_generate") is True
     retry = await limiter.get_retry_after(user_id, "media")
     assert retry > 0
 

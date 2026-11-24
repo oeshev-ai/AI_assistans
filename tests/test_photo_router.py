@@ -258,7 +258,9 @@ async def test_photo_video_sends_the_photos_as_references(
             self.texts.append(text)
             return SimpleNamespace(message_id=1)
 
-        async def answer_video(self, *, video: Any) -> SimpleNamespace:
+        async def answer_video(
+            self, *, video: Any, request_timeout: int | None = None
+        ) -> SimpleNamespace:
             payload = video.data
             self.videos.append(
                 payload if isinstance(payload, bytes) else payload.read()
@@ -391,7 +393,9 @@ async def test_photo_video_keeps_router_reference_subset(
         async def answer(self, text: str) -> SimpleNamespace:
             return SimpleNamespace(message_id=1)
 
-        async def answer_video(self, *, video: Any) -> SimpleNamespace:
+        async def answer_video(
+            self, *, video: Any, request_timeout: int | None = None
+        ) -> SimpleNamespace:
             return SimpleNamespace(message_id=2)
 
     class _Assistant:

@@ -125,6 +125,12 @@ async def test_health_server_failure_closes_started_clients(
     monkeypatch.setattr(
         "app.bot.video_retry.bind_video_delivery", lambda *_a, **_k: None
     )
+    monkeypatch.setattr(
+        "app.storage.file_delivery.open_file_delivery_store",
+        lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr("app.bot.file_retry.file_delivery_loop", _idle)
+    monkeypatch.setattr("app.bot.file_retry.bind_file_delivery", lambda *_a, **_k: None)
 
     dispatcher = Dispatcher()
     with pytest.raises(RuntimeError, match="health down"):
@@ -139,5 +145,7 @@ async def test_health_server_failure_closes_started_clients(
     assert job_closed["ok"]
     image_task = dispatcher.workflow_data["image_delivery_task"]
     video_task = dispatcher.workflow_data["video_delivery_task"]
+    file_task = dispatcher.workflow_data["file_delivery_task"]
     assert image_task.cancelled() or image_task.done()
     assert video_task.cancelled() or video_task.done()
+    assert file_task.cancelled() or file_task.done()

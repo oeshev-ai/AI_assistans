@@ -328,6 +328,13 @@ async def _start_background(
 
     upload_store = UploadSessionStore(shared_redis)
     s3_storage = get_storage()
+    from app.bot.file_retry import bind_file_delivery, file_delivery_loop
+    from app.storage.file_delivery import open_file_delivery_store
+
+    file_store = open_file_delivery_store(shared_redis)
+    bind_file_delivery(file_store, s3_storage)
+    file_task = asyncio.create_task(file_delivery_loop(bot, file_store, s3_storage))
+    dispatcher.workflow_data["file_delivery_task"] = file_task
     assistant.upload_session_store = upload_store  # type: ignore[attr-defined]
     dispatcher.workflow_data["bot"] = bot
     dispatcher.workflow_data["upload_store"] = upload_store
@@ -417,6 +424,16 @@ async def on_shutdown(dispatcher: Dispatcher) -> None:
     from app.bot.video_retry import bind_video_delivery
 
     bind_video_delivery(None)
+    file_task = dispatcher.workflow_data.get("file_delivery_task")
+    if isinstance(file_task, asyncio.Task):
+        file_task.cancel()
+        try:
+            await file_task
+        except asyncio.CancelledError:
+            pass
+    from app.bot.file_retry import bind_file_delivery
+
+    bind_file_delivery(None)
     health_runner = dispatcher.workflow_data.get("health_runner")
     if health_runner is not None:
         app = getattr(health_runner, "app", None)

@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.methods import SendMessage
 from redis.exceptions import WatchError
 
 from app.bot.image_retry import (
     IMAGE_EXPIRED_TEXT,
+    IMAGE_KEEP_TEXT,
     IMAGE_LATE_CAPTION,
     IMAGE_RETRY_TEXT,
     bind_image_delivery,
@@ -336,6 +339,88 @@ async def test_add_retries_when_the_record_changes_under_watch() -> None:
         "https://s3.polza.ai/c.png",
         "https://s3.polza.ai/b.png",
     ]
+
+
+def _network_error() -> TelegramNetworkError:
+    return TelegramNetworkError(
+        method=SendMessage(chat_id=1, text="x"),
+        message="HTTP Client says - ServerDisconnectedError: Server disconnected",
+    )
+
+
+class _PhotoMessage(_Message):
+    def __init__(self, *, fail_photos: int) -> None:
+        self.fail_photos = fail_photos
+        self.photos = 0
+        self.documents = 0
+        self.sent = object()
+
+    async def answer_photo(self, **_kwargs: object) -> object:
+        self.photos += 1
+        if self.photos <= self.fail_photos:
+            raise _network_error()
+        return self.sent
+
+    async def answer_document(self, **_kwargs: object) -> object:
+        self.documents += 1
+        raise _network_error()
+
+
+@pytest.mark.asyncio
+async def test_telegram_disconnect_retries_photo_then_keeps_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Обрыв sendPhoto не молчит: файл ставится в повторную доставку."""
+    store = InMemoryImageDeliveryStore()
+    bind_image_delivery(store)
+    message = _PhotoMessage(fail_photos=10)
+
+    async def _png(_url: str) -> bytes:
+        return b"png"
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.bot.runtime._download_image_url", _png)
+    monkeypatch.setattr("app.bot.runtime.asyncio.sleep", _no_sleep)
+    try:
+        with pytest.raises(AssistAIError) as info:
+            await _send_generated_image(
+                message,  # type: ignore[arg-type]
+                "https://s3-alt.polza.ai/paid.png",
+                0,
+            )
+    finally:
+        bind_image_delivery(None)
+    assert info.value.message == IMAGE_KEEP_TEXT
+    assert message.photos == 4
+    assert message.documents == 1
+    waiting = await store.due(10**12)
+    assert waiting[0].urls == ["https://s3-alt.polza.ai/paid.png"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_disconnect_photo_succeeds_on_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _PhotoMessage(fail_photos=2)
+
+    async def _png(_url: str) -> bytes:
+        return b"png"
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.bot.runtime._download_image_url", _png)
+    monkeypatch.setattr("app.bot.runtime.asyncio.sleep", _no_sleep)
+    sent = await _send_generated_image(
+        message,  # type: ignore[arg-type]
+        "https://s3-alt.polza.ai/paid.png",
+        0,
+    )
+    assert sent is message.sent
+    assert message.photos == 3
+    assert message.documents == 0
 
 
 def test_photo_size_and_type_errors_fall_back_to_document() -> None:

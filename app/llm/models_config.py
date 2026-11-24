@@ -18,6 +18,10 @@ AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
     "qwen/qwen4-max",
 )
 
+# Vision — свойство текстовой модели, отдельным выбором не задаётся.
+# Все модели текущего текстового каталога принимают фото и PDF.
+TEXT_MODELS_WITH_VISION: frozenset[str] = frozenset(AVAILABLE_TEXT_MODELS)
+
 # Картинки: GPT Image 2.6 — основная; FLUX, Qwen и Nano Banana — свои поля размера.
 AVAILABLE_IMAGE_MODELS: tuple[str, ...] = (
     "openai/gpt-image-2.6-flare",
@@ -129,6 +133,14 @@ def resolve_polza_video_model(model_id: str | None) -> str | None:
     if not model_id:
         return model_id
     return POLZA_VIDEO_MODEL_ALIASES.get(model_id.strip().casefold(), model_id)
+
+
+def text_model_supports_vision(model_id: str | None) -> bool:
+    """True, если эта текстовая модель принимает фото и PDF."""
+    resolved = resolve_text_model(model_id)
+    if not resolved:
+        return False
+    return resolved in TEXT_MODELS_WITH_VISION
 
 
 def model_hint(model_id: str | None) -> str:
