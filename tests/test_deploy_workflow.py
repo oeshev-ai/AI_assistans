@@ -18,6 +18,7 @@ def test_deploy_pulls_arq_profile_and_ups_only_a_live_worker() -> None:
     assert 'if [ ! -f .env ]' in script
     assert "exit 1" in script
     assert " > .env" not in script
+    assert "command_timeout: 20m" in text
     assert "concurrency:" in text
     assert "cancel-in-progress: false" in text
     assert "running|restarting" in script

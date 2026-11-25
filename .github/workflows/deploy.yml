@@ -64,6 +64,9 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Дефолт action — 10m. Pull большого образа съедает его, и up
+          # обрывается на «Starting» сообщением Run Command Timeout.
+          command_timeout: 20m
           script: |
             set -e
             cd /home/deploy/AI_assistans
