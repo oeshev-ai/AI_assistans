@@ -2150,13 +2150,19 @@ async def _reset_flow(state: FSMContext) -> None:
 
 
 async def _delete_bot_message(message: Message) -> None:
-    """Удаляет сообщение бота. Повторное удаление не считается сбоем."""
+    """Удаляет сообщение бота. Сбой Telegram не пробрасываем — это уборка."""
+    from aiogram.exceptions import TelegramNetworkError
+
     try:
         await message.delete()
     except TelegramBadRequest as exc:
         if "message to delete not found" in str(exc):
             logger.debug("Сообщение уже удалено: %s", exc)
             return
+        logger.warning("Не удалось удалить сообщение: %s", exc)
+    except TelegramNetworkError as exc:
+        logger.warning("Не удалось удалить сообщение (сеть): %s", exc)
+    except Exception as exc:
         logger.warning("Не удалось удалить сообщение: %s", exc)
 
 
@@ -2213,6 +2219,8 @@ async def _sweep_chrome(
     anchor = stored.get(_MENU_ANCHOR)
     bot = message.bot
     if bot is not None:
+        from aiogram.exceptions import TelegramNetworkError
+
         for item in raw_ids:
             if not isinstance(item, int) or item == anchor:
                 continue
@@ -2223,6 +2231,13 @@ async def _sweep_chrome(
                     "Служебное сообщение уже удалено chat_id=%s message_id=%s",
                     message.chat.id,
                     item,
+                )
+            except (TelegramNetworkError, Exception) as exc:
+                logger.warning(
+                    "chrome_delete_failed",
+                    chat_id=message.chat.id,
+                    message_id=item,
+                    error=str(exc),
                 )
     refreshed = await state.get_data()
     for key in _SCREEN_KEYS:

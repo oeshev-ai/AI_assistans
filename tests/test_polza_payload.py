@@ -50,6 +50,7 @@ def _body(**kwargs: Any) -> dict[str, Any]:
 def test_body_omits_complexity_and_image_resolution() -> None:
     body = _body(aspect_ratio="3:2", size="1536x1024", quality="high")
     media_input = body["input"]
+    assert body["async"] is True
     assert media_input["aspect_ratio"] == "3:2"
     assert media_input["size"] == "1536x1024"
     assert media_input["quality"] == "high"
@@ -349,7 +350,7 @@ async def test_generate_sync_completed_sends_expected_request(
     request = route.calls[0].request
     sent = json.loads(request.content)
     assert sent["model"] == _MODEL
-    assert "async" not in sent
+    assert sent["async"] is True
     assert result.images[0]["value"].startswith("https://s3.polza.ai/")
     assert result.cost_rub == pytest.approx(2.37166294)
 

@@ -14,6 +14,8 @@
 * ``data`` — список ``[{"url": ...}]`` (допускаем и объект, и ``b64_json``);
 * референсы передаются как ``{"type": "base64", "data": ...}``;
 * опрос статуса — только ``GET /v1/media/{id}``;
+* create всегда с ``async: true``: короткий ответ с ``id``, иначе при обрыве
+  sync-HTTP теряется уже оплаченный файл без ``media_id`` для повтора;
 * ``complexity`` не отправляется; ``background`` — только у GPT Image
   (``auto`` / ``transparent`` / ``opaque``), правка всегда ``auto``;
 * ``usage.cost_rub`` приходит уже в синхронном ответе.
@@ -519,7 +521,9 @@ def build_media_body(
             {"type": "base64", "data": base64.b64encode(raw).decode("ascii")}
             for raw in images
         ]
-    body: dict[str, Any] = {"model": model, "input": media_input}
+    # Как у видео: сначала id, потом GET /v1/media/{id}. Sync-create держит
+    # длинный POST; RemoteProtocolError тогда оставляет оплату без media_id.
+    body: dict[str, Any] = {"model": model, "input": media_input, "async": True}
     if user:
         body["user"] = user[:_MAX_USER_LEN]
     profile = polza_media_profile(model)
@@ -860,10 +864,12 @@ async def generate(
     try:
         response = await client.post(url, json=body, timeout=timeout)
     except httpx.RequestError as exc:
+        # Без id статус не проверить; idempotency у Polza нет — create не ретраим.
         raise _network_error(exc, "create") from exc
     _raise_for_response(response, provider.id)
     # Successful create accepted by Polza — further poll/parse failures must not
     # trigger a second paid job on the fallback provider (same as generate_video).
+    known_media_id: str | None = None
     try:
         try:
             payload = response.json()
@@ -878,24 +884,27 @@ async def generate(
 
         status = str(payload.get("status") or "").casefold()
         media_id = payload.get("id")
+        if isinstance(media_id, str) and media_id:
+            known_media_id = media_id
         if (
             status in _PENDING_STATUSES
             and not _items(payload)
-            and isinstance(media_id, str)
-            and media_id
+            and known_media_id is not None
         ):
-            logger.info("polza_media_async", media_id=media_id, status=status)
+            logger.info(
+                "polza_media_async", media_id=known_media_id, status=status
+            )
             try:
                 payload = await _poll(
                     client,
                     provider,
-                    media_id,
+                    known_media_id,
                     poll_interval=poll_interval,
                     total_wait=total_wait,
                     timeout=timeout,
                 )
             except AssistAIError as exc:
-                _remember_polza_job(exc, media_id, medium="image")
+                _remember_polza_job(exc, known_media_id, medium="image")
                 raise
             status = str(payload.get("status") or "").casefold()
 
@@ -920,6 +929,23 @@ async def generate(
             )
     except AssistAIError as exc:
         exc.job_committed = True
+        # Poll уже вызывает _remember_polza_job. Здесь — обрыв после id
+        # (пустой completed, битый JSON уже без id): доставка без второй оплаты.
+        code = (exc.error_code or "").upper()
+        if (
+            known_media_id
+            and not exc.pending_job_id
+            and code
+            in {
+                "NETWORK_ERROR",
+                "TIMEOUT",
+                "REQUEST_TIMEOUT",
+                "POLL_TIMEOUT",
+                "BAD_GATEWAY",
+                "SERVICE_UNAVAILABLE",
+            }
+        ):
+            _remember_polza_job(exc, known_media_id, medium="image")
         raise
     logger.info(
         "polza_media_done",
