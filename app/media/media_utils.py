@@ -227,32 +227,38 @@ async def _run_ffmpeg(
         ) from None
 
 
-async def extract_audio_from_video(
-    video_bytes: bytes,
-    *,
-    source_name: str = "video.mp4",
-) -> tuple[bytes, str]:
-    """Достаёт аудиодорожку из видео в MP3.
-
-    Returns:
-        ``(audio_bytes, filename)``.
-    """
-    if not video_bytes:
-        raise MediaProcessingError("Пустой видеофайл.")
+async def _extract_audio_to(src: Path, dst: Path) -> None:
+    """Пишет дорожку ``src`` в ``dst`` (16 kHz mono MP3). Исходник не читает в RAM."""
     ffmpeg = find_ffmpeg()
-    suffix = Path(source_name).suffix or ".mp4"
-    with tempfile.TemporaryDirectory(prefix="assist_media_") as tmp:
-        src = Path(tmp) / f"input{suffix}"
-        dst = Path(tmp) / "audio.mp3"
-        await asyncio.to_thread(src.write_bytes, video_bytes)
-        # 16 kHz mono — оптимально для Whisper; явный map первой аудиодорожки.
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-y",
+        "-i",
+        str(src),
+        "-map",
+        "0:a:0?",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        str(dst),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _stdout, stderr = await _run_ffmpeg(proc)
+    if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
+        logger.warning("ffmpeg_extract_map_failed", detail=detail)
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-y",
             "-i",
             str(src),
-            "-map",
-            "0:a:0?",
             "-vn",
             "-ac",
             "1",
@@ -267,35 +273,32 @@ async def extract_audio_from_video(
             stderr=asyncio.subprocess.PIPE,
         )
         _stdout, stderr = await _run_ffmpeg(proc)
-        if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
-            # Fallback без map — некоторые контейнеры криво маркируют дорожки.
+        if proc.returncode != 0 or not dst.exists():
             detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
-            logger.warning("ffmpeg_extract_map_failed", detail=detail)
-            proc = await asyncio.create_subprocess_exec(
-                ffmpeg,
-                "-y",
-                "-i",
-                str(src),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "64k",
-                str(dst),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            logger.error("ffmpeg_extract_failed", detail=detail)
+            raise MediaProcessingError(
+                "Не удалось извлечь аудио из видео. Проверьте формат файла."
             )
-            _stdout, stderr = await _run_ffmpeg(proc)
-            if proc.returncode != 0 or not dst.exists():
-                detail = (stderr or b"").decode("utf-8", errors="replace")[-500:]
-                logger.error("ffmpeg_extract_failed", detail=detail)
-                raise MediaProcessingError(
-                    "Не удалось извлечь аудио из видео. Проверьте формат файла."
-                )
+
+
+async def extract_audio_from_video(
+    video_bytes: bytes,
+    *,
+    source_name: str = "video.mp4",
+) -> tuple[bytes, str]:
+    """Достаёт аудиодорожку из видео в MP3.
+
+    Returns:
+        ``(audio_bytes, filename)``.
+    """
+    if not video_bytes:
+        raise MediaProcessingError("Пустой видеофайл.")
+    suffix = Path(source_name).suffix or ".mp4"
+    with tempfile.TemporaryDirectory(prefix="assist_media_") as tmp:
+        src = Path(tmp) / f"input{suffix}"
+        dst = Path(tmp) / "audio.mp3"
+        await asyncio.to_thread(src.write_bytes, video_bytes)
+        await _extract_audio_to(src, dst)
         audio = await asyncio.to_thread(dst.read_bytes)
         if not audio:
             raise MediaProcessingError("В видео нет звуковой дорожки.")
@@ -315,26 +318,15 @@ async def extract_audio_from_video(
         return audio, "audio.mp3"
 
 
-async def split_audio_for_stt(
-    audio_bytes: bytes,
+async def _split_audio_path(
+    src: Path,
     *,
-    filename: str = "audio.mp3",
-    chunk_seconds: int = _DEFAULT_CHUNK_SECONDS,
+    source_bytes: int,
+    chunk_seconds: int,
 ) -> list[tuple[bytes, str]]:
-    """Режет длинное аудио на куски, пригодные для transcriptions API.
-
-    Короткий файл возвращается как один элемент без перекодирования.
-    """
-    if not audio_bytes:
-        raise MediaProcessingError("Пустой аудиофайл.")
-    if len(audio_bytes) <= _MAX_CHUNK_BYTES:
-        return [(audio_bytes, filename)]
-
+    """Режет файл на диске. В память попадают только куски, не исходник целиком."""
     ffmpeg = find_ffmpeg()
-    suffix = Path(filename).suffix or ".mp3"
     with tempfile.TemporaryDirectory(prefix="assist_stt_") as tmp:
-        src = Path(tmp) / f"input{suffix}"
-        await asyncio.to_thread(src.write_bytes, audio_bytes)
         pattern = str(Path(tmp) / "chunk_%03d.mp3")
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
@@ -354,7 +346,6 @@ async def split_audio_for_stt(
         _stdout, stderr = await _run_ffmpeg(proc)
         chunks = sorted(Path(tmp).glob("chunk_*.mp3"))
         if proc.returncode != 0 or not chunks:
-            # copy может не сработать без ключевых кадров — перекодируем.
             detail = (stderr or b"").decode("utf-8", errors="replace")[-300:]
             logger.warning("ffmpeg_segment_copy_failed", detail=detail)
             proc = await asyncio.create_subprocess_exec(
@@ -383,18 +374,56 @@ async def split_audio_for_stt(
             data = await asyncio.to_thread(path.read_bytes)
             if not data:
                 continue
-            # Если кусок всё ещё слишком большой — режем ещё раз пополам по времени.
             if len(data) > _MAX_CHUNK_BYTES:
                 raise MediaProcessingError(
                     "Фрагмент аудио слишком большой для распознавания. "
                     "Попробуйте файл покороче или с меньшим битрейтом."
                 )
-            name = f"chunk_{index + 1:03d}.mp3"
-            result.append((data, name))
+            result.append((data, f"chunk_{index + 1:03d}.mp3"))
         if not result:
             raise MediaProcessingError("После нарезки не осталось аудиоданных.")
-        logger.info("audio_split", parts=len(result), source_bytes=len(audio_bytes))
+        logger.info("audio_split", parts=len(result), source_bytes=source_bytes)
         return result
+
+
+async def split_audio_file_for_stt(
+    src: Path,
+    *,
+    filename: str = "audio.mp3",
+    chunk_seconds: int = _DEFAULT_CHUNK_SECONDS,
+) -> list[tuple[bytes, str]]:
+    """Режет файл с диска. Короткий читается один раз, длинный не собирается в ``bytes``."""
+    size = src.stat().st_size if src.is_file() else 0
+    if size <= 0:
+        raise MediaProcessingError("Пустой аудиофайл.")
+    if size <= _MAX_CHUNK_BYTES:
+        data = await asyncio.to_thread(src.read_bytes)
+        return [(data, filename)]
+    return await _split_audio_path(src, source_bytes=size, chunk_seconds=chunk_seconds)
+
+
+async def split_audio_for_stt(
+    audio_bytes: bytes,
+    *,
+    filename: str = "audio.mp3",
+    chunk_seconds: int = _DEFAULT_CHUNK_SECONDS,
+) -> list[tuple[bytes, str]]:
+    """Режет длинное аудио на куски, пригодные для transcriptions API.
+
+    Короткий файл возвращается как один элемент без перекодирования.
+    """
+    if not audio_bytes:
+        raise MediaProcessingError("Пустой аудиофайл.")
+    if len(audio_bytes) <= _MAX_CHUNK_BYTES:
+        return [(audio_bytes, filename)]
+
+    suffix = Path(filename).suffix or ".mp3"
+    with tempfile.TemporaryDirectory(prefix="assist_src_") as tmp:
+        src = Path(tmp) / f"input{suffix}"
+        await asyncio.to_thread(src.write_bytes, audio_bytes)
+        return await _split_audio_path(
+            src, source_bytes=len(audio_bytes), chunk_seconds=chunk_seconds
+        )
 
 
 def _duration_from_ffmpeg_text(text: str) -> float | None:
@@ -468,3 +497,38 @@ async def prepare_audio_for_stt(
     if is_video:
         data, filename = await extract_audio_from_video(data, source_name=filename)
     return await split_audio_for_stt(data, filename=filename)
+
+
+async def prepare_audio_file_for_stt(
+    path: Path,
+    *,
+    filename: str,
+    is_video: bool,
+) -> list[tuple[bytes, str]]:
+    """То же, что ``prepare_audio_for_stt``, но исходник остаётся файлом.
+
+    В память попадают куски для STT. Видео и длинное аудио целиком не читаются.
+    """
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise MediaProcessingError("Пустой файл.")
+    if is_video:
+        with tempfile.TemporaryDirectory(prefix="assist_media_") as tmp:
+            dst = Path(tmp) / "audio.mp3"
+            await _extract_audio_to(path, dst)
+            video_size = path.stat().st_size
+            audio_size = dst.stat().st_size if dst.exists() else 0
+            if audio_size <= 0:
+                raise MediaProcessingError("В видео нет звуковой дорожки.")
+            if video_size > 5 * 1024 * 1024 and audio_size < 32 * 1024:
+                logger.warning(
+                    "audio_extracted_suspiciously_small",
+                    video_bytes=video_size,
+                    audio_bytes=audio_size,
+                )
+            logger.info(
+                "audio_extracted",
+                video_bytes=video_size,
+                audio_bytes=audio_size,
+            )
+            return await split_audio_file_for_stt(dst, filename="audio.mp3")
+    return await split_audio_file_for_stt(path, filename=filename)

@@ -81,8 +81,22 @@ def _jobs_from(payload: object) -> list[dict[str, str]]:
             continue
         if item.get("as_file") in {True, "1", "true", "yes"}:
             job["as_file"] = "1"
+        sent = _sent_mark(item.get("sent"))
+        if sent is not None:
+            job["sent"] = sent
         jobs.append(job)
     return jobs
+
+
+def _sent_mark(value: object) -> str | None:
+    """Сколько кадров с начала пачки уже сдано. Ноль и мусор не пишем."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return str(value)
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return str(int(value))
+    return None
 
 
 def _safe_filename(name: str) -> str:

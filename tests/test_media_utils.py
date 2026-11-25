@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +14,9 @@ from app.media.media_utils import (
     audio_duration_seconds,
     communicate_with_timeout,
     extract_audio_from_video,
+    prepare_audio_file_for_stt,
     prepare_audio_for_stt,
+    split_audio_file_for_stt,
     split_audio_for_stt,
 )
 
@@ -74,6 +77,57 @@ async def test_split_short_audio_passthrough() -> None:
     raw = b"tiny-audio"
     parts = await split_audio_for_stt(raw, filename="a.mp3")
     assert parts == [(raw, "a.mp3")]
+
+
+@pytest.mark.asyncio
+async def test_long_file_is_split_from_disk_not_loaded_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "big.mp3"
+    src.write_bytes(b"0123456789")
+    seen: dict[str, object] = {}
+
+    async def fake_split(
+        path: Path, *, source_bytes: int, chunk_seconds: int
+    ) -> list[tuple[bytes, str]]:
+        seen["path"] = path
+        seen["source_bytes"] = source_bytes
+        seen["chunk_seconds"] = chunk_seconds
+        return [(b"aa", "chunk_001.mp3"), (b"bb", "chunk_002.mp3")]
+
+    monkeypatch.setattr(media_utils, "_MAX_CHUNK_BYTES", 4)
+    monkeypatch.setattr(media_utils, "_split_audio_path", fake_split)
+    parts = await split_audio_file_for_stt(src, filename="big.mp3")
+    assert seen["path"] == src
+    assert seen["source_bytes"] == 10
+    assert b"0123456789" not in {item for item, _name in parts}
+    assert parts == [(b"aa", "chunk_001.mp3"), (b"bb", "chunk_002.mp3")]
+
+
+@pytest.mark.asyncio
+async def test_prepare_video_file_extracts_without_reading_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"video-bytes-not-loaded")
+    extracted: list[Path] = []
+
+    async def fake_extract(path: Path, dst: Path) -> None:
+        extracted.append(path)
+        dst.write_bytes(b"mp3")
+
+    async def fake_split(
+        path: Path, *, filename: str, chunk_seconds: int = 600
+    ) -> list[tuple[bytes, str]]:
+        assert path.read_bytes() == b"mp3"
+        assert filename == "audio.mp3"
+        return [(b"mp3", filename)]
+
+    monkeypatch.setattr(media_utils, "_extract_audio_to", fake_extract)
+    monkeypatch.setattr(media_utils, "split_audio_file_for_stt", fake_split)
+    parts = await prepare_audio_file_for_stt(src, filename="clip.mp4", is_video=True)
+    assert extracted == [src]
+    assert parts == [(b"mp3", "audio.mp3")]
 
 
 @pytest.mark.asyncio

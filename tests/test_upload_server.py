@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import wave
 from dataclasses import dataclass
+from http.cookies import SimpleCookie
 from typing import Any
 
 import pytest
@@ -71,9 +73,11 @@ async def test_same_origin_file_upload_flow() -> None:
     store = UploadSessionStore(redis=None)
     storage = FakeStorage()
     completed: list[str] = []
+    verified: list[str | None] = []
 
     async def on_complete(session: Any) -> None:
         completed.append(session.upload_id)
+        verified.append(session.verified_mime)
 
     session = await store.create(chat_id=42, user_id=7, purpose="transcribe")
     app = web.Application(client_max_size=10 * 1024 * 1024)
@@ -98,9 +102,16 @@ async def test_same_origin_file_upload_flow() -> None:
         assert "FormData" in text
         assert "TOKEN" not in text
         assert session.token not in text
-        assert "upload_token" in client.session.cookie_jar.filter_cookies(
-            client.make_url("/")
+        jar = client.session.cookie_jar
+        assert "upload_token" in jar.filter_cookies(
+            client.make_url(f"/upload/{session.upload_id}")
         )
+        assert "upload_token" in jar.filter_cookies(
+            client.make_url(f"/api/uploads/{session.upload_id}/file")
+        )
+        assert "upload_token" not in jar.filter_cookies(client.make_url("/live"))
+        assert "upload_token" not in jar.filter_cookies(client.make_url("/ready"))
+        assert "upload_token" not in jar.filter_cookies(client.make_url("/health"))
 
         form = FormData()
         form.add_field(
@@ -138,6 +149,83 @@ async def test_same_origin_file_upload_flow() -> None:
                 break
             await asyncio.sleep(0.01)
         assert completed == [session.upload_id]
+        assert verified == ["audio/wav"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_cookie_paths_are_upload_only() -> None:
+    store = UploadSessionStore(redis=None)
+    session = await store.create(chat_id=1, user_id=1, purpose="transcribe")
+    app = web.Application()
+
+    async def on_complete(_session: Any) -> None:
+        return None
+
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=FakeStorage(),
+        on_complete=on_complete,
+    )
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.get(
+            f"/upload/{session.upload_id}?t={session.token}",
+            allow_redirects=False,
+        )
+        assert resp.status == 302
+        paths: list[str] = []
+        for header in resp.headers.getall("Set-Cookie"):
+            parsed: SimpleCookie[str] = SimpleCookie()
+            parsed.load(header)
+            paths.append(parsed["upload_token"]["path"])
+            assert parsed["upload_token"]["httponly"]
+        assert paths == ["/upload/", "/api/uploads/"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_id_must_be_hex_before_script() -> None:
+    store = UploadSessionStore(redis=None)
+    session = await store.create(chat_id=1, user_id=1, purpose="transcribe")
+    app = web.Application()
+
+    async def on_complete(_session: Any) -> None:
+        return None
+
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=FakeStorage(),
+        on_complete=on_complete,
+    )
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        page = await client.get(f"/upload/{session.upload_id}?t={session.token}")
+        assert page.status == 200
+        assert (
+            f"const UPLOAD_ID = {json.dumps(session.upload_id)};" in await page.text()
+        )
+
+        blocked = await client.get('/upload/";alert(1)//')
+        assert blocked.status == 404
+        body = await blocked.text()
+        assert "const UPLOAD_ID" not in body
+        assert "alert" not in body
+
+        upper = await client.get(f"/upload/{'A' * 32}")
+        assert upper.status == 404
+
+        api = await client.post("/api/uploads/not-a-uuid/file")
+        assert api.status == 404
+        assert await api.json() == {"error": "Сессия не найдена"}
     finally:
         await client.close()
 

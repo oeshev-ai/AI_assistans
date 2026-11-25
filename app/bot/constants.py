@@ -138,7 +138,10 @@ from app.storage.upload_sessions import (
 
 logger = structlog.get_logger("TelegramBot")
 
-STREAM_EDIT_INTERVAL = 0.5
+# editMessageText чаще одного раза в секунду на чат упирается в 429.
+STREAM_EDIT_INTERVAL = 1.2
+# Индикатор typing гаснет через 5 с — обновляем раньше.
+STREAM_TYPING_INTERVAL = 4.0
 PAGE_SIZE = 10
 WELCOME = (
     "Привет! Я AI-ассистент: отвечаю на вопросы, рисую, расшифровываю аудио, "
@@ -193,6 +196,7 @@ IMAGE_SIZES: tuple[str, ...] = (
 )
 _FLOW_KEYS = (
     "flow_name",
+    "flow_id",
     "flow_prompt",
     "flow_edit_id",
     "flow_text_model",

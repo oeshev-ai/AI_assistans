@@ -15,6 +15,7 @@ from app.llm.chat_runtime import (
     _attach_chat_tools,
     _gpt6_chat_omit_tools,
     _gpt6_chat_tools_need_reasoning_none,
+    _length_mark_suffix,
     _ToolCallBuilder,
 )
 from app.llm.tooling import BaseTool
@@ -99,6 +100,127 @@ def _stream_delta(
     }
 
 
+def test_tool_call_builder_keeps_parallel_calls_when_index_is_omitted() -> None:
+    """Повтор имени не склеивается; продолжение без index идёт в последний слот."""
+    builder = _ToolCallBuilder()
+    builder.add(
+        {
+            "index": 0,
+            "id": "call_a",
+            "function": {"name": "get_weather", "arguments": "{"},
+        }
+    )
+    builder.add(
+        {
+            "index": 1,
+            "id": "call_b",
+            "function": {"name": "get_time", "arguments": ""},
+        }
+    )
+    builder.add({"function": {"name": "get_time", "arguments": '{"tz":"UTC"}'}})
+    builder.add(
+        {
+            "index": 0,
+            "function": {"name": "get_weather", "arguments": '"city":"Омск"}'},
+        }
+    )
+    calls = builder.calls()
+    assert [call["id"] for call in calls] == ["call_a", "call_b"]
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert calls[0]["function"]["arguments"] == '{"city":"Омск"}'
+    assert calls[1]["function"]["name"] == "get_time"
+    assert calls[1]["function"]["arguments"] == '{"tz":"UTC"}'
+
+
+def test_length_mark_is_one_trailing_line() -> None:
+    assert _length_mark_suffix("Фраза обрывает") == "\n…ответ обрезан по лимиту длины"
+    assert _length_mark_suffix("Фраза обрывает\n") == "…ответ обрезан по лимиту длины"
+    assert _length_mark_suffix("уже\n…ответ обрезан по лимиту длины") == ""
+    assert _length_mark_suffix("") == "…ответ обрезан по лимиту длины"
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_marks_length_finish(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Обрезка по max_tokens дописывает одну строку и в чат, и в историю хода."""
+    respx_mock.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=_sse([_stream_delta({"content": "Фраза обрывает"}, "length")]),
+        )
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "продолжай"}]
+    deltas = [
+        delta async for delta in assist_client.stream_chat(messages, use_tools=False)
+    ]
+    text = "".join(delta.text for delta in deltas if delta.kind == "content")
+    assert text == "Фраза обрывает\n…ответ обрезан по лимиту длины"
+    assert messages[-1] == {"role": "assistant", "content": text}
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_stop_has_no_length_mark(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    respx_mock.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=_sse([_stream_delta({"content": "Целая фраза."}, "stop")]),
+        )
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "коротко"}]
+    deltas = [
+        delta async for delta in assist_client.stream_chat(messages, use_tools=False)
+    ]
+    text = "".join(delta.text for delta in deltas if delta.kind == "content")
+    assert text == "Целая фраза."
+    assert messages[-1]["content"] == "Целая фраза."
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_does_not_mark_length_on_a_tool_round(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Пометка только у финального ответа. Промежуточный tool-ход её не получает."""
+    assist_client.register_tool(_RecordingTool("get_weather_by_city"))
+    first = _sse(
+        [
+            _stream_delta({"content": "Сейчас узнаю. "}),
+            _stream_delta(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_len_1",
+                            "function": {
+                                "name": "get_weather_by_city",
+                                "arguments": '{"city_name": "Омск"}',
+                            },
+                        }
+                    ]
+                },
+                "length",
+            ),
+        ]
+    )
+    second = _sse([_stream_delta({"content": "В Омске ясно."}, "stop")])
+    respx_mock.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=first),
+            httpx.Response(200, text=second),
+        ]
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "погода"}]
+    deltas = [delta async for delta in assist_client.stream_chat(messages)]
+    text = "".join(delta.text for delta in deltas if delta.kind == "content")
+    assert text == "Сейчас узнаю. В Омске ясно."
+    assert messages[-1]["content"] == "В Омске ясно."
+
+
 def test_gpt6_tools_require_reasoning_none() -> None:
     """luna/sol/terra → reasoning_effort=none при tools; omit-список пуст."""
     assert _gpt6_chat_tools_need_reasoning_none("openai/gpt-6-luna")
@@ -159,6 +281,7 @@ async def test_stream_chat_gpt6_sol_sends_tools_with_none(
     assert body["model"] == "openai/gpt-6-sol"
     assert body.get("tools")
     assert body["reasoning_effort"] == "none"
+    assert body["stream_options"] == {"include_usage": True}
 
 
 @pytest.mark.asyncio
@@ -185,6 +308,7 @@ async def test_stream_chat_gpt6_luna_sends_reasoning_none(
     assert body["model"] == "openai/gpt-6-luna"
     assert body.get("tools")
     assert body["reasoning_effort"] == "none"
+    assert body["stream_options"] == {"include_usage": True}
 
 
 def test_tool_arguments_parsing_robustness() -> None:
@@ -273,14 +397,20 @@ async def test_stream_chat_tool_call_stitching(
     assist_client: AssistAIClient,
     respx_mock: MockRouter,
 ) -> None:
-    """Фрагменты delta.tool_calls склеиваются в get_weather_by_city до вызова инструмента."""
+    """Аргументы склеиваются, повтор имени не удваивается, нет index — прошлый слот."""
     fragments = [
-        {"index": 0, "id": "call_w_1", "function": {"name": "get_we"}},
         {
             "index": 0,
+            "id": "call_w_1",
             "function": {
-                "name": "ather_by_city",
-                "arguments": '{"city_name": "Москва"}',
+                "name": "get_weather_by_city",
+                "arguments": '{"city_na',
+            },
+        },
+        {
+            "function": {
+                "name": "get_weather_by_city",
+                "arguments": 'me": "Москва"}',
             },
         },
     ]
@@ -288,6 +418,7 @@ async def test_stream_chat_tool_call_stitching(
     for fragment in fragments:
         builder.add(fragment)
     assert builder.calls()[0]["function"]["name"] == "get_weather_by_city"
+    assert builder.calls()[0]["function"]["arguments"] == '{"city_name": "Москва"}'
 
     stub = _RecordingTool("get_weather_by_city")
     assist_client.register_tool(stub)
@@ -317,6 +448,9 @@ async def test_stream_chat_tool_call_stitching(
     deltas = [delta async for delta in assist_client.stream_chat(messages)]
 
     assert route.call_count == 2
+    for call in route.calls:
+        body = json.loads(call.request.content)
+        assert body["stream_options"] == {"include_usage": True}
     assert stub.calls == [{"city_name": "Москва"}]
     tool_deltas = [delta for delta in deltas if delta.kind == "tool"]
     assert tool_deltas
@@ -327,6 +461,62 @@ async def test_stream_chat_tool_call_stitching(
     )
     tool_message = next(item for item in messages if item.get("tool_calls"))
     assert tool_message["tool_calls"][0]["function"]["name"] == "get_weather_by_city"
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_emits_tool_delta_before_execute(
+    assist_client: AssistAIClient,
+    respx_mock: MockRouter,
+) -> None:
+    """Статус чата должен успеть обновиться до долгого generate_image / видео."""
+
+    class _MarkTool(_RecordingTool):
+        def __init__(self) -> None:
+            super().__init__("get_weather_by_city")
+            self.ran = False
+
+        async def execute(self, **kwargs: Any) -> str:
+            self.ran = True
+            return await super().execute(**kwargs)
+
+    tool = _MarkTool()
+    assist_client.register_tool(tool)
+    stream = _sse(
+        [
+            _stream_delta(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_w_1",
+                            "function": {
+                                "name": "get_weather_by_city",
+                                "arguments": '{"city_name": "Москва"}',
+                            },
+                        }
+                    ]
+                },
+                "tool_calls",
+            )
+        ]
+    )
+    followup = _sse([_stream_delta({"content": "ясно"}, "stop")])
+    respx_mock.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=stream),
+            httpx.Response(200, text=followup),
+        ]
+    )
+    seen_before_run = False
+    async for delta in assist_client.stream_chat(
+        [{"role": "user", "content": "погода"}]
+    ):
+        if delta.kind == "tool":
+            seen_before_run = not tool.ran
+            assert delta.text.startswith("get_weather_by_city")
+    assert seen_before_run is True
+    assert tool.ran is True
+    assert tool.calls == [{"city_name": "Москва"}]
 
 
 @pytest.mark.asyncio

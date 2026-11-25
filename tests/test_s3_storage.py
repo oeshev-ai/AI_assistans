@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -101,3 +102,52 @@ async def test_delete_swallows_s3_error_only() -> None:
     broken = _storage(_Boom(RuntimeError("bug")))
     with pytest.raises(RuntimeError):
         await broken.delete_object("uploads/a")
+
+
+class _Body:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._offset = 0
+        self.closed = False
+
+    def read(self, size: int) -> bytes:
+        if self._offset >= len(self._payload):
+            return b""
+        part = self._payload[self._offset : self._offset + size]
+        self._offset += len(part)
+        return part
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Get:
+    def __init__(self, payload: bytes, *, content_length: int | None = None) -> None:
+        self.body = _Body(payload)
+        self._length = len(payload) if content_length is None else content_length
+
+    def get_object(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"ContentLength": self._length, "Body": self.body}
+
+
+@pytest.mark.asyncio
+async def test_download_file_streams_without_joining(tmp_path: Path) -> None:
+    payload = b"abcdefghij"
+    client = _Get(payload)
+    storage = _storage(client)
+    destination = tmp_path / "object.bin"
+    await storage.download_file("uploads/a", destination, max_bytes=100)
+    assert destination.read_bytes() == payload
+    assert client.body.closed
+
+
+@pytest.mark.asyncio
+async def test_download_file_over_limit_removes_partial(tmp_path: Path) -> None:
+    client = _Get(b"abcdefghij", content_length=0)
+    storage = _storage(client)
+    destination = tmp_path / "object.bin"
+    destination.write_bytes(b"partial")
+    with pytest.raises(S3StorageError):
+        await storage.download_file("uploads/a", destination, max_bytes=4)
+    assert not destination.exists()
+    assert client.body.closed

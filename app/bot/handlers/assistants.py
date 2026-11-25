@@ -34,6 +34,7 @@ from app.bot.states import (
     EditAssistantSG,
     NewAssistantSG,
 )
+from app.infra.security import MAX_MESSAGE_LENGTH
 
 
 async def on_menu_assistants(
@@ -195,7 +196,8 @@ async def on_asst_edit_ask(
         query,
         f"Промпт ассистента «{persona_label(profile.name, profile.icon)}»:\n\n"
         f"{profile.system_prompt}\n\n"
-        "Пришлите новый промпт (≥10 символов). /cancel — отмена.",
+        f"Пришлите новый промпт (10–{MAX_MESSAGE_LENGTH} символов). "
+        "/cancel — отмена.",
     )
 
 
@@ -206,9 +208,15 @@ async def sg_edit_prompt(
     assistant_storage: AssistantStorage,
 ) -> None:
     """Сохраняет новый системный промпт выбранной персоны."""
-    prompt = message.text or ""
+    prompt = (message.text or "").strip()
     if len(prompt) < 10:
         await message.answer("Промпт минимум 10 символов. /cancel — отмена.")
+        return
+    if len(prompt) > MAX_MESSAGE_LENGTH:
+        await message.answer(
+            f"Промпт слишком длинный. Максимум {MAX_MESSAGE_LENGTH} символов. "
+            "/cancel — отмена."
+        )
         return
     data = await state.get_data()
     profile_id = data.get("id")
@@ -432,7 +440,7 @@ async def on_asst_new_commit(
     topic_storage: TopicHistoryStorage,
     state: FSMContext,
 ) -> None:
-    """Сохраняет персону из шагов мастера и делает её активной."""
+    """Сохраняет персону и делает её активной. Повтор «Готово» пишет тот же id."""
     message = R._query_message(query)
     if message is None:
         await query.answer()
@@ -460,12 +468,18 @@ async def on_asst_new_commit(
             "text_model": M._optional_model(data.get("flow_text_model")),
             "image_model": M._optional_model(data.get("flow_image_model")),
         }
+        draft_id = data.get("flow_id")
+        if isinstance(draft_id, str) and 1 <= len(draft_id.strip()) <= 32:
+            fields["id"] = draft_id.strip()
         profile = AssistantProfile.model_validate(fields)
     except ValidationError:
         await query.answer("Имя 1–50, промпт ≥ 10", show_alert=True)
         await state.set_state(NewAssistantSG.name)
         await message.answer("Введите имя персоны (1–50 символов).\n/cancel — отмена")
         return
+    # До записи: иначе сбой активации оставит персону без id в FSM,
+    # и следующее «Готово» создаст вторую.
+    await state.update_data(flow_id=profile.id)
     chat_id = message.chat.id
     try:
         await assistant_storage.save_assistant(chat_id, profile)
@@ -496,7 +510,7 @@ async def on_asst_icon_menu(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Открывает выбор иконки активной персоны отдельным сообщением."""
+    """Открывает выбор иконки и запоминает id персоны, как правка имени."""
     message = R._query_message(query)
     if message is None:
         await query.answer()
@@ -506,7 +520,7 @@ async def on_asst_icon_menu(
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
-    await state.update_data({_SCREEN_SETTINGS: message.message_id})
+    await state.update_data({_SCREEN_SETTINGS: message.message_id, "id": profile.id})
     label = persona_label(profile.name, profile.icon)
     await query.answer()
     sent = await message.answer(
@@ -522,7 +536,7 @@ async def on_set_persona_icon(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Сохраняет иконку активной персоны и возвращает к настройкам."""
+    """Сохраняет иконку персоны, для которой открыли пикер."""
     message = R._query_message(query)
     if message is None:
         await query.answer()
@@ -533,8 +547,17 @@ async def on_set_persona_icon(
     except (ValueError, IndexError):
         await query.answer("Неизвестная иконка", show_alert=True)
         return
+    data = await state.get_data()
+    profile_id = data.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        await query.answer("Ассистент не найден", show_alert=True)
+        return
     try:
-        profile = await R._active_profile(message.chat.id, assistant_storage)
+        profiles = await assistant_storage.list_assistants(message.chat.id)
+        profile = next((item for item in profiles if item.id == profile_id), None)
+        if profile is None:
+            await query.answer("Ассистент не найден", show_alert=True)
+            return
         updated = profile.model_copy(update={"icon": icon})
         await assistant_storage.save_assistant(message.chat.id, updated)
     except AssistantStorageError as exc:

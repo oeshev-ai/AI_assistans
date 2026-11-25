@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.storage.upload_sessions import (
     UploadRequestContext,
+    UploadSession,
     UploadSessionStore,
     get_upload_request_context,
     object_key_for,
@@ -33,6 +36,24 @@ async def test_object_key_prefix() -> None:
     assert key.startswith(f"uploads/{session.upload_id}/")
     assert key.endswith(".mp4")
     assert " " not in key
+
+
+def test_old_session_json_without_verified_mime_loads() -> None:
+    store_payload = {
+        "upload_id": "abc",
+        "token": "tok",
+        "chat_id": 1,
+        "user_id": 2,
+        "purpose": "transcribe",
+        "media_kind": "audio",
+        "status": "uploaded",
+        "created_at": 1.0,
+        "expires_at": 9_999_999_999.0,
+        "mime_type": "audio/mpeg",
+    }
+    session = UploadSession.from_json(json.dumps(store_payload))
+    assert session.verified_mime is None
+    assert session.mime_type == "audio/mpeg"
 
 
 def test_upload_request_context() -> None:

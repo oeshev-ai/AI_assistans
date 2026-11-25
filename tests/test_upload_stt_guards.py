@@ -8,8 +8,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.methods import SendMessage
 
 import app.bot.runtime as runtime
+from app.bot.constants import MSG_UPLOAD_PROCESS_FAILED
 from app.infra import cost_tracker as cost_tracker_mod
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker
 from app.infra.rate_limiter import rate_limiter
@@ -49,7 +52,7 @@ async def test_upload_process_respects_media_rate_limit(
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
-        download_bytes=AsyncMock(),
+        download_file=AsyncMock(),
         delete_object=AsyncMock(),
     )
     monkeypatch.setattr(
@@ -72,7 +75,7 @@ async def test_upload_process_respects_media_rate_limit(
     assert session.status == "failed"
     assert session.error == "rate_limited"
     check_budget.assert_not_called()
-    storage.download_bytes.assert_not_called()
+    storage.download_file.assert_not_called()
     storage.delete_object.assert_awaited_once_with("uploads/u1.bin")
     bot.send_message.assert_awaited()
 
@@ -101,7 +104,7 @@ async def test_upload_process_respects_budget(
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
-        download_bytes=AsyncMock(),
+        download_file=AsyncMock(),
         delete_object=AsyncMock(),
     )
     monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
@@ -123,7 +126,7 @@ async def test_upload_process_respects_budget(
 
     assert session.status == "failed"
     assert session.error == "budget_exceeded"
-    storage.download_bytes.assert_not_called()
+    storage.download_file.assert_not_called()
     storage.delete_object.assert_awaited_once()
 
 
@@ -154,12 +157,15 @@ async def test_upload_process_releases_unused_budget_hold(
     assert runtime._upload_stt_floor_cost() > actual
 
     bot: Any = SimpleNamespace(
-        send_message=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock()))
+        send_message=AsyncMock(
+            return_value=SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+        ),
+        send_chat_action=AsyncMock(),
     )
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
-        download_bytes=AsyncMock(return_value=b"audio"),
+        download_file=AsyncMock(return_value=b"audio"),
         delete_object=AsyncMock(),
     )
     monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
@@ -168,7 +174,7 @@ async def test_upload_process_releases_unused_budget_hold(
     )
     monkeypatch.setattr(
         runtime,
-        "prepare_audio_for_stt",
+        "prepare_audio_file_for_stt",
         AsyncMock(return_value=[(b"audio", "a.mp3")]),
     )
     monkeypatch.setattr(
@@ -238,6 +244,70 @@ def _uploaded_session(*, file_size: int, user_id: int) -> UploadSession:
 
 
 @pytest.mark.asyncio
+async def test_verified_mime_skips_second_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime._upload_process_sem = asyncio.Semaphore(2)
+    user_id = 717171
+    session = _uploaded_session(file_size=1200, user_id=user_id)
+    session.verified_mime = session.mime_type
+    probe = AsyncMock(return_value=True)
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(
+            return_value=SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+        ),
+        send_chat_action=AsyncMock(),
+    )
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
+        config=SimpleNamespace(max_upload_mb=512),
+        download_file=AsyncMock(),
+        delete_object=AsyncMock(),
+    )
+    monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "release_reservation", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "record", AsyncMock())
+    monkeypatch.setattr("app.media.file_magic.mime_compatible", probe)
+    monkeypatch.setattr(
+        runtime,
+        "prepare_audio_file_for_stt",
+        AsyncMock(return_value=[(b"mp3", "audio.mp3")]),
+    )
+    monkeypatch.setattr(
+        "app.media.media_utils.audio_duration_seconds",
+        AsyncMock(return_value=10.0),
+    )
+    monkeypatch.setattr(
+        runtime.job_queue,
+        "transcribe_audio",
+        AsyncMock(
+            return_value=TranscriptionResult(
+                text="",
+                cost_usd=0.01,
+                cost_rub=0.8,
+                cost_source="cost_rub",
+                provider_id="proxyapi",
+                model="whisper-1",
+            )
+        ),
+    )
+    monkeypatch.setattr(runtime, "_delete_chat_messages", AsyncMock())
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=MagicMock(append_messages=AsyncMock(), max_length=10),
+        assistant_storage=MagicMock(),
+        store=store,
+        storage=storage,
+        session=session,
+    )
+    probe.assert_not_called()
+    runtime.prepare_audio_file_for_stt.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_large_video_passes_budget_until_real_duration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -246,12 +316,15 @@ async def test_large_video_passes_budget_until_real_duration(
     user_id = 515151
     session = _uploaded_session(file_size=300 * 1024 * 1024, user_id=user_id)
     bot: Any = SimpleNamespace(
-        send_message=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock()))
+        send_message=AsyncMock(
+            return_value=SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+        ),
+        send_chat_action=AsyncMock(),
     )
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=512),
-        download_bytes=AsyncMock(return_value=b"video"),
+        download_file=AsyncMock(return_value=b"video"),
         delete_object=AsyncMock(),
     )
     transcribe = AsyncMock(
@@ -270,7 +343,7 @@ async def test_large_video_passes_budget_until_real_duration(
     )
     monkeypatch.setattr(
         runtime,
-        "prepare_audio_for_stt",
+        "prepare_audio_file_for_stt",
         AsyncMock(return_value=[(b"mp3", "audio.mp3")]),
     )
     monkeypatch.setattr(
@@ -293,7 +366,7 @@ async def test_large_video_passes_budget_until_real_duration(
             session=session,
         )
         assert session.status == "done"
-        storage.download_bytes.assert_awaited()
+        storage.download_file.assert_awaited()
         transcribe.assert_awaited()
         assert cost_tracker_mod._reserved_amount() == pytest.approx(0.0)
     finally:
@@ -308,11 +381,14 @@ async def test_long_audio_rejected_after_extract_before_stt(
     runtime._upload_process_sem = asyncio.Semaphore(2)
     user_id = 616161
     session = _uploaded_session(file_size=300 * 1024 * 1024, user_id=user_id)
-    bot: Any = SimpleNamespace(send_message=AsyncMock())
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(),
+        send_chat_action=AsyncMock(),
+    )
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=512),
-        download_bytes=AsyncMock(return_value=b"video"),
+        download_file=AsyncMock(return_value=b"video"),
         delete_object=AsyncMock(),
     )
     transcribe = AsyncMock()
@@ -322,7 +398,7 @@ async def test_long_audio_rejected_after_extract_before_stt(
     )
     monkeypatch.setattr(
         runtime,
-        "prepare_audio_for_stt",
+        "prepare_audio_file_for_stt",
         AsyncMock(return_value=[(b"mp3", "audio.mp3")]),
     )
     monkeypatch.setattr(
@@ -355,7 +431,7 @@ async def test_long_audio_rejected_after_extract_before_stt(
         )
         assert session.status == "failed"
         assert session.error == "budget_exceeded"
-        storage.download_bytes.assert_awaited()
+        storage.download_file.assert_awaited()
         transcribe.assert_not_called()
         assert cost_tracker_mod._reserved_amount() == pytest.approx(0.0)
     finally:
@@ -371,12 +447,15 @@ async def test_upload_status_deleted_when_processing_fails(
 ) -> None:
     runtime._upload_process_sem = asyncio.Semaphore(2)
     session = _uploaded_session(file_size=12_000, user_id=7)
-    status = SimpleNamespace(delete=AsyncMock())
-    bot: Any = SimpleNamespace(send_message=AsyncMock(return_value=status))
+    status = SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(return_value=status),
+        send_chat_action=AsyncMock(),
+    )
     store: Any = SimpleNamespace(update=AsyncMock())
     storage: Any = SimpleNamespace(
         config=SimpleNamespace(max_upload_mb=64),
-        download_bytes=AsyncMock(side_effect=AssistAIError("s3 down")),
+        download_file=AsyncMock(side_effect=AssistAIError("s3 down")),
         delete_object=AsyncMock(),
     )
     monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
@@ -395,3 +474,224 @@ async def test_upload_status_deleted_when_processing_fails(
 
     assert session.status == "failed"
     status.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_progress_names_each_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime._upload_process_sem = asyncio.Semaphore(2)
+    session = _uploaded_session(file_size=1200, user_id=818181)
+    session.media_kind = "audio"
+    session.filename = "talk.mp3"
+    session.mime_type = "audio/mpeg"
+    session.verified_mime = session.mime_type
+    status = SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(return_value=status),
+        send_chat_action=AsyncMock(),
+    )
+
+    async def _download(*_args: object, **_kwargs: object) -> None:
+        await asyncio.sleep(0)
+
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
+        config=SimpleNamespace(max_upload_mb=512),
+        download_file=AsyncMock(side_effect=_download),
+        delete_object=AsyncMock(),
+    )
+    monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "release_reservation", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "record", AsyncMock())
+    monkeypatch.setattr(
+        runtime,
+        "prepare_audio_file_for_stt",
+        AsyncMock(return_value=[(b"mp3", f"part{i}.mp3") for i in range(5)]),
+    )
+    monkeypatch.setattr(
+        "app.media.media_utils.audio_duration_seconds",
+        AsyncMock(return_value=10.0),
+    )
+    monkeypatch.setattr(
+        runtime.job_queue,
+        "transcribe_audio",
+        AsyncMock(
+            return_value=TranscriptionResult(
+                text="",
+                cost_usd=0.01,
+                cost_rub=0.8,
+                cost_source="cost_rub",
+                provider_id="proxyapi",
+                model="whisper-1",
+            )
+        ),
+    )
+    monkeypatch.setattr(runtime, "_delete_chat_messages", AsyncMock())
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=MagicMock(),
+        assistant_storage=MagicMock(),
+        store=store,
+        storage=storage,
+        session=session,
+    )
+
+    opened = bot.send_message.await_args_list[0].args[1]
+    assert "Скачиваю" in opened
+    edited = [call.args[0] for call in status.edit_text.await_args_list]
+    assert any("Готовлю аудио" in text for text in edited)
+    assert "Файл «talk.mp3» получен. Часть 2 из 5…" in edited
+    assert "Файл «talk.mp3» получен. Часть 5 из 5…" in edited
+    bot.send_chat_action.assert_awaited()
+
+
+def _telegram_down(chat_id: int = 10) -> TelegramNetworkError:
+    return TelegramNetworkError(
+        method=SendMessage(chat_id=chat_id, text="x"),
+        message="Server disconnected",
+    )
+
+
+def _patch_paid_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    text: str,
+    keep: bool,
+) -> tuple[UploadSession, Any, SimpleNamespace]:
+    """Сессия доходит до отправки transcript.txt. keep — ответ бакета доставки."""
+    runtime._upload_process_sem = asyncio.Semaphore(2)
+    session = _uploaded_session(file_size=1200, user_id=919191)
+    session.media_kind = "audio"
+    session.filename = "talk.mp3"
+    session.mime_type = "audio/mpeg"
+    session.verified_mime = session.mime_type
+    topic = SimpleNamespace(
+        ensure_active=AsyncMock(return_value="topic"),
+        append_messages=AsyncMock(),
+        max_length=20,
+    )
+    status = SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(return_value=status),
+        send_document=AsyncMock(side_effect=_telegram_down()),
+        send_chat_action=AsyncMock(),
+        delete_message=AsyncMock(),
+    )
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
+        config=SimpleNamespace(max_upload_mb=512),
+        download_file=AsyncMock(),
+        delete_object=AsyncMock(),
+    )
+    monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "release_reservation", AsyncMock())
+    monkeypatch.setattr(cost_tracker, "record", AsyncMock())
+    monkeypatch.setattr(
+        runtime,
+        "prepare_audio_file_for_stt",
+        AsyncMock(return_value=[(b"mp3", "talk.mp3")]),
+    )
+    monkeypatch.setattr(
+        "app.media.media_utils.audio_duration_seconds",
+        AsyncMock(return_value=10.0),
+    )
+    monkeypatch.setattr(
+        runtime.job_queue,
+        "transcribe_audio",
+        AsyncMock(
+            return_value=TranscriptionResult(
+                text=text,
+                cost_usd=0.01,
+                cost_rub=0.8,
+                cost_source="cost_rub",
+                provider_id="proxyapi",
+                model="whisper-1",
+            )
+        ),
+    )
+    monkeypatch.setattr(runtime, "_delete_chat_messages", AsyncMock())
+    monkeypatch.setattr(
+        "app.bot.file_retry.keep_paid_bytes", AsyncMock(return_value=keep)
+    )
+    assistant_storage = SimpleNamespace(
+        get_active_assistant=AsyncMock(return_value=SimpleNamespace(id="asst"))
+    )
+    return (
+        session,
+        bot,
+        SimpleNamespace(
+            topic=topic,
+            store=store,
+            storage=storage,
+            assistant_storage=assistant_storage,
+            status=status,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unkept_transcript_reaches_chat_and_session_stays_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "оплаченный текст"
+    session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=parts.topic,
+        assistant_storage=parts.assistant_storage,
+        store=parts.store,
+        storage=parts.storage,
+        session=session,
+    )
+
+    sent = [call.args[1] for call in bot.send_message.await_args_list]
+    assert text in sent
+    assert runtime._PAID_TRANSCRIPT_INTRO in sent
+    assert MSG_UPLOAD_PROCESS_FAILED not in sent
+    assert session.status == "done"
+    assert session.error is None
+    stored = parts.topic.append_messages.await_args.args[3][1]["content"]
+    assert "отправлена текстом" in stored
+    assert text not in stored
+
+
+@pytest.mark.asyncio
+async def test_unkept_transcript_stays_in_history_when_chat_rejects_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "оплаченный текст, который чат не принял"
+    session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
+    opened = {"done": False}
+
+    async def _send_message(_chat_id: int, payload: str) -> object:
+        if not opened["done"]:
+            opened["done"] = True
+            return parts.status
+        raise _telegram_down()
+
+    bot.send_message = AsyncMock(side_effect=_send_message)
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=parts.topic,
+        assistant_storage=parts.assistant_storage,
+        store=parts.store,
+        storage=parts.storage,
+        session=session,
+    )
+
+    assert session.status == "done"
+    assert session.error is None
+    stored = parts.topic.append_messages.await_args.args[3][1]["content"]
+    assert text in stored
+    assert MSG_UPLOAD_PROCESS_FAILED not in {
+        call.args[1] for call in bot.send_message.await_args_list if len(call.args) > 1
+    }

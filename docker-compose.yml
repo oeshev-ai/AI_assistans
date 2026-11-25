@@ -112,7 +112,7 @@ services:
       HEALTH_BIND: "0.0.0.0"
       # nginx завершает TLS и передаёт X-Forwarded-Proto
       TRUST_PROXY: "1"
-    # Два upload по 512 МБ держатся в памяти. cgroup режет контейнер, не VPS.
+    # Два upload по 512 МБ: объект на диске, в RAM только куски STT. cgroup режет контейнер, не VPS.
     mem_limit: 1536m
     memswap_limit: 1536m
     healthcheck:

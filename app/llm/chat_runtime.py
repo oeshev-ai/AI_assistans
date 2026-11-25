@@ -137,6 +137,70 @@ def _swap_max_tokens_to_completion(payload: dict[str, Any]) -> int | None:
     return int(value)
 
 
+def _needs_stream_options_retry(exc: AssistAIError) -> bool:
+    """True если провайдер отклонил ``stream_options`` или ``include_usage``."""
+    if exc.status_code not in (400, None):
+        return False
+    text = (exc.message or "").casefold()
+    return "stream_options" in text or "include_usage" in text
+
+
+def _adapt_rejected_stream_payload(
+    exc: AssistAIError,
+    payload: dict[str, Any],
+    *,
+    allow_drop_stream_options: bool,
+    allow_remap_max_tokens: bool,
+) -> tuple[bool, bool] | None:
+    """Снимает поля, из-за которых стрим ответил 400.
+
+    Возвращает ``(dropped_stream_options, remapped_max_tokens)``
+    или ``None``, если повторять запрос нечем.
+    """
+    dropped = False
+    remapped = False
+    if (
+        allow_drop_stream_options
+        and "stream_options" in payload
+        and _needs_stream_options_retry(exc)
+    ):
+        payload.pop("stream_options", None)
+        dropped = True
+    if (
+        allow_remap_max_tokens
+        and "max_tokens" in payload
+        and _needs_max_completion_tokens_retry(exc)
+    ):
+        _swap_max_tokens_to_completion(payload)
+        remapped = True
+    if not dropped and not remapped:
+        return None
+    return dropped, remapped
+
+
+_LENGTH_MARK = "…ответ обрезан по лимиту длины"
+
+
+def _length_mark_suffix(text: str) -> str:
+    """Хвост к финальному ответу, если провайдер остановился по ``length``.
+
+    Пустая строка — пометка уже стоит. Иначе одна строка в конце хода.
+    """
+    if text.rstrip().endswith(_LENGTH_MARK):
+        return ""
+    if text.endswith("\n") or not text.strip():
+        return _LENGTH_MARK
+    return f"\n{_LENGTH_MARK}"
+
+
+def _tool_delta_text(call: dict[str, Any]) -> str:
+    """Имя инструмента и короткий preview аргументов для ``ChatDelta``."""
+    name = str(call["function"]["name"])
+    arguments = str(call["function"].get("arguments") or "")
+    preview = arguments if len(arguments) <= 120 else arguments[:117] + "..."
+    return f"{name} {preview}".rstrip()
+
+
 def _assistant_stream_tool_message(
     reasoning: str,
     content: str,
@@ -159,25 +223,19 @@ def _assistant_stream_tool_message(
 
 
 class _ToolCallBuilder:
-    """Склеивает ``delta.tool_calls``, которые в потоке приходят по кускам."""
+    """Склеивает ``delta.tool_calls``, которые в потоке приходят по кускам.
+
+    Имя пишется один раз: шлюз часто повторяет его в каждом дельте.
+    Продолжение без ``index`` относится к последнему открытому слоту,
+    а не к нулевому — иначе параллельные вызовы склеиваются.
+    """
 
     def __init__(self) -> None:
         self._calls: dict[int, dict[str, Any]] = {}
+        self._opened: list[int] = []
 
     def add(self, delta_call: dict[str, Any]) -> None:
-        raw_index = delta_call.get("index", 0)
-        try:
-            index = int(raw_index)
-        except (TypeError, ValueError):
-            index = 0
-        slot = self._calls.setdefault(
-            index,
-            {
-                "id": "",
-                "type": "function",
-                "function": {"name": "", "arguments": ""},
-            },
-        )
+        slot = self._open(self._index_of(delta_call))
         call_id = delta_call.get("id")
         if isinstance(call_id, str) and call_id:
             slot["id"] = call_id
@@ -188,14 +246,35 @@ class _ToolCallBuilder:
         if not isinstance(function, dict):
             return
         name = function.get("name")
-        if isinstance(name, str) and name:
-            slot["function"]["name"] += name
+        if isinstance(name, str) and name and not slot["function"]["name"]:
+            slot["function"]["name"] = name
         arguments = function.get("arguments")
         if isinstance(arguments, str) and arguments:
             slot["function"]["arguments"] += arguments
 
     def calls(self) -> list[dict[str, Any]]:
         return [self._calls[index] for index in sorted(self._calls)]
+
+    def _index_of(self, delta_call: dict[str, Any]) -> int:
+        if "index" not in delta_call or delta_call.get("index") is None:
+            return self._opened[-1] if self._opened else 0
+        try:
+            return int(delta_call["index"])
+        except (TypeError, ValueError):
+            return self._opened[-1] if self._opened else 0
+
+    def _open(self, index: int) -> dict[str, Any]:
+        slot = self._calls.get(index)
+        if slot is not None:
+            return slot
+        slot = {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        }
+        self._calls[index] = slot
+        self._opened.append(index)
+        return slot
 
 
 ChatDeltaKind = Literal["content", "tool"]
@@ -206,7 +285,8 @@ class ChatDelta:
     """Фрагмент потокового ответа ``stream_chat``.
 
     ``content`` — кусок итогового текста.
-    ``tool`` — инструмент уже выполнен, в ``text`` его имя и аргументы.
+    ``tool`` — инструмент сейчас вызывается; в ``text`` имя и аргументы.
+    Чат успевает показать статус, пока вызов ещё идёт.
     Рассуждения модели в чат не отдаются.
     """
 
@@ -485,12 +565,17 @@ class ChatRuntimeMixin(ProviderTransportMixin):
     ) -> AsyncIterator[ChatDelta]:
         """Потоковый диалог с теми же инструментами, что и ``chat_completion``.
 
-        В запрос добавляется ``stream: true``. Наружу выходят только текст
-        ответа и отметки об инструментах. Куски рассуждения в поток и в
-        финальное сообщение ассистента не попадают.
+        В запрос добавляется ``stream: true`` и
+        ``stream_options: {"include_usage": true}``: без флага OpenAI-совместимый
+        API не кладёт usage в последний чанк, и раунд считается эвристикой.
+        Если провайдер отвечает 400 на ``stream_options``, поле снимается
+        и запрос повторяется. Наружу выходят только текст ответа и отметки
+        об инструментах. Куски рассуждения в поток и в финальное сообщение
+        ассистента не попадают.
 
-        Вызовы инструментов собираются из ``delta.tool_calls`` и выполняются
-        после закрытия потока. Для DeepSeek рассуждение сохраняется только
+        Вызовы инструментов собираются из ``delta.tool_calls``. Отметка
+        ``tool`` уходит до выполнения, чтобы чат показал статус, пока
+        инструмент работает. Для DeepSeek рассуждение сохраняется только
         во внутренних tool-кругах как ``reasoning_content``: без него
         следующий запрос с tools отвечает 400.
 
@@ -524,6 +609,9 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 "model": selected_model,
                 "messages": messages,
                 "stream": True,
+                # ProxyAPI/OpenAI отдают usage в стриме только с этим флагом.
+                # Polza часто шлёт его и без флага; отказ 400 снимает поле.
+                "stream_options": {"include_usage": True},
             }
             if use_tools:
                 _attach_chat_tools(payload, tools, selected_model)
@@ -547,7 +635,9 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             content_parts: list[str] = []
             tool_builder = _ToolCallBuilder()
             finish_reason = ""
+            dropped_stream_options = False
             remapped_max_tokens = False
+            saw_chunk = False
             last_usage: dict[str, Any] | None = None
             billed_model: str | None = None
 
@@ -558,6 +648,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                         catalog_model=catalog_model,
                         stick_to=active_provider,
                     ):
+                        saw_chunk = True
                         raw_usage = chunk.get("usage")
                         if isinstance(raw_usage, dict):
                             last_usage = raw_usage
@@ -593,26 +684,39 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                                     tool_builder.add(call)
                     break
                 except AssistAIError as exc:
-                    if (
-                        remapped_max_tokens
-                        or "max_tokens" not in payload
-                        or not _needs_max_completion_tokens_retry(exc)
-                    ):
+                    # Куски уже ушли в чат: повтор продублирует текст.
+                    if saw_chunk:
                         raise
-                    remapped_max_tokens = True
-                    swapped = _swap_max_tokens_to_completion(payload)
-                    logger.info(
-                        "chat_max_tokens_remapped",
-                        model=selected_model,
-                        max_completion_tokens=swapped,
-                        stream=True,
+                    adapted = _adapt_rejected_stream_payload(
+                        exc,
+                        payload,
+                        allow_drop_stream_options=not dropped_stream_options,
+                        allow_remap_max_tokens=not remapped_max_tokens,
                     )
+                    if adapted is None:
+                        raise
+                    dropped_now, remapped_now = adapted
+                    if dropped_now:
+                        dropped_stream_options = True
+                        logger.info(
+                            "chat_stream_options_dropped",
+                            model=selected_model,
+                        )
+                    if remapped_now:
+                        remapped_max_tokens = True
+                        logger.info(
+                            "chat_max_tokens_remapped",
+                            model=selected_model,
+                            max_completion_tokens=payload.get("max_completion_tokens"),
+                            stream=True,
+                        )
                     reasoning_parts.clear()
                     content_parts.clear()
                     tool_builder = _ToolCallBuilder()
                     finish_reason = ""
                     last_usage = None
                     billed_model = None
+                    saw_chunk = False
 
             tool_calls = [
                 self._tools.normalize_tool_call(call) for call in tool_builder.calls()
@@ -648,16 +752,14 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                     model=billed_model or selected_model,
                     provider=active_provider,
                 )
+                # До await: потребитель успевает сменить «Готовлю ответ…»,
+                # пока generate_image / generate_video ещё не стартовали.
+                for call in tool_calls:
+                    yield ChatDelta("tool", _tool_delta_text(call))
                 results = await asyncio.gather(
                     *(_execute_tool_isolated(self._tools, call) for call in tool_calls)
                 )
                 for call, result in zip(tool_calls, results, strict=True):
-                    name = str(call["function"]["name"])
-                    arguments = str(call["function"]["arguments"])
-                    preview = (
-                        arguments if len(arguments) <= 120 else arguments[:117] + "..."
-                    )
-                    yield ChatDelta("tool", f"{name} {preview}".rstrip())
                     messages.append(
                         {
                             "role": "tool",
@@ -684,6 +786,12 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 model=billed_model or selected_model,
                 provider=active_provider,
             )
+            if finish_reason == "length":
+                suffix = _length_mark_suffix(content_text)
+                if suffix:
+                    content_text += suffix
+                    messages[-1]["content"] = content_text
+                    yield ChatDelta("content", suffix)
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,

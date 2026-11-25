@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import secrets
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -25,6 +28,9 @@ logger = structlog.get_logger("upload_server")
 UploadCompleteHandler = Callable[[UploadSession], Awaitable[None]]
 
 _COOKIE_NAME = "upload_token"
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# Страница и API. path="/" уносил бы токен на /live и /ready того же порта.
+_COOKIE_PATHS = ("/upload/", "/api/uploads/")
 UPLOAD_TASKS_KEY: web.AppKey[set[asyncio.Task[Any]]] = web.AppKey(
     "upload_tasks", set[asyncio.Task[Any]]
 )
@@ -212,15 +218,33 @@ def _set_upload_cookie(
     max_age: int,
     secure: bool,
 ) -> None:
-    response.set_cookie(
-        _COOKIE_NAME,
-        token,
-        max_age=max(60, max_age),
-        httponly=True,
-        samesite="Lax",
-        secure=secure,
-        path="/",
-    )
+    """Два Set-Cookie с одним именем: SimpleCookie хранит только один path."""
+    age = str(max(60, max_age))
+    for path in _COOKIE_PATHS:
+        baked = SimpleCookie()
+        baked[_COOKIE_NAME] = token
+        morsel = baked[_COOKIE_NAME]
+        morsel["max-age"] = age
+        morsel["httponly"] = True
+        morsel["samesite"] = "Lax"
+        morsel["path"] = path
+        if secure:
+            morsel["secure"] = True
+        response.headers.add("Set-Cookie", morsel.OutputString())
+
+
+def _bad_upload_id(upload_id: str, *, page: bool) -> web.Response | None:
+    """None — id годится. Иначе 404 до стора и до HTML."""
+    if _UPLOAD_ID_RE.fullmatch(upload_id):
+        return None
+    if page:
+        return web.Response(
+            text="Ссылка недействительна или устарела.",
+            status=404,
+            content_type="text/plain",
+            charset="utf-8",
+        )
+    return web.json_response({"error": "Сессия не найдена"}, status=404)
 
 
 def _page_html(upload_id: str, max_mb: int) -> str:
@@ -287,7 +311,7 @@ def _page_html(upload_id: str, max_mb: int) -> str:
     <div class="status" id="status"></div>
   </div>
   <script>
-    const UPLOAD_ID = {upload_id!r};
+    const UPLOAD_ID = {json.dumps(upload_id)};
     const MAX_MB = {max_mb};
     const ALLOWED_EXT = {list(ALLOWED_EXTENSIONS)!r};
 
@@ -409,6 +433,9 @@ def setup_upload_routes(
         if limited is not None:
             return limited
         upload_id = request.match_info["upload_id"]
+        bad = _bad_upload_id(upload_id, page=True)
+        if bad is not None:
+            return bad
         query_token = request.rel_url.query.get("t", "").strip()
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
@@ -455,6 +482,9 @@ def setup_upload_routes(
         if limited is not None:
             return limited
         upload_id = request.match_info["upload_id"]
+        bad = _bad_upload_id(upload_id, page=False)
+        if bad is not None:
+            return bad
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
         if session is None:
@@ -528,6 +558,9 @@ def setup_upload_routes(
         if limited is not None:
             return limited
         upload_id = request.match_info["upload_id"]
+        bad = _bad_upload_id(upload_id, page=False)
+        if bad is not None:
+            return bad
         token = _extract_token(request)
         session = await store.get_authorized(upload_id, token)
         if session is None:
@@ -607,6 +640,9 @@ def setup_upload_routes(
         if limited is not None:
             return limited
         upload_id = request.match_info["upload_id"]
+        bad = _bad_upload_id(upload_id, page=False)
+        if bad is not None:
+            return bad
         token = _extract_token(request)
         # Claim early so two parallel POSTs cannot both process.
         session = await store.claim_processing(
@@ -705,6 +741,7 @@ def setup_upload_routes(
             session.object_key = key
             session.filename = file_name
             session.mime_type = effective_type
+            session.verified_mime = effective_type
             session.file_size = size
             session.status = "processing"
             await store.update(session)

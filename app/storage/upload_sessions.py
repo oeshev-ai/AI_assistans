@@ -45,6 +45,8 @@ class UploadSession:
     object_key: str | None = None
     filename: str | None = None
     mime_type: str | None = None
+    # MIME, уже подтверждённый ffmpeg на same-origin загрузке. Бот не проверяет снова.
+    verified_mime: str | None = None
     file_size: int | None = None
     error: str | None = None
     # Сообщения в чате со ссылкой/пояснением — удаляем после успеха или Отмены.
