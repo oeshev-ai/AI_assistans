@@ -15,7 +15,7 @@ def test_deploy_pulls_arq_profile_and_ups_only_a_live_worker() -> None:
     pull = script.index("docker compose --profile arq pull")
     rewrite = script.index('sed -i "s|^APP_IMAGE=')
     assert pull < rewrite
-    assert 'if [ ! -f .env ]' in script
+    assert "if [ ! -f .env ]" in script
     assert "exit 1" in script
     assert " > .env" not in script
     assert "command_timeout: 20m" in text

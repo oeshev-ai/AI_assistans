@@ -45,7 +45,9 @@ def test_locks_pin_every_package_and_share_prod_versions() -> None:
     assert "--generate-hashes" in (ROOT / "requirements-prod.txt").read_text(
         encoding="utf-8"
     )
-    assert "--generate-hashes" in (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "--generate-hashes" in (ROOT / "requirements.txt").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_direct_requirements_do_not_list_openai() -> None:
