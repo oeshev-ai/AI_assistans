@@ -176,8 +176,12 @@ def _normalize_current(data: dict) -> dict:
 
 def _timezone_offset(value: object) -> int:
     """Секунды сдвига от UTC из поля ``timezone`` ответа OWM."""
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, float | str):
+        return 0
     try:
-        return int(value)  # type: ignore[arg-type]
+        return int(value)
     except (TypeError, ValueError):
         return 0
 
