@@ -254,11 +254,15 @@ async def _send_bytes(bot: Bot, chat_id: int, raw: bytes, filename: str) -> None
             request_timeout=180,
         )
     except (TelegramBadRequest, TelegramNetworkError):
-        await bot.send_document(
-            chat_id,
-            BufferedInputFile(raw, filename=filename),
-            caption=VIDEO_LATE_CAPTION,
-            request_timeout=180,
+        from app.bot.runtime import _flood_send
+
+        await _flood_send(
+            lambda: bot.send_document(
+                chat_id,
+                BufferedInputFile(raw, filename=filename),
+                caption=VIDEO_LATE_CAPTION,
+                request_timeout=180,
+            )
         )
 
 

@@ -55,3 +55,9 @@ def test_worker_keeps_job_result_for_a_minute(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("REDIS_QUEUE_URL", raising=False)
     settings_cls = worker._worker_settings_class()
     assert settings_cls.keep_result == 60
+    image_keep = {
+        item.name: item.keep_result_s
+        for item in settings_cls.functions
+        if getattr(item, "keep_result_s", None) is not None
+    }
+    assert image_keep == {"generate_image_task": 180, "edit_image_task": 180}

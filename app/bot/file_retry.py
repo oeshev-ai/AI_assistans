@@ -191,11 +191,15 @@ async def _send_bytes(bot: Bot, chat_id: int, raw: bytes, item: KeptFile) -> Non
             request_timeout=120,
         )
         return
-    await bot.send_document(
-        chat_id,
-        payload,
-        caption=FILE_LATE_CAPTION,
-        request_timeout=120,
+    from app.bot.runtime import _flood_send
+
+    await _flood_send(
+        lambda: bot.send_document(
+            chat_id,
+            payload,
+            caption=FILE_LATE_CAPTION,
+            request_timeout=120,
+        )
     )
 
 

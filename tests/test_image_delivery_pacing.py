@@ -35,6 +35,7 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
 
     monkeypatch.setattr(photo_pacer.time, "monotonic", monotonic)
     monkeypatch.setattr(photo_pacer.asyncio, "sleep", sleep)
+    monkeypatch.setattr("app.bot.runtime.asyncio.sleep", sleep)
     monkeypatch.setattr(time, "monotonic", monotonic)
     state["sleeps"] = sleeps  # type: ignore[assignment]
     return state
@@ -91,3 +92,18 @@ async def test_retry_after_is_slept_once_and_next_photo_still_sends(
     assert failed == ["a.png"]
     assert sent == ["a.png", "a.png", "b.png"]
     assert 3.0 in clock["sleeps"]
+
+
+@pytest.mark.asyncio
+async def test_long_photo_flood_is_not_waited_out(clock: dict[str, float]) -> None:
+    calls = 0
+
+    async def send() -> str:
+        nonlocal calls
+        calls += 1
+        raise _flood(45)
+
+    with pytest.raises(TelegramRetryAfter):
+        await send_photo_paced(4, send)
+    assert calls == 1
+    assert clock["sleeps"] == []

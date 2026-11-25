@@ -29,6 +29,7 @@ async def test_generate_image_inline_when_disabled() -> None:
 
 @pytest.mark.asyncio
 async def test_generate_image_enqueue_none_fail_closed() -> None:
+    from app.infra.metrics import ARQ_ENQUEUE_FAILED
     from app.llm.errors import AssistAIError
 
     await job_queue.close_job_queue()
@@ -44,8 +45,11 @@ async def test_generate_image_enqueue_none_fail_closed() -> None:
         async def generate_image(self, *args, **kwargs):
             raise AssertionError("must not fall back inline")
 
+    before = ARQ_ENQUEUE_FAILED.labels(task="generate_image_task")._value.get()
     with pytest.raises(AssistAIError, match="Очередь обработки"):
         await job_queue.generate_image(FakeAssistant(), "cat", "model-a", "512x512")
+    after = ARQ_ENQUEUE_FAILED.labels(task="generate_image_task")._value.get()
+    assert after == before + 1
     job_queue._enabled = False
     job_queue._pool = None
 
@@ -376,6 +380,29 @@ async def test_timeout_while_job_is_queued_is_still_running() -> None:
         await job_queue._await_job_result(Job(), 450.0, task="generate_image_task")
     assert caught.value.error_code == "QUEUE_JOB_RUNNING"
     assert caught.value.job_committed is True
+    assert caught.value.pending_job_id == "job-busy"
+    assert caught.value.pending_provider == "arq"
+    assert caught.value.pending_kind == "image"
+
+
+@pytest.mark.asyncio
+async def test_speech_timeout_keeps_the_job_id_without_an_image_retry() -> None:
+    from app.llm.errors import AssistAIError
+
+    class Job:
+        job_id = "speech-1"
+
+        async def result(self, timeout: float) -> dict[str, str]:
+            raise TimeoutError
+
+        async def status(self) -> str:
+            return "queued"
+
+    with pytest.raises(AssistAIError) as caught:
+        await job_queue._await_job_result(Job(), 1.0, task="synthesize_speech_task")
+    assert caught.value.pending_job_id == "speech-1"
+    assert caught.value.pending_provider is None
+    assert caught.value.pending_kind is None
 
 
 @pytest.mark.asyncio

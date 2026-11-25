@@ -55,13 +55,14 @@ def test_active_users_gauge() -> None:
 
 
 class _InfoRedis:
-    def __init__(self, *, used: int, evicted: int) -> None:
+    def __init__(self, *, used: int, evicted: int, maxmemory: int = 0) -> None:
         self.used = used
         self.evicted = evicted
+        self.maxmemory = maxmemory
 
     async def info(self, section: str) -> dict[str, int]:
         if section == "memory":
-            return {"used_memory": self.used}
+            return {"used_memory": self.used, "maxmemory": self.maxmemory}
         return {"evicted_keys": self.evicted}
 
 
@@ -77,13 +78,26 @@ async def test_eviction_growth_is_logged() -> None:
         await refresh_redis_gauge(client, role="state")
         client.evicted = 7
         await refresh_redis_gauge(client, role="state")
-    assert metrics_mod.REDIS_SIZE._value.get() == 1000
+    assert metrics_mod.REDIS_SIZE.labels(role="state")._value.get() == 1000
     assert note_evicted_keys is not None
     evicted = [item for item in logs if item["event"] == "redis_keys_evicted"]
     assert len(evicted) == 1
     assert evicted[0]["delta"] == 3
     assert evicted[0]["role"] == "state"
     metrics_mod._last_evicted.pop("state", None)
+
+
+@pytest.mark.asyncio
+async def test_maxmemory_gauge_feeds_fill_ratio() -> None:
+    from app.infra.metrics import refresh_redis_gauge
+
+    client = _InfoRedis(used=850, evicted=0, maxmemory=1000)
+    await refresh_redis_gauge(client, role="queue")
+    used = metrics_mod.REDIS_SIZE.labels(role="queue")._value.get()
+    ceiling = metrics_mod.REDIS_MAXMEMORY.labels(role="queue")._value.get()
+    assert used == 850
+    assert ceiling == 1000
+    assert used / ceiling > 0.8
 
 
 def test_metrics_server_defaults_to_localhost_bind() -> None:

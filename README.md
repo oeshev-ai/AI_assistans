@@ -194,20 +194,20 @@ pytest tests/ -v
 
 `mypy` смотрит `app`, `bot.py` и `worker.py` — тот же набор, что в CI. Каталог `tests/` не входит: тестовые двойники не сходятся со стабами redis-py 5.
 
-`requirements.in` и `requirements-prod.in` задают диапазоны. `requirements.txt` и `requirements-prod.txt` — lock pip-compile: у каждого пакета версия `==`, общие пакеты совпадают. CI и образ ставят lock, не диапазоны. Образ берёт `requirements-prod.txt` (без pytest, ruff и mypy) и ffmpeg, процесс внутри контейнера идёт не от root. Пересборка lock:
+`requirements.in` и `requirements-prod.in` задают диапазоны. `requirements.txt` и `requirements-prod.txt` — lock pip-compile: у каждого пакета версия `==` и хеши, общие пакеты совпадают. CI и образ ставят lock, не диапазоны. Образ берёт `requirements-prod.txt` (без pytest, ruff и mypy) и ffmpeg, процесс внутри контейнера идёт не от root. Пересборка lock на Linux (так же считает CI):
 
 ```bash
-pip-compile --no-strip-extras --output-file=requirements-prod.txt requirements-prod.in
-pip-compile --constraint=requirements-prod.txt --no-strip-extras --output-file=requirements.txt requirements.in
+pip-compile --no-strip-extras --generate-hashes --output-file=requirements-prod.txt requirements-prod.in
+pip-compile --constraint=requirements-prod.txt --no-strip-extras --generate-hashes --output-file=requirements.txt requirements.in
 ```
 
-Нужен пакет `pip-tools`. Сначала прод, потом полный файл с `--constraint`, чтобы общие пакеты не разъехались.
+Нужен пакет `pip-tools` 7.7.0. Сначала прод, потом полный файл с `--constraint`, чтобы общие пакеты не разъехались. У этой версии нет флага `--check`: CI ставит `pip-tools==7.7.0`, гоняет те же две команды и сравнивает результат с файлами в репозитории.
 
 ## Деплой
 
-CI на push и pull request в `main`: ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
+CI на push и pull request в `main`: сверка lock с `.in`, ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
 
-После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA проверенного коммита. На VPS в `.env` записывается `APP_IMAGE` с этим SHA, затем `docker compose --profile arq pull`. Так на хосте оказывается образ, который прошёл CI, а не плавающий `latest`. Откат — поставить в `APP_IMAGE` SHA предыдущего зелёного деплоя и снова `compose up`. Второй деплой ждёт, пока первый закончит SSH. `up -d` идёт с профилем `arq`, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
+После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA проверенного коммита. На VPS `docker compose --profile arq pull` сначала скачивает этот SHA (тег только в окружении команды). После успешного pull тот же тег записывается в уже существующий `.env`. Если файла нет, деплой останавливается: пустой `.env` поднял бы стек без токенов и бюджетов. Так на хосте оказывается образ, который прошёл CI, а не плавающий `latest`. Оборванный pull оставляет прежний `APP_IMAGE`. Откат — поставить в `APP_IMAGE` SHA предыдущего зелёного деплоя и снова `compose up`. Второй деплой ждёт, пока первый закончит SSH. `up -d` идёт с профилем `arq`, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
 
 Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа.
 
@@ -229,9 +229,9 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
 
 `redis` (`REDIS_MAXMEMORY`, по умолчанию 512mb) хранит темы, персоны, FSM (состояние и data, 30 суток с последней записи), бюджет и лимиты. При упоре в потолок уходит ключ с самым коротким остатком TTL: сначала окна лимитов, потом давно не открытые темы. Активный чат продлевает TTL и освобождается последним. Запись истории при этом не останавливается целиком.
 
-`redis-queue` (`REDIS_QUEUE_MAXMEMORY`, по умолчанию 768mb) хранит только очередь. Альбом до 20 МБ уходит в Redis как base64, это около 27 МБ; STT — сырые байты до 20 МБ. При `ARQ_MAX_JOBS=10` одна волна — примерно 270 МБ правок или 200 МБ распознавания, вместе до ~470 МБ. Прежний общий потолок 256mb эту волну не вмещал и начинал выселять лимиты, бюджет, FSM и темы. Результат задачи arq хранится 60 секунд (`keep_result`; дефолт библиотеки — час), бот читает его сразу по завершении. Политика очереди — `noeviction`: при `volatile-ttl` этот ключ на 60 секунд выселялся раньше payload, и бот терял уже оплаченную картинку. Полная память отвергает `enqueue` до платного вызова. Рост `redis_evicted_keys{role="queue"}` при этой политике означает, что инстанс всё же выселяет ключи.
+`redis-queue` (`REDIS_QUEUE_MAXMEMORY`, по умолчанию 768mb) хранит только очередь. Альбом до 20 МБ уходит в Redis как base64, это около 27 МБ; STT — сырые байты до 20 МБ. При `ARQ_MAX_JOBS=10` одна волна — примерно 270 МБ правок или 200 МБ распознавания, вместе до ~470 МБ. Прежний общий потолок 256mb эту волну не вмещал и начинал выселять лимиты, бюджет, FSM и темы. Результат задачи arq хранится 60 секунд (`keep_result`; дефолт библиотеки — час), у генерации и правки картинки — 180 секунд. Бот читает результат сразу по завершении. Если к этому моменту задача ещё идёт, в ошибку кладётся её id: цикл доставки забирает URL, пока ключ жив, и дальше качает файл с CDN. Политика очереди — `noeviction`: при `volatile-ttl` этот ключ на 60 секунд выселялся раньше payload, и бот терял уже оплаченную картинку. Полная память отвергает `enqueue` до платного вызова. Заполнение очереди: `redis_memory_bytes{role="queue"} / redis_maxmemory_bytes{role="queue"} > 0.8` (и `redis_maxmemory_bytes > 0`). Отказ записи считает `increase(arq_enqueue_failed_total[5m]) > 0`.
 
-Рост `redis_evicted_keys{role="state"|"queue"}` пишется в лог как `redis_keys_evicted`. Для алерта: `delta(redis_evicted_keys[5m]) > 0`.
+Рост `redis_evicted_keys{role="state"}` пишется в лог как `redis_keys_evicted`. Для состояния алерт: `delta(redis_evicted_keys{role="state"}[5m]) > 0`.
 
 ## Метрики
 
@@ -242,8 +242,11 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
 - `llm_daily_budget_remaining_usd` — остаток глобального дневного потолка, если он задан.
 - `provider_fallback_total{from,to,reason}` — уход на запасной провайдер.
 - `api_calls_total`, `api_latency_seconds`, `errors_total` — внешние вызовы, метка `service` равна id провайдера (`polza` или `proxyapi`).
-- `message_processing_seconds`, `active_users`, `redis_memory_bytes` — память Redis состояния.
-- `redis_evicted_keys{role}` — сколько ключей Redis уже выселил. `state` — чаты и лимиты, `queue` — медиа очереди. `delta(...[5m]) > 0` значит потолок памяти режет данные.
+- `message_processing_seconds`, `active_users`.
+- `redis_memory_bytes{role}` — `used_memory`. `state` — чаты и лимиты, `queue` — медиа очереди.
+- `redis_maxmemory_bytes{role}` — потолок из `INFO memory`. Алерт заполнения: `redis_memory_bytes / redis_maxmemory_bytes > 0.8` при `redis_maxmemory_bytes > 0`.
+- `arq_enqueue_failed_total{task}` — очередь не приняла задачу до платного вызова. `increase(...[5m]) > 0`.
+- `redis_evicted_keys{role="state"}` — сколько ключей выселил инстанс состояния. `delta(...[5m]) > 0` значит потолок режет чаты и лимиты. На очереди с `noeviction` этот счётчик стоит на нуле.
 
 Логи — JSON structlog. Секреты и пароль в Redis URL в них не пишутся.
 

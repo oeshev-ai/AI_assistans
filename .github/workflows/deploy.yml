@@ -64,18 +64,25 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Дефолт action — 10m. Pull большого образа съедает его, и up
+          # обрывается на «Starting» сообщением Run Command Timeout.
+          command_timeout: 20m
           script: |
             set -e
             cd /home/deploy/AI_assistans
-            image='${{ steps.image.outputs.name }}:${{ github.event.workflow_run.head_sha }}'
             if [ ! -f .env ]; then
-              printf 'APP_IMAGE=%s\n' "$image" > .env
-            elif grep -q '^APP_IMAGE=' .env; then
+              echo ".env нет в /home/deploy/AI_assistans. Деплой его не создаёт: там токены и бюджеты." >&2
+              exit 1
+            fi
+            image='${{ steps.image.outputs.name }}:${{ github.event.workflow_run.head_sha }}'
+            # Тег только в окружении этой команды. .env меняется после pull:
+            # оборванная загрузка оставляет прежний образ.
+            APP_IMAGE="$image" docker compose --profile arq pull
+            if grep -q '^APP_IMAGE=' .env; then
               sed -i "s|^APP_IMAGE=.*|APP_IMAGE=${image}|" .env
             else
               printf '\nAPP_IMAGE=%s\n' "$image" >> .env
             fi
-            docker compose --profile arq pull
             update_worker=0
             for id in $(docker compose --profile arq ps -aq worker); do
               state="$(docker inspect -f '{{.State.Status}}' "$id")"

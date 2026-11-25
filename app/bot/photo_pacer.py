@@ -7,8 +7,6 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
-from aiogram.exceptions import TelegramRetryAfter
-
 _GAP_SECONDS = 1.0
 
 T = TypeVar("T")
@@ -45,13 +43,11 @@ async def _reserve(chat_id: int) -> None:
 
 
 async def send_photo_paced(chat_id: int, send: Callable[[], Awaitable[T]]) -> T:
-    """Один sendPhoto. На ``TelegramRetryAfter`` ждёт ``retry_after`` и пробует ещё раз."""
-    await _reserve(chat_id)
-    try:
-        return await send()
-    except TelegramRetryAfter as exc:
-        delay = float(exc.retry_after)
-        if delay > 0:
-            await asyncio.sleep(delay)
+    """Один sendPhoto. Короткий flood control ждёт и пробует ещё раз, длинный — сразу отказ."""
+    from app.bot.runtime import _flood_send
+
+    async def _once() -> T:
         await _reserve(chat_id)
         return await send()
+
+    return await _flood_send(_once)
