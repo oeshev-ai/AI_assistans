@@ -78,14 +78,21 @@ async def _copy_until_limit(field: Any, dest: Any, max_bytes: int) -> tuple[int,
         size += len(chunk)
         if size > max_bytes:
             return size, True
-        dest.write(chunk)
+        await asyncio.to_thread(dest.write, chunk)
 
 
 def _payload_too_large(request: web.Request, limit_mb: int) -> web.Response:
-    """413 и закрытие сокета. Иначе aiohttp дочитывает тело lingering_time секунд."""
+    """413 и закрытие сокета. Иначе aiohttp дочитывает тело lingering_time секунд.
+
+    ``_lingering_time`` — приватное поле aiohttp 3.x. Если его не станет,
+    присваивание создало бы новый атрибут и linger вернулся бы без ошибки.
+    """
     protocol = request.protocol
-    if protocol is not None:
-        protocol._lingering_time = 0.0
+    if protocol is not None and hasattr(protocol, "_lingering_time"):
+        try:
+            protocol._lingering_time = 0.0
+        except Exception as exc:
+            logger.warning("upload_linger_disable_failed", error=str(exc))
     response = web.json_response(
         {"error": f"Файл больше {limit_mb} МБ"},
         status=413,

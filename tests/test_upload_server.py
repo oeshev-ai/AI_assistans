@@ -12,7 +12,11 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.media.upload_server import _copy_until_limit, setup_upload_routes
+from app.media.upload_server import (
+    _copy_until_limit,
+    _payload_too_large,
+    setup_upload_routes,
+)
 from app.storage.upload_sessions import UploadSessionStore
 
 
@@ -445,6 +449,67 @@ class _ChunkField:
         if not self._parts:
             return b""
         return self._parts.pop(0)
+
+
+def test_payload_too_large_zeroes_existing_linger() -> None:
+    class _Protocol:
+        _lingering_time = 10.0
+
+    class _Request:
+        protocol = _Protocol()
+
+    response = _payload_too_large(_Request(), 1)  # type: ignore[arg-type]
+    assert response.status == 413
+    assert _Request.protocol._lingering_time == 0.0
+
+
+def test_payload_too_large_does_not_invent_missing_linger() -> None:
+    class _Protocol:
+        pass
+
+    class _Request:
+        protocol = _Protocol()
+
+    response = _payload_too_large(_Request(), 1)  # type: ignore[arg-type]
+    assert response.status == 413
+    assert response.headers["Connection"] == "close"
+    assert not hasattr(_Request.protocol, "_lingering_time")
+
+
+def test_payload_too_large_survives_linger_setter_error() -> None:
+    class _Protocol:
+        @property
+        def _lingering_time(self) -> float:
+            return 10.0
+
+        @_lingering_time.setter
+        def _lingering_time(self, _value: float) -> None:
+            raise AttributeError("removed")
+
+    class _Request:
+        protocol = _Protocol()
+
+    response = _payload_too_large(_Request(), 1)  # type: ignore[arg-type]
+    assert response.status == 413
+    assert response.headers["Connection"] == "close"
+
+
+@pytest.mark.asyncio
+async def test_copy_writes_off_the_event_loop() -> None:
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    class _Dest:
+        def write(self, chunk: bytes) -> None:
+            seen.append(threading.get_ident())
+
+    size, too_large = await _copy_until_limit(_ChunkField([b"abc"]), _Dest(), 10)
+    assert too_large is False
+    assert size == 3
+    assert seen == [seen[0]]
+    assert seen[0] != loop_thread
 
 
 @pytest.mark.asyncio

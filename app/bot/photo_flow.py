@@ -1029,11 +1029,11 @@ async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) 
 async def _text_context(
     storage: Any, chat_id: int, assistant_id: str, topic_id: str
 ) -> list[dict[str, Any]]:
-    async with R._chat_turn(chat_id):
-        try:
-            history = await storage.get_history(chat_id, assistant_id, topic_id)
-        except Exception:
-            return []
+    """Снимок истории без лока чата. Запись раунда атомарна, фото не ждёт текст."""
+    try:
+        history = await storage.get_history(chat_id, assistant_id, topic_id)
+    except Exception:
+        return []
     texts: list[dict[str, Any]] = []
     if not isinstance(history, list):
         return texts

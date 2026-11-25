@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from aiogram.exceptions import TelegramBadRequest
+import json
+
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from app.bot import runtime
@@ -38,6 +40,36 @@ def test_code_point_slice_of_emoji_exceeds_api_limit() -> None:
     clipped = clip_telegram_text(text)
     assert telegram_text_units(clipped) <= TELEGRAM_TEXT_SAFE
     assert text.startswith(clipped)
+
+
+def test_lone_surrogate_from_json_is_one_unit() -> None:
+    text = json.loads('"hello \\ud800 world"')
+    assert "\ud800" in text
+    assert telegram_text_units(text) == telegram_text_units("hello  world") + 1
+    assert clip_telegram_text(text) == text
+    parts = split_telegram_text(text, 7)
+    assert "".join(parts) == text
+    assert all(telegram_text_units(part) <= 7 for part in parts)
+
+
+async def test_send_and_edit_survive_lone_surrogate() -> None:
+    text = json.loads('"hello \\ud800 world"')
+    edited: list[str] = []
+    sent: list[str] = []
+
+    class _Status:
+        async def edit_text(self, value: str) -> None:
+            edited.append(value)
+
+    class _Message:
+        async def answer(self, value: str) -> None:
+            sent.append(value)
+
+    shown = await runtime._edit_stream(_Status(), text, "")  # type: ignore[arg-type]
+    assert shown == text
+    assert edited == [text]
+    await runtime._send_text(_Message(), text)  # type: ignore[arg-type]
+    assert "".join(sent) == text
 
 
 def test_clip_does_not_split_surrogate_pair() -> None:
@@ -135,6 +167,74 @@ async def test_send_text_swallows_other_bad_request(monkeypatch) -> None:
 
     await runtime._send_text(_Message(), "abcdef")  # type: ignore[arg-type]
     assert sent == ["abcd"]
+
+
+def _flood(text: str, retry_after: int = 2) -> TelegramRetryAfter:
+    return TelegramRetryAfter(
+        method=SendMessage(chat_id=1, text=text),
+        message="Flood control exceeded",
+        retry_after=retry_after,
+    )
+
+
+async def test_send_text_waits_out_flood_and_sends_the_rest(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "TELEGRAM_TEXT_SAFE", 4)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+    attempts: list[str] = []
+    delivered: list[str] = []
+
+    class _Message:
+        async def answer(self, value: str) -> None:
+            attempts.append(value)
+            if len(attempts) == 1:
+                raise _flood(value)
+            delivered.append(value)
+
+    await runtime._send_text(_Message(), "abcdefgh")  # type: ignore[arg-type]
+    assert sleeps == [2]
+    assert delivered == ["abcd", "efgh"]
+
+
+async def test_send_text_second_flood_does_not_raise(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+
+    class _Message:
+        async def answer(self, value: str) -> None:
+            raise _flood(value, 3)
+
+    await runtime._send_text(_Message(), "hello")  # type: ignore[arg-type]
+    assert sleeps == [3]
+
+
+async def test_edit_stream_retries_after_flood(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+    edits: list[str] = []
+
+    class _Status:
+        async def edit_text(self, value: str) -> None:
+            edits.append(value)
+            if len(edits) == 1:
+                raise _flood(value, 1)
+
+    shown = await runtime._edit_stream(_Status(), "hello", "")  # type: ignore[arg-type]
+    assert sleeps == [1]
+    assert edits == ["hello", "hello"]
+    assert shown == "hello"
 
 
 async def test_send_text_blank_becomes_placeholder() -> None:

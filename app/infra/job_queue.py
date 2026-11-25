@@ -248,6 +248,68 @@ async def _staged_payload_ttl(pool: Any) -> int:
     return _payload_ttl_seconds(await _queue_depth(pool))
 
 
+def _result_lost(task: str) -> Exception:
+    """Задача уже ушла из очереди, а ключа результата нет."""
+    from app.llm.errors import AssistAIError
+
+    logger.error("arq_result_missing", task=task)
+    return AssistAIError(
+        "Результат не сохранился в очереди. Повтор может списать деньги ещё раз.",
+        error_code="QUEUE_RESULT_LOST",
+        job_committed=True,
+    )
+
+
+def _job_still_running(task: str) -> Exception:
+    """Ключ результата ещё не появился, задача по-прежнему в очереди."""
+    from app.llm.errors import AssistAIError
+
+    logger.error("arq_job_still_running", task=task)
+    return AssistAIError(
+        "Задача ещё выполняется. Повтор может списать деньги ещё раз.",
+        error_code="QUEUE_JOB_RUNNING",
+        job_committed=True,
+    )
+
+
+async def _job_status(job: Any) -> str:
+    status_of = getattr(job, "status", None)
+    if status_of is None:
+        return ""
+    try:
+        raw = await status_of()
+    except Exception as exc:
+        logger.warning("arq_job_status_failed", error=str(exc))
+        return ""
+    value = getattr(raw, "value", raw)
+    return str(value)
+
+
+async def _await_job_result(job: Any, timeout: float, *, task: str) -> Any:
+    """Ждёт результат и не путает пропавший ключ с ещё идущей задачей.
+
+    arq при отсутствии результата и записи в очереди сразу бросает
+    ``ResultNotFound``. ``TimeoutError`` бывает только пока задача в очереди.
+    """
+
+    from arq.jobs import ResultNotFound
+
+    try:
+        return await job.result(timeout=timeout)
+    except ResultNotFound as exc:
+        raise _result_lost(task) from exc
+    except TimeoutError as exc:
+        status = await _job_status(job)
+        if status == "complete":
+            try:
+                return await job.result(timeout=0)
+            except (TimeoutError, ResultNotFound):
+                raise _result_lost(task) from exc
+        if status in {"queued", "deferred", "in_progress", ""}:
+            raise _job_still_running(task) from exc
+        raise _result_lost(task) from exc
+
+
 def _arq_enqueue_failed(task: str) -> Exception:
     """Очередь включена, но job не принят — не уходим в inline (риск OOM бота)."""
     from app.llm.errors import AssistAIError
@@ -296,7 +358,7 @@ async def generate_image(
         if job is None:
             raise _arq_enqueue_failed("generate_image_task")
         logger.info("arq_job_enqueued", task="generate_image_task", job_id=job.job_id)
-        result = await job.result(timeout=wait)
+        result = await _await_job_result(job, wait, task="generate_image_task")
         return list(result)
     return await assistant.generate_image(
         prompt=prompt, model=model, size=size, background=background
@@ -354,7 +416,7 @@ async def edit_images(
             raise _arq_enqueue_failed("edit_image_task")
         logger.info("arq_job_enqueued", task="edit_image_task", job_id=job.job_id)
         try:
-            result = await job.result(timeout=wait)
+            result = await _await_job_result(job, wait, task="edit_image_task")
             return list(result)
         except Exception as exc:
             # Job accepted — do not re-run inline. Payload stays until TTL.
@@ -405,7 +467,7 @@ async def synthesize_speech(
         logger.info(
             "arq_job_enqueued", task="synthesize_speech_task", job_id=job.job_id
         )
-        payload = await job.result(timeout=timeout)
+        payload = await _await_job_result(job, timeout, task="synthesize_speech_task")
         return SpeechResult(
             audio=base64.b64decode(payload["audio_b64"]),
             filename=payload["filename"],
@@ -469,7 +531,9 @@ async def transcribe_audio(
             raise _arq_enqueue_failed("transcribe_audio_task")
         logger.info("arq_job_enqueued", task="transcribe_audio_task", job_id=job.job_id)
         try:
-            return _coerce_transcription(await job.result(timeout=timeout))
+            return _coerce_transcription(
+                await _await_job_result(job, timeout, task="transcribe_audio_task")
+            )
         except Exception as exc:
             # Job accepted — do not duplicate STT inline. Payload TTL covers cleanup.
             logger.warning("arq_stt_failed", error=str(exc), job_id=job.job_id)

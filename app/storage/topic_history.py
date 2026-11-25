@@ -200,6 +200,7 @@ class TopicHistoryStorage(ABC):
     ) -> None:
         """Добавляет сообщение в тему и обрезает историю до ``max_length``."""
 
+    @abstractmethod
     async def append_messages(
         self,
         chat_id: int,
@@ -213,10 +214,6 @@ class TopicHistoryStorage(ABC):
         Раунд ``assistant.tool_calls`` + ``tool`` + ответ не должен быть виден
         наполовину: чужой ход иначе получит 400 от провайдера.
         """
-        for message in messages:
-            await self.append_message(
-                chat_id, assistant_id, topic_id, message, max_length
-            )
 
     @abstractmethod
     async def clear_topic(self, chat_id: int, assistant_id: str, topic_id: str) -> None:

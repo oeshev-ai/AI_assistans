@@ -1,0 +1,16 @@
+# Прямые прод-зависимости. Версии фиксирует requirements-prod.txt (pip-compile).
+python-dotenv>=1.0,<2
+httpx>=0.27,<1
+pydantic>=2.4,<2.14
+tenacity>=8.2,<10
+aiogram>=3.31,<4
+redis[hiredis]>=5.0.0,<6
+PyMuPDF>=1.24,<2
+pillow>=10.4,<13
+structlog>=24.1
+prometheus_client>=0.20
+aiohttp>=3.9,<4
+sentry-sdk[aiohttp]>=2.0,<3
+arq>=0.26
+imageio-ffmpeg>=0.5
+boto3>=1.34

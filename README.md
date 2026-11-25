@@ -114,7 +114,7 @@ SpeechKit (`TTS_PROVIDER=speechkit`) ходит в Yandex TTS v3 и в эту с
 
 ## Что обязательно в production
 
-Compose сам выставляет `ENVIRONMENT=production`, `REDIS_URL` на сервис `redis`, `REDIS_QUEUE_URL` на `redis-queue` (пароль в percent-encoding), `TRUST_PROXY=1`, health и metrics на `0.0.0.0` внутри контейнера. Наружу порты публикуются только на `127.0.0.1`. Healthcheck бота ходит в `GET /live`. Память контейнеров: Redis состояния 768 МБ, Redis очереди 1280 МБ, бот 1536 МБ, воркер 1024 МБ.
+Compose сам выставляет `ENVIRONMENT=production`, `REDIS_URL` на сервис `redis`, `REDIS_QUEUE_URL` на `redis-queue` (пароль в percent-encoding), `TRUST_PROXY=1`, health и metrics на `0.0.0.0` внутри контейнера. Наружу порты публикуются только на `127.0.0.1`. Healthcheck бота ходит в `GET /live`. Память контейнеров: Redis состояния 768 МБ, Redis очереди 1280 МБ, бот 1536 МБ, воркер 1024 МБ. Сумма потолков 4608 МБ, у каждого `memswap_limit` равен `mem_limit`, свопа нет. Хосту нужно не меньше 6 ГБ RAM: потолки могут заполниться одновременно, плюс ОС и nginx.
 
 Бот завершается с `SystemExit`, если в production:
 
@@ -194,13 +194,20 @@ pytest tests/ -v
 
 `mypy` смотрит `app`, `bot.py` и `worker.py` — тот же набор, что в CI. Каталог `tests/` не входит: тестовые двойники не сходятся со стабами redis-py 5.
 
-Прод-зависимости без pytest, ruff и mypy — `requirements-prod.txt`. Образ ставит их и ffmpeg, процесс внутри контейнера идёт не от root.
+`requirements.in` и `requirements-prod.in` задают диапазоны. `requirements.txt` и `requirements-prod.txt` — lock pip-compile: у каждого пакета версия `==`, общие пакеты совпадают. CI и образ ставят lock, не диапазоны. Образ берёт `requirements-prod.txt` (без pytest, ruff и mypy) и ffmpeg, процесс внутри контейнера идёт не от root. Пересборка lock:
+
+```bash
+pip-compile --no-strip-extras --output-file=requirements-prod.txt requirements-prod.in
+pip-compile --constraint=requirements-prod.txt --no-strip-extras --output-file=requirements.txt requirements.in
+```
+
+Нужен пакет `pip-tools`. Сначала прод, потом полный файл с `--constraint`, чтобы общие пакеты не разъехались.
 
 ## Деплой
 
 CI на push и pull request в `main`: ruff, format, mypy, pytest, установка `requirements-prod.txt`, сборка Docker-образа.
 
-После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA, затем шаг Deploy over SSH в `/home/deploy/AI_assistans` делает `docker compose --profile arq pull`. `up -d` идёт с тем же профилем, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
+После зелёного CI на push в `main` workflow Deploy публикует `ghcr.io/oeshev-ai/ai_assistans:latest` и тег по SHA проверенного коммита. На VPS в `.env` записывается `APP_IMAGE` с этим SHA, затем `docker compose --profile arq pull`. Так на хосте оказывается образ, который прошёл CI, а не плавающий `latest`. Откат — поставить в `APP_IMAGE` SHA предыдущего зелёного деплоя и снова `compose up`. Второй деплой ждёт, пока первый закончит SSH. `up -d` идёт с профилем `arq`, только если контейнер `worker` уже `running` или `restarting`; иначе поднимаются бот и Redis, а очередь не стартует. Без `APP_IMAGE` Compose собирает локальный тег `ai-assistans:local`.
 
 Без секретов `SSH_HOST`, `SSH_USER` и `SSH_PRIVATE_KEY` этот шаг роняет job уже после публикации образа.
 
@@ -211,18 +218,18 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
 1. На `main` есть актуальный `docker-compose.yml` с `image: ${APP_IMAGE:-…}` (не только `build: .`). На сервере: `git pull` до этого коммита.
 2. В `/home/deploy/AI_assistans/.env`:
    ```text
-   APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:latest
+   APP_IMAGE=ghcr.io/oeshev-ai/ai_assistans:<sha зелёного CI>
    ```
 3. Под `deploy`: `docker login ghcr.io` (PAT с `read:packages`), если пакет private.
 4. Первый раз вручную: `cd /home/deploy/AI_assistans && docker compose --profile arq pull && docker compose up -d`. Если воркер уже запущен, `up` тоже с `--profile arq`. Контейнер бота должен перейти на образ `ghcr.io/oeshev-ai/…`, не `ai-assistans-bot`.
 5. Секреты репозитория: `SSH_HOST`, `SSH_USER` (`deploy`), `SSH_PRIVATE_KEY` (отдельный ключ для Actions, pubkey в `authorized_keys` у `deploy`).
 6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` включён и сам выбирает профиль: образ воркера подтягивается всегда, контейнер пересоздаётся только пока он `running` или `restarting`.
 
-Два Redis, оба с AOF и `volatile-ttl`. Пароль один — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
+Два Redis, оба с AOF. У состояния политика `volatile-ttl`, у очереди — `noeviction`. Пароль один — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
 
 `redis` (`REDIS_MAXMEMORY`, по умолчанию 512mb) хранит темы, персоны, FSM (состояние и data, 30 суток с последней записи), бюджет и лимиты. При упоре в потолок уходит ключ с самым коротким остатком TTL: сначала окна лимитов, потом давно не открытые темы. Активный чат продлевает TTL и освобождается последним. Запись истории при этом не останавливается целиком.
 
-`redis-queue` (`REDIS_QUEUE_MAXMEMORY`, по умолчанию 768mb) хранит только очередь. Альбом до 20 МБ уходит в Redis как base64, это около 27 МБ; STT — сырые байты до 20 МБ. При `ARQ_MAX_JOBS=10` одна волна — примерно 270 МБ правок или 200 МБ распознавания, вместе до ~470 МБ. Прежний общий потолок 256mb эту волну не вмещал и начинал выселять лимиты, бюджет, FSM и темы. Результат задачи arq хранится 60 секунд (`keep_result`; дефолт библиотеки — час), бот читает его сразу по завершении. Выселение на очереди роняет payload задачи, а не память чатов.
+`redis-queue` (`REDIS_QUEUE_MAXMEMORY`, по умолчанию 768mb) хранит только очередь. Альбом до 20 МБ уходит в Redis как base64, это около 27 МБ; STT — сырые байты до 20 МБ. При `ARQ_MAX_JOBS=10` одна волна — примерно 270 МБ правок или 200 МБ распознавания, вместе до ~470 МБ. Прежний общий потолок 256mb эту волну не вмещал и начинал выселять лимиты, бюджет, FSM и темы. Результат задачи arq хранится 60 секунд (`keep_result`; дефолт библиотеки — час), бот читает его сразу по завершении. Политика очереди — `noeviction`: при `volatile-ttl` этот ключ на 60 секунд выселялся раньше payload, и бот терял уже оплаченную картинку. Полная память отвергает `enqueue` до платного вызова. Рост `redis_evicted_keys{role="queue"}` при этой политике означает, что инстанс всё же выселяет ключи.
 
 Рост `redis_evicted_keys{role="state"|"queue"}` пишется в лог как `redis_keys_evicted`. Для алерта: `delta(redis_evicted_keys[5m]) > 0`.
 
