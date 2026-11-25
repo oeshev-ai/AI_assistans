@@ -48,12 +48,12 @@ from sentry_sdk.integrations.aiohttp import AioHttpIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 import app.infra.job_queue as job_queue
+from app.bot.telegram_text import TELEGRAM_TEXT_LIMIT, TELEGRAM_TEXT_SAFE
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker, set_billing_user
 from app.infra.health_server import start_health_server
 from app.infra.logging_setup import (
     bind_request_context,
     clear_request_context,
-    configure_logging,
 )
 from app.infra.metrics import note_active_user, observe_message, start_metrics_server
 from app.infra.rate_limiter import rate_limiter
@@ -136,10 +136,8 @@ from app.storage.upload_sessions import (
     set_upload_request_context,
 )
 
-configure_logging()
 logger = structlog.get_logger("TelegramBot")
 
-TELEGRAM_TEXT_LIMIT = 4096
 STREAM_EDIT_INTERVAL = 0.5
 PAGE_SIZE = 10
 WELCOME = (

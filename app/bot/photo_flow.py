@@ -540,6 +540,19 @@ async def _edit(
     decision: PhotoDecision,
     topic_id: str,
 ) -> None:
+    """Ход правки фото. Держит лок чата, как текст и голос."""
+    async with R._chat_turn(turn.message.chat.id):
+        await _edit_locked(turn, media, profile, loaded, decision, topic_id)
+
+
+async def _edit_locked(
+    turn: Any,
+    media: PendingMedia,
+    profile: Any,
+    loaded: list[UserMedia],
+    decision: PhotoDecision,
+    topic_id: str,
+) -> None:
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.consume_image_bucket(user_id, "image_edit"):
@@ -726,6 +739,19 @@ async def _generate_video(
     topic_id: str,
     profile: Any | None = None,
 ) -> None:
+    """Ролик по присланным фото. Держит лок чата, пока ход не записан в историю."""
+    async with R._chat_turn(turn.message.chat.id):
+        await _generate_video_locked(turn, media, loaded, decision, topic_id, profile)
+
+
+async def _generate_video_locked(
+    turn: Any,
+    media: PendingMedia,
+    loaded: list[UserMedia],
+    decision: PhotoDecision,
+    topic_id: str,
+    profile: Any | None = None,
+) -> None:
     """Ролик по присланным фото. Повторный запрос сюда не приходит, пока этот ход жив."""
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
@@ -829,6 +855,19 @@ async def _generate_video(
 
 
 async def _generate(
+    turn: Any,
+    media: PendingMedia,
+    profile: Any,
+    loaded: list[UserMedia],
+    decision: PhotoDecision,
+    topic_id: str,
+) -> None:
+    """Ход генерации по фото. Держит лок чата, как текст и голос."""
+    async with R._chat_turn(turn.message.chat.id):
+        await _generate_locked(turn, media, profile, loaded, decision, topic_id)
+
+
+async def _generate_locked(
     turn: Any,
     media: PendingMedia,
     profile: Any,
@@ -973,18 +1012,14 @@ async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) 
         return
     limit = storage.max_length
     try:
-        await storage.append_message(
+        await storage.append_messages(
             chat_id,
             profile.id,
             topic_id,
-            {"role": "user", "content": user_text},
-            limit,
-        )
-        await storage.append_message(
-            chat_id,
-            profile.id,
-            topic_id,
-            {"role": "assistant", "content": answer},
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": answer},
+            ],
             limit,
         )
     except Exception:
@@ -994,10 +1029,11 @@ async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) 
 async def _text_context(
     storage: Any, chat_id: int, assistant_id: str, topic_id: str
 ) -> list[dict[str, Any]]:
-    try:
-        history = await storage.get_history(chat_id, assistant_id, topic_id)
-    except Exception:
-        return []
+    async with R._chat_turn(chat_id):
+        try:
+            history = await storage.get_history(chat_id, assistant_id, topic_id)
+        except Exception:
+            return []
     texts: list[dict[str, Any]] = []
     if not isinstance(history, list):
         return texts

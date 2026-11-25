@@ -114,7 +114,7 @@ SpeechKit (`TTS_PROVIDER=speechkit`) ходит в Yandex TTS v3 и в эту с
 
 ## Что обязательно в production
 
-Compose сам выставляет `ENVIRONMENT=production`, `REDIS_URL` на сервис `redis` (пароль в percent-encoding), `TRUST_PROXY=1`, health и metrics на `0.0.0.0` внутри контейнера. Наружу порты публикуются только на `127.0.0.1`. Healthcheck бота ходит в `GET /live`. Память контейнеров ограничена: Redis 512 МБ, бот 1536 МБ, воркер 1024 МБ.
+Compose сам выставляет `ENVIRONMENT=production`, `REDIS_URL` на сервис `redis`, `REDIS_QUEUE_URL` на `redis-queue` (пароль в percent-encoding), `TRUST_PROXY=1`, health и metrics на `0.0.0.0` внутри контейнера. Наружу порты публикуются только на `127.0.0.1`. Healthcheck бота ходит в `GET /live`. Память контейнеров: Redis состояния 768 МБ, Redis очереди 1280 МБ, бот 1536 МБ, воркер 1024 МБ.
 
 Бот завершается с `SystemExit`, если в production:
 
@@ -218,7 +218,13 @@ VPS: пользователь `deploy`, каталог `/home/deploy/AI_assistan
 5. Секреты репозитория: `SSH_HOST`, `SSH_USER` (`deploy`), `SSH_PRIVATE_KEY` (отдельный ключ для Actions, pubkey в `authorized_keys` у `deploy`).
 6. Шаг `Deploy over SSH` в `.github/workflows/deploy.yml` включён и сам выбирает профиль: образ воркера подтягивается всегда, контейнер пересоздаётся только пока он `running` или `restarting`.
 
-Redis в Compose: AOF, потолок `REDIS_MAXMEMORY` (по умолчанию 256mb), политика `volatile-ttl`. У тем, персон, FSM (состояние и data, 30 суток с последней записи), бюджета, лимитов и буферов очереди есть срок жизни. Когда память кончается, Redis снимает ключ с самым коротким остатком TTL: сначала окна лимитов и временные payload, потом давно не открытые темы. Активный чат продлевает TTL при обращении и освобождается последним. Запись истории при этом не останавливается целиком. Пароль — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
+Два Redis, оба с AOF и `volatile-ttl`. Пароль один — `REDIS_PASSWORD`; в URL он percent-encoding, пустой пароль не подставляется, иначе клиент arq ломает AUTH.
+
+`redis` (`REDIS_MAXMEMORY`, по умолчанию 512mb) хранит темы, персоны, FSM (состояние и data, 30 суток с последней записи), бюджет и лимиты. При упоре в потолок уходит ключ с самым коротким остатком TTL: сначала окна лимитов, потом давно не открытые темы. Активный чат продлевает TTL и освобождается последним. Запись истории при этом не останавливается целиком.
+
+`redis-queue` (`REDIS_QUEUE_MAXMEMORY`, по умолчанию 768mb) хранит только очередь. Альбом до 20 МБ уходит в Redis как base64, это около 27 МБ; STT — сырые байты до 20 МБ. При `ARQ_MAX_JOBS=10` одна волна — примерно 270 МБ правок или 200 МБ распознавания, вместе до ~470 МБ. Прежний общий потолок 256mb эту волну не вмещал и начинал выселять лимиты, бюджет, FSM и темы. Результат задачи arq хранится 60 секунд (`keep_result`; дефолт библиотеки — час), бот читает его сразу по завершении. Выселение на очереди роняет payload задачи, а не память чатов.
+
+Рост `redis_evicted_keys{role="state"|"queue"}` пишется в лог как `redis_keys_evicted`. Для алерта: `delta(redis_evicted_keys[5m]) > 0`.
 
 ## Метрики
 
@@ -229,7 +235,8 @@ Redis в Compose: AOF, потолок `REDIS_MAXMEMORY` (по умолчанию
 - `llm_daily_budget_remaining_usd` — остаток глобального дневного потолка, если он задан.
 - `provider_fallback_total{from,to,reason}` — уход на запасной провайдер.
 - `api_calls_total`, `api_latency_seconds`, `errors_total` — внешние вызовы, метка `service` равна id провайдера (`polza` или `proxyapi`).
-- `message_processing_seconds`, `active_users`, `redis_memory_bytes`.
+- `message_processing_seconds`, `active_users`, `redis_memory_bytes` — память Redis состояния.
+- `redis_evicted_keys{role}` — сколько ключей Redis уже выселил. `state` — чаты и лимиты, `queue` — медиа очереди. `delta(...[5m]) > 0` значит потолок памяти режет данные.
 
 Логи — JSON structlog. Секреты и пароль в Redis URL в них не пишутся.
 

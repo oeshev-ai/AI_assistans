@@ -57,8 +57,11 @@ async def test_health_server_failure_closes_started_clients(
         created[key] = item
         return item
 
-    async def _init(_url: str) -> None:
-        return None
+    queue_url = "redis://queue:6379/0"
+    seen_queue: dict[str, str] = {}
+
+    async def _init(url: str) -> None:
+        seen_queue["url"] = url
 
     async def _close_jobs() -> None:
         job_closed["ok"] = True
@@ -68,6 +71,7 @@ async def test_health_server_failure_closes_started_clients(
 
     settings = SimpleNamespace(
         redis_url="redis://localhost/0",
+        queue_redis_url=queue_url,
         photo_router_fast_path=False,
         metrics_port=9,
         health_port=9,
@@ -142,6 +146,7 @@ async def test_health_server_failure_closes_started_clients(
     assert created["profiles"].closed
     assert created["pending"].closed
     assert redis.closed
+    assert seen_queue["url"] == queue_url
     assert job_closed["ok"]
     image_task = dispatcher.workflow_data["image_delivery_task"]
     video_task = dispatcher.workflow_data["video_delivery_task"]

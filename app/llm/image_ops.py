@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -1112,7 +1113,7 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        edit_size = self._resolve_edit_size(None, image_bytes)
+        edit_size = await asyncio.to_thread(self._resolve_edit_size, None, image_bytes)
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -1123,7 +1124,9 @@ class ImageOpsMixin(ProviderTransportMixin):
         )
         await cost_tracker.check_budget(estimated=image_cost)
         try:
-            image_bytes, mime_type = self._downscale_edit_input(image_bytes, mime_type)
+            image_bytes, mime_type = await asyncio.to_thread(
+                self._downscale_edit_input, image_bytes, mime_type
+            )
             sanitized = security.sanitize_prompt(prompt.strip())
             edit_background = openai_background(selected_model, None, edit=True)
             body = _image_generation_body(
@@ -1215,7 +1218,7 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        edit_size = self._resolve_edit_size(size, files[0][0])
+        edit_size = await asyncio.to_thread(self._resolve_edit_size, size, files[0][0])
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -1228,7 +1231,9 @@ class ImageOpsMixin(ProviderTransportMixin):
         try:
             scaled: list[tuple[bytes, str, str]] = []
             for raw, name, mime in files:
-                scaled_data, scaled_mime = self._downscale_edit_input(raw, mime)
+                scaled_data, scaled_mime = await asyncio.to_thread(
+                    self._downscale_edit_input, raw, mime
+                )
                 scaled.append((scaled_data, name, scaled_mime))
             polza_size = _OPENAI_SIZE_ALIASES.get(edit_size, edit_size)
             edit_background = openai_background(selected_model, None, edit=True)

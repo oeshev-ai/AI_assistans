@@ -111,3 +111,131 @@ async def test_storage_error_clears_turn_context(
     finally:
         reset_user_media(outer)
         structlog.contextvars.clear_contextvars()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_releases_budget_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[int] = []
+
+    async def _budget(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("redis after hold")
+
+    async def _release(user_id: int | None = None) -> float:
+        released.append(0 if user_id is None else user_id)
+        return 0.0
+
+    monkeypatch.setattr(R.cost_tracker, "check_budget", _budget)
+    monkeypatch.setattr(R.cost_tracker, "release_reservation", _release)
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(user_id=1, chat_id=1)
+    outer = set_user_media(
+        [
+            UserMedia(
+                kind="image",
+                filename="outer.png",
+                mime_type="image/png",
+                data=b"png",
+            )
+        ]
+    )
+    message = _Message()
+    try:
+        with pytest.raises(RuntimeError, match="redis after hold"):
+            await R._process_user_message_locked(
+                message,  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                _Topics(),  # type: ignore[arg-type]
+                _Profiles(fail=False),  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                user_text="привет",
+                user_media=[_clip()],
+            )
+        assert released == [11]
+        assert message.replies == []
+        assert [item.filename for item in get_user_media()] == ["outer.png"]
+        assert get_upload_request_context() is None
+        assert structlog.contextvars.get_contextvars() == {}
+    finally:
+        reset_user_media(outer)
+        structlog.contextvars.clear_contextvars()
+
+
+@pytest.mark.asyncio
+async def test_profile_validation_error_releases_budget_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[int] = []
+
+    async def _budget(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _release(user_id: int | None = None) -> float:
+        released.append(0 if user_id is None else user_id)
+        return 0.0
+
+    class _BrokenProfiles:
+        async def get_active_assistant(self, chat_id: int) -> SimpleNamespace:
+            raise ValueError("битый профиль")
+
+    monkeypatch.setattr(R.cost_tracker, "check_budget", _budget)
+    monkeypatch.setattr(R.cost_tracker, "release_reservation", _release)
+    structlog.contextvars.clear_contextvars()
+    outer = set_user_media([])
+    message = _Message()
+    try:
+        with pytest.raises(ValueError, match="битый профиль"):
+            await R._process_user_message_locked(
+                message,  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                _Topics(),  # type: ignore[arg-type]
+                _BrokenProfiles(),  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                user_text="привет",
+            )
+        assert released == [11]
+        assert get_upload_request_context() is None
+        assert structlog.contextvars.get_contextvars() == {}
+    finally:
+        reset_user_media(outer)
+        structlog.contextvars.clear_contextvars()
+
+
+@pytest.mark.asyncio
+async def test_vision_profile_error_releases_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[int] = []
+
+    async def _budget(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _release(user_id: int | None = None) -> float:
+        released.append(0 if user_id is None else user_id)
+        return 0.0
+
+    class _BrokenProfiles:
+        async def get_active_assistant(self, chat_id: int) -> SimpleNamespace:
+            raise ValueError("битый профиль")
+
+    monkeypatch.setattr(R.cost_tracker, "check_budget", _budget)
+    monkeypatch.setattr(R.cost_tracker, "release_reservation", _release)
+    outer = set_user_media([])
+    message = _Message()
+    try:
+        with pytest.raises(ValueError, match="битый профиль"):
+            await R._process_vision_message_locked(
+                message,  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                _Topics(),  # type: ignore[arg-type]
+                _BrokenProfiles(),  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                multimodal_content=[],
+                history_placeholder="[фото]",
+                user_media=[_clip()],
+            )
+        assert released == [11]
+        assert get_user_media() == []
+    finally:
+        reset_user_media(outer)

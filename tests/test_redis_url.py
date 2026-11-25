@@ -30,8 +30,28 @@ def test_password_is_percent_encoded_and_roundtrips() -> None:
 def test_worker_settings_unquote_password(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.infra.worker import redis_settings
 
+    monkeypatch.delenv("REDIS_QUEUE_URL", raising=False)
     monkeypatch.setenv("REDIS_URL", compose_redis_url("redis", "a/b@c", db=1))
     settings = redis_settings()
     assert settings.password == "a/b@c"
     assert settings.database == 1
     assert settings.host == "redis"
+
+
+def test_queue_url_overrides_state_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.infra.settings import get_settings
+
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("REDIS_QUEUE_URL", "redis://redis-queue:6379/0")
+    assert get_settings().queue_redis_url == "redis://redis-queue:6379/0"
+    assert get_settings().redis_url == "redis://redis:6379/0"
+
+
+def test_worker_keeps_job_result_for_a_minute(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.infra.worker as worker
+
+    monkeypatch.setattr(worker, "_prepare_worker_process", lambda: None)
+    monkeypatch.setattr(worker, "require_valid_settings", lambda: None)
+    monkeypatch.delenv("REDIS_QUEUE_URL", raising=False)
+    settings_cls = worker._worker_settings_class()
+    assert settings_cls.keep_result == 60

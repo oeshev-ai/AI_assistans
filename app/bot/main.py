@@ -54,8 +54,9 @@ from app.infra.access import (
     parse_allowed_user_ids,
     require_redis_password,
 )
+from app.infra.logging_setup import configure_logging
 from app.infra.security import redact_url_credentials
-from app.infra.settings import get_settings, load_project_dotenv
+from app.infra.settings import get_settings, load_project_dotenv, require_valid_settings
 from app.storage.pending_media import PendingMediaStorage, create_pending_media_storage
 
 _SENSITIVE_KEYS = frozenset(
@@ -144,8 +145,8 @@ def warn_polza_user_hash_secret() -> None:
 
 
 # Same horizon as topics and personas. aiogram sets EXPIRE on set_state and
-# set_data. Without a TTL, volatile-ttl never evicts FSM keys, so a full 256mb
-# Redis starts refusing writes.
+# set_data. Without a TTL, volatile-ttl never evicts FSM keys, so a full
+# state Redis starts refusing writes.
 _FSM_TTL_SECONDS = 30 * 24 * 60 * 60
 
 
@@ -234,7 +235,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot) -> None:
             "photo_router_fast_path_enabled",
             hint="Skips LLM router; forces edit at confidence 1.0 — keep 0 in production",
         )
-    await job_queue.init_job_queue(redis_url)
+    await job_queue.init_job_queue(settings.queue_redis_url)
     dispatcher.workflow_data["shared_redis"] = shared_redis
     try:
         topic_storage = await create_topic_storage(TopicConfig.from_env())
@@ -495,6 +496,8 @@ class _ChromeBot(Bot):
 async def main() -> None:
     """Запускает long polling. Токен бота читается из TELEGRAM_BOT_TOKEN."""
     load_project_dotenv()
+    configure_logging()
+    require_valid_settings()
     require_redis_password()
     init_sentry()
     warn_polza_user_hash_secret()

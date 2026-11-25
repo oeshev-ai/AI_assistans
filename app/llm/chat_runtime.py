@@ -271,7 +271,8 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                         continue
                 raise
             return data, provider
-        assert last_exc is not None
+        if last_exc is None:
+            raise RuntimeError("Обход провайдеров закончился без ошибки")
         raise last_exc
 
     async def _iter_chat_with_fallback(
@@ -317,7 +318,8 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                     **{"from": primary.id, "to": fallback.id, "reason": reason},
                 )
                 note_provider_fallback(primary.id, fallback.id, reason)
-        assert last_exc is not None
+        if last_exc is None:
+            raise RuntimeError("Обход провайдеров закончился без ошибки")
         raise last_exc
 
     async def chat_completion(

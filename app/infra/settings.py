@@ -1,8 +1,10 @@
 """Единое чтение переменных окружения приложения.
 
-Имена, значения по умолчанию и разбор живут здесь. Свойства читают
-``os.environ`` в момент обращения, поэтому ``monkeypatch.setenv`` в тестах
-по-прежнему виден. ``load_dotenv`` не перезаписывает уже заданные переменные.
+Имена, значения по умолчанию и разбор живут здесь. До ``require_valid_settings``
+свойства читают ``os.environ`` при обращении, поэтому ``monkeypatch.setenv``
+в тестах виден. После успешной проверки старт замораживает снимок, и горячий
+цикл больше не трогает окружение. ``load_dotenv`` не перезаписывает уже
+заданные переменные и вызывается только со старта процесса, не при импорте.
 
 ``REDIS_MAXMEMORY`` и ``APP_IMAGE`` читает только Compose, их здесь нет.
 ``REDIS_PASSWORD`` нужен процессу: в production пустое значение завершает старт.
@@ -13,7 +15,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import structlog
 from dotenv import load_dotenv
+
+logger = structlog.get_logger("settings")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,7 +50,7 @@ def _choice(name: str, default: str, allowed: set[str]) -> str:
 
 
 def _strict_flag(name: str, default: bool) -> bool:
-    """0/1. Пустая переменная оставляет дефолт, прочий текст — ошибка."""
+    """Пусто — дефолт. Иначе 1/true/yes/on или 0/false/no/off, прочий текст — ошибка."""
     raw = getenv(name)
     if raw is None or not raw.strip():
         return default
@@ -54,20 +59,9 @@ def _strict_flag(name: str, default: bool) -> bool:
         return True
     if cleaned in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{name} должен быть 0 или 1")
-
-
-def _loose_flag(name: str, default: bool) -> bool:
-    """Пусто — дефолт. Иначе истина только для 1/true/yes/on."""
-    raw = getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _legacy_alias_enabled(name: str) -> bool:
-    """Пусто и любой текст кроме 0/false/no оставляют подмену включённой."""
-    return _stripped(name, "1").casefold() not in {"0", "false", "no"}
+    raise ValueError(
+        f"{name}={cleaned!r} должен быть 0/1, true/false, yes/no или on/off"
+    )
 
 
 def _model(name: str, default: str) -> str:
@@ -83,9 +77,11 @@ def _bounded_float(name: str, default: float) -> float:
         return default
     try:
         value = float(raw)
-    except ValueError:
-        return default
-    return min(1.0, max(0.0, value))
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} не число") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name}={value} должен быть от 0 до 1")
+    return value
 
 
 def _non_negative_int(name: str, default: int) -> int:
@@ -94,9 +90,11 @@ def _non_negative_int(name: str, default: int) -> int:
         return default
     try:
         value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 0 else default
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} не целое число") from exc
+    if value < 0:
+        raise ValueError(f"{name}={value} должен быть не меньше 0")
+    return value
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -105,9 +103,11 @@ def _positive_int(name: str, default: int) -> int:
         return default
     try:
         value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} не целое число") from exc
+    if value <= 0:
+        raise ValueError(f"{name}={value} должен быть больше 0")
+    return value
 
 
 def _positive_float(name: str, default: float) -> float:
@@ -116,13 +116,15 @@ def _positive_float(name: str, default: float) -> float:
         return default
     try:
         value = float(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} не число") from exc
+    if value <= 0:
+        raise ValueError(f"{name}={value} должен быть больше 0")
+    return value
 
 
 def _optional_float(name: str, default: float) -> float:
-    """Пустое или нечисловое значение — дефолт. Ноль и отрицательные остаются."""
+    """Пустое значение — дефолт. Ноль и отрицательные остаются, опечатка падает."""
     from app.infra.envparse import env_float
 
     return env_float(name, default)
@@ -135,7 +137,13 @@ def _optional_int(name: str, default: int) -> int:
 
 
 class Settings:
-    """Снимок не кэшируется: каждое свойство читает окружение заново."""
+    """До заморозки свойства читают окружение, после — только снимок."""
+
+    def __getattribute__(self, name: str) -> object:
+        snapshot = _snapshot
+        if snapshot is not None and name in snapshot:
+            return snapshot[name]
+        return object.__getattribute__(self, name)
 
     @property
     def redis_url(self) -> str:
@@ -149,6 +157,12 @@ class Settings:
     def worker_redis_url(self) -> str:
         """arq без ``REDIS_URL`` смотрит на локальный Redis, бот — нет."""
         return _stripped("REDIS_URL", "redis://localhost:6379/0")
+
+    @property
+    def queue_redis_url(self) -> str:
+        """Redis очереди: payload, задачи и результаты. Пусто — тот же, что у бота."""
+        raw = _stripped("REDIS_QUEUE_URL")
+        return raw or self.worker_redis_url
 
     @property
     def topic_ttl_days(self) -> str:
@@ -192,7 +206,7 @@ class Settings:
 
     @property
     def photo_router_fast_path(self) -> bool:
-        return _stripped("PHOTO_ROUTER_FAST_PATH", "0") == "1"
+        return _strict_flag("PHOTO_ROUTER_FAST_PATH", False)
 
     @property
     def photo_confirm_mode(self) -> str:
@@ -213,12 +227,7 @@ class Settings:
 
     @property
     def max_album_total_mb(self) -> int:
-        raw = _stripped("MAX_ALBUM_TOTAL_MB", "20")
-        try:
-            value = int(raw)
-        except ValueError:
-            value = 20
-        return value if value >= 1 else 20
+        return _positive_int("MAX_ALBUM_TOTAL_MB", 20)
 
     @property
     def photo_pending_ttl_seconds(self) -> int:
@@ -226,7 +235,7 @@ class Settings:
 
     @property
     def arq_enabled(self) -> bool:
-        return _stripped("ARQ_ENABLED").lower() in {"1", "true", "yes", "on"}
+        return _strict_flag("ARQ_ENABLED", False)
 
     @property
     def health_bind(self) -> str | None:
@@ -312,7 +321,7 @@ class Settings:
 
     @property
     def polza_allow_upstream_fallbacks(self) -> bool:
-        return _loose_flag("POLZA_ALLOW_UPSTREAM_FALLBACKS", False)
+        return _strict_flag("POLZA_ALLOW_UPSTREAM_FALLBACKS", False)
 
     @property
     def polza_upstream_only(self) -> tuple[str, ...]:
@@ -430,7 +439,7 @@ class Settings:
 
     @property
     def image_legacy_aliases(self) -> bool:
-        return _legacy_alias_enabled("IMAGE_LEGACY_ALIASES")
+        return _strict_flag("IMAGE_LEGACY_ALIASES", True)
 
     @property
     def image_bucket_capacity(self) -> float:
@@ -449,15 +458,11 @@ class Settings:
 
     @property
     def text_legacy_aliases(self) -> bool:
-        return _legacy_alias_enabled("TEXT_LEGACY_ALIASES")
+        return _strict_flag("TEXT_LEGACY_ALIASES", True)
 
     @property
     def tts_legacy_aliases(self) -> bool:
-        return _legacy_alias_enabled("TTS_LEGACY_ALIASES")
-
-    @property
-    def image_legacy_aliases_strict(self) -> bool:
-        return _strict_flag("IMAGE_LEGACY_ALIASES", True)
+        return _strict_flag("TTS_LEGACY_ALIASES", True)
 
     @property
     def video_model(self) -> str:
@@ -522,16 +527,11 @@ class Settings:
 
     @property
     def trust_proxy(self) -> bool:
-        return _stripped("TRUST_PROXY").lower() in {"1", "true", "yes", "on"}
+        return _strict_flag("TRUST_PROXY", False)
 
     @property
     def upload_legacy_presign(self) -> bool:
-        return _stripped("UPLOAD_LEGACY_PRESIGN", "0").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        return _strict_flag("UPLOAD_LEGACY_PRESIGN", False)
 
     @property
     def cost_chat_input_per_1k(self) -> float:
@@ -591,11 +591,42 @@ class Settings:
 
 
 _SETTINGS = Settings()
+_snapshot: dict[str, object] | None = None
 
 
 def get_settings() -> Settings:
-    """Общий объект настроек. Значения не замораживаются."""
+    """Общий объект настроек. После старта отдаёт замороженный снимок."""
     return _SETTINGS
 
 
-load_project_dotenv()
+def reset_settings_cache() -> None:
+    """Сбрасывает снимок. Нужен тестам между проверками окружения."""
+    global _snapshot
+    _snapshot = None
+
+
+def require_valid_settings() -> None:
+    """Читает все настройки один раз. Опечатка завершает процесс до polling.
+
+    Успешный проход замораживает значения: дальнейшие обращения не читают
+    ``os.environ``.
+    """
+    global _snapshot
+    previous = _snapshot
+    _snapshot = None
+    settings = get_settings()
+    loaded: dict[str, object] = {}
+    problems: list[str] = []
+    for name, attr in vars(Settings).items():
+        if not isinstance(attr, property):
+            continue
+        try:
+            loaded[name] = getattr(settings, name)
+        except ValueError as exc:
+            problems.append(str(exc))
+    if problems:
+        _snapshot = previous
+        for item in problems:
+            logger.error("invalid_setting", error=item)
+        raise SystemExit(1)
+    _snapshot = loaded

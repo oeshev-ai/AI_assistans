@@ -9,25 +9,22 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # volatile-ttl: у каждого ключа приложения есть EXPIRE (темы, персоны, FSM,
-    # бюджеты, лимиты, тела очереди). При упоре в потолок Redis первым выселяет
-    # ключ с наименьшим остатком TTL. Активные чаты обновляют TTL при записи,
-    # поэтому уходят последними. noeviction при заполненных 256mb отвергал
-    # любую запись, в том числе новую строку истории.
-    # REDIS_MAXMEMORY — число и единица (256mb, 1gb). Необязательный
-    # REDIS_PASSWORD → requirepass (тот же пароль в REDIS_URL бота и воркера).
+    # Состояние бота: темы, персоны, FSM, бюджет, лимиты. Медиа очереди здесь нет.
+    # volatile-ttl снимает ключ с самым коротким остатком TTL. noeviction при
+    # заполнении отвергал любую запись, включая новую строку истории.
+    # REDIS_MAXMEMORY — число и единица (512mb, 1gb). Пароль общий с redis-queue.
     # Потолок контейнера выше maxmemory: AOF и фрагментация, но не память VPS.
-    mem_limit: 512m
-    memswap_limit: 512m
+    mem_limit: 768m
+    memswap_limit: 768m
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-256mb}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-512mb}
     command:
       - /bin/sh
       - -c
       - |
         set -e
-        MEM="$${REDIS_MAXMEMORY:-256mb}"
+        MEM="$${REDIS_MAXMEMORY:-512mb}"
         case "$$MEM" in
           ''|*[!0-9A-Za-z]*)
             echo "invalid REDIS_MAXMEMORY: $$MEM" >&2
@@ -51,6 +48,46 @@ services:
       timeout: 5s
       retries: 5
 
+  # Payload правки (~27 МБ base64 на альбом 20 МБ), байты STT (до 20 МБ)
+  # и результаты arq. Отдельный инстанс: выселение здесь не трогает FSM и бюджет.
+  # 10 задач: 10×27 МБ + 10×20 МБ ≈ 470 МБ, плюс результаты 60 с. 256 МБ это не держат.
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 1280m
+    memswap_limit: 1280m
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_MAXMEMORY: ${REDIS_QUEUE_MAXMEMORY:-768mb}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        MEM="$${REDIS_MAXMEMORY:-768mb}"
+        case "$$MEM" in
+          ''|*[!0-9A-Za-z]*)
+            echo "invalid REDIS_MAXMEMORY: $$MEM" >&2
+            exit 1
+            ;;
+        esac
+        ARGS="--appendonly yes --maxmemory $$MEM --maxmemory-policy volatile-ttl"
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          ARGS="$$ARGS --requirepass $$REDIS_PASSWORD"
+        fi
+        exec redis-server $$ARGS
+    volumes:
+      - redis_queue_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'if [ -n "$$REDIS_PASSWORD" ]; then REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping; else redis-cli ping; fi',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   bot:
     <<: *app
     restart: unless-stopped
@@ -61,6 +98,7 @@ services:
       # percent-encoding, пустой пароль без userinfo (redis://:@host ломает arq).
       # Пустой REDIS_PASSWORD при ENVIRONMENT=production завершает процесс бота.
       REDIS_HOST: redis
+      REDIS_QUEUE_HOST: redis-queue
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ENVIRONMENT: production
       # Держать в соответствии с .env: одного профиля worker недостаточно.
@@ -93,6 +131,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      redis-queue:
+        condition: service_healthy
 
   # Необязательно: docker compose --profile arq up -d (и ARQ_ENABLED=1 в .env)
   worker:
@@ -102,6 +142,7 @@ services:
       - .env
     environment:
       REDIS_HOST: redis
+      REDIS_QUEUE_HOST: redis-queue
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       ARQ_ENABLED: "1"
       ENVIRONMENT: production
@@ -112,6 +153,8 @@ services:
     profiles: ["arq"]
     depends_on:
       redis:
+        condition: service_healthy
+      redis-queue:
         condition: service_healthy
 
   redis-backup:
@@ -134,3 +177,4 @@ services:
 
 volumes:
   redis_data:
+  redis_queue_data:

@@ -62,6 +62,39 @@ DEFAULT_ALLOWED_MIME = (
     "video/x-matroska",
 )
 
+# Запас на boundary и заголовки multipart, чтобы Content-Length чуть выше
+# файла на лимите не отвергался заранее.
+_MULTIPART_FRAMING_BYTES = 64 * 1024
+_UPLOAD_CHUNK = 1024 * 1024
+
+
+async def _copy_until_limit(field: Any, dest: Any, max_bytes: int) -> tuple[int, bool]:
+    """Копирует поле, пока оно в лимите. Хвост после превышения не читает."""
+    size = 0
+    while True:
+        chunk = await field.read_chunk(size=_UPLOAD_CHUNK)
+        if not chunk:
+            return size, False
+        size += len(chunk)
+        if size > max_bytes:
+            return size, True
+        dest.write(chunk)
+
+
+def _payload_too_large(request: web.Request, limit_mb: int) -> web.Response:
+    """413 и закрытие сокета. Иначе aiohttp дочитывает тело lingering_time секунд."""
+    protocol = request.protocol
+    if protocol is not None:
+        protocol._lingering_time = 0.0
+    response = web.json_response(
+        {"error": f"Файл больше {limit_mb} МБ"},
+        status=413,
+        headers={"Connection": "close"},
+    )
+    response.force_close()
+    return response
+
+
 ALLOWED_EXTENSIONS = (
     ".mp3",
     ".m4a",
@@ -306,7 +339,7 @@ def _page_html(upload_id: str, max_mb: int) -> str:
             try {{ payload = JSON.parse(xhr.responseText || '{{}}'); }} catch (_e) {{}}
             if (xhr.status >= 200 && xhr.status < 300) resolve(payload);
             else if (xhr.status === 413) {{
-              reject(new Error('Файл слишком большой для nginx (нужен client_max_body_size 512m)'));
+              reject(new Error((payload && payload.error) || 'Файл слишком большой'));
             }} else {{
               reject(new Error((payload && payload.error) || ('Ошибка загрузки (' + xhr.status + ')')));
             }}
@@ -399,16 +432,16 @@ def setup_upload_routes(
             )
             raise redirect
         html = _page_html(upload_id, storage.config.max_upload_mb)
-        page = web.Response(text=html, content_type="text/html", charset="utf-8")
+        response = web.Response(text=html, content_type="text/html", charset="utf-8")
         if not request.cookies.get(_COOKIE_NAME):
             max_age = max(60, int(session.expires_at - time.time()))
             _set_upload_cookie(
-                page,
+                response,
                 session.token,
                 max_age=max_age,
                 secure=_request_is_https(request),
             )
-        return page
+        return response
 
     async def presign(request: web.Request) -> web.Response:
         limited = await _upload_rate_limited(request, write=True)
@@ -588,6 +621,10 @@ def setup_upload_routes(
         size = 0
         too_large = False
         try:
+            declared = request.content_length
+            if declared is not None and declared > max_bytes + _MULTIPART_FRAMING_BYTES:
+                await _release_claim()
+                return _payload_too_large(request, storage.config.max_upload_mb)
             try:
                 reader = await request.multipart()
                 field = await reader.next()
@@ -629,24 +666,11 @@ def setup_upload_routes(
                 delete=False, suffix=Path(file_name).suffix
             ) as tmp:
                 tmp_path = tmp.name
-                while True:
-                    chunk = await field.read_chunk(size=1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > max_bytes:
-                        too_large = True
-                        # Дочитываем тело, иначе клиент видит обрыв (xhr.onerror).
-                        continue
-                    if not too_large:
-                        tmp.write(chunk)
+                size, too_large = await _copy_until_limit(field, tmp, max_bytes)
 
             if too_large:
                 await _release_claim()
-                return web.json_response(
-                    {"error": f"Файл больше {storage.config.max_upload_mb} МБ"},
-                    status=400,
-                )
+                return _payload_too_large(request, storage.config.max_upload_mb)
             if size <= 0:
                 await _release_claim()
                 return web.json_response({"error": "Пустой файл"}, status=400)

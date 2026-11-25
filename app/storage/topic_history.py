@@ -91,6 +91,17 @@ def _dump_message(message: dict[str, Any]) -> str:
         raise TopicStorageError("Сообщение истории нельзя записать в JSON.") from exc
 
 
+def _stored_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Проверяет пачку до записи, чтобы сбой посередине не оставлял половину раунда."""
+    stored: list[dict[str, Any]] = []
+    for message in messages:
+        loaded = _load_message(_dump_message(message))
+        if loaded is None:
+            raise TopicStorageError("Сообщение истории нельзя сохранить.")
+        stored.append(loaded)
+    return stored
+
+
 def _load_message(raw: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(raw)
@@ -188,6 +199,24 @@ class TopicHistoryStorage(ABC):
         max_length: int,
     ) -> None:
         """Добавляет сообщение в тему и обрезает историю до ``max_length``."""
+
+    async def append_messages(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        topic_id: str,
+        messages: list[dict[str, Any]],
+        max_length: int,
+    ) -> None:
+        """Добавляет реплики одним изменением истории.
+
+        Раунд ``assistant.tool_calls`` + ``tool`` + ответ не должен быть виден
+        наполовину: чужой ход иначе получит 400 от провайдера.
+        """
+        for message in messages:
+            await self.append_message(
+                chat_id, assistant_id, topic_id, message, max_length
+            )
 
     @abstractmethod
     async def clear_topic(self, chat_id: int, assistant_id: str, topic_id: str) -> None:
@@ -309,15 +338,27 @@ class InMemoryTopicStorage(TopicHistoryStorage):
         message: dict[str, Any],
         max_length: int,
     ) -> None:
+        await self.append_messages(
+            chat_id, assistant_id, topic_id, [message], max_length
+        )
+
+    async def append_messages(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        topic_id: str,
+        messages: list[dict[str, Any]],
+        max_length: int,
+    ) -> None:
         self._check_open()
+        if not messages:
+            return
         chat = self._chat(chat_id, assistant_id)
         if topic_id not in chat.names:
             raise TopicStorageError("Тема не найдена.")
-        loaded = _load_message(_dump_message(message))
-        if loaded is None:
-            raise TopicStorageError("Сообщение истории нельзя сохранить.")
+        loaded = _stored_messages(messages)
         bucket = chat.histories.setdefault(topic_id, [])
-        bucket.append(loaded)
+        bucket.extend(loaded)
         chat.histories[topic_id] = trim_messages(bucket, max_length)
         logger.info(
             "Память: chat_id=%s topic_id=%s всего=%s",
@@ -752,16 +793,31 @@ class RedisTopicStorage(TopicHistoryStorage):
         message: dict[str, Any],
         max_length: int,
     ) -> None:
-        loaded = _load_message(_dump_message(message))
-        if loaded is None:
-            raise TopicStorageError("Сообщение истории нельзя сохранить.")
+        await self.append_messages(
+            chat_id, assistant_id, topic_id, [message], max_length
+        )
+
+    async def append_messages(
+        self,
+        chat_id: int,
+        assistant_id: str,
+        topic_id: str,
+        messages: list[dict[str, Any]],
+        max_length: int,
+    ) -> None:
+        if not messages:
+            return
+        loaded = _stored_messages(messages)
 
         def mutate(current: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            return trim_messages([*current, loaded], max_length)
+            return trim_messages([*current, *loaded], max_length)
 
         await self._update_history(chat_id, assistant_id, topic_id, mutate)
         logger.info(
-            "Redis: добавлено сообщение chat_id=%s topic_id=%s", chat_id, topic_id
+            "Redis: добавлено сообщений chat_id=%s topic_id=%s count=%s",
+            chat_id,
+            topic_id,
+            len(loaded),
         )
 
     async def clear_topic(self, chat_id: int, assistant_id: str, topic_id: str) -> None:

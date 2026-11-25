@@ -56,6 +56,16 @@ _PROVIDER_ENV = (
 
 
 @pytest.fixture(autouse=True)
+def _reset_settings_snapshot():
+    """Снимок настроек не должен переживать тест."""
+    from app.infra.settings import reset_settings_cache
+
+    reset_settings_cache()
+    yield
+    reset_settings_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Локальный ``.env`` разработчика не должен менять маршруты в тестах."""
     for name in _PROVIDER_ENV:

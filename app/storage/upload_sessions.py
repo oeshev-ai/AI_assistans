@@ -185,11 +185,13 @@ class UploadSessionStore:
         from_statuses: set[str],
         updates: dict[str, Any] | None,
     ) -> UploadSession | None:
-        assert self._redis is not None
+        redis = self._redis
+        if redis is None:
+            raise RuntimeError("Redis сессий загрузки не подключён")
         key = f"{_REDIS_PREFIX}{upload_id}"
         for _ in range(8):
             try:
-                async with self._redis.pipeline(transaction=True) as pipe:
+                async with redis.pipeline(transaction=True) as pipe:
                     await pipe.watch(key)
                     raw = await pipe.get(key)
                     if not raw:

@@ -59,3 +59,48 @@ async def test_overlapping_turns_share_one_lock_then_drop_it() -> None:
     await waiting
     assert order == ["first-in", "first-out", "second-in"]
     assert runtime._chat_turn_locks == {}
+
+
+@pytest.mark.parametrize("entry", ["_edit", "_generate", "_generate_video"])
+async def test_photo_branch_holds_the_chat_lock(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from app.bot import photo_flow
+
+    order: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def body(*_args: object, **_kwargs: object) -> None:
+        order.append("photo-in")
+        started.set()
+        await release.wait()
+        order.append("photo-out")
+
+    monkeypatch.setattr(photo_flow, f"{entry}_locked", body)
+    turn = SimpleNamespace(message=SimpleNamespace(chat=SimpleNamespace(id=9)))
+
+    async def text() -> None:
+        async with runtime._chat_turn(9):
+            order.append("text-in")
+
+    photo = asyncio.create_task(
+        getattr(photo_flow, entry)(turn, None, None, None, None, "topic")
+    )
+    await started.wait()
+    waiting = asyncio.create_task(text())
+    for _ in range(50):
+        gate = runtime._chat_turn_locks.get(9)
+        if gate is not None and gate.users == 2:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("текстовый ход не встал в очередь за фото")
+
+    assert order == ["photo-in"]
+    release.set()
+    await photo
+    await waiting
+    assert order == ["photo-in", "photo-out", "text-in"]
