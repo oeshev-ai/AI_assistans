@@ -891,9 +891,7 @@ async def generate(
             and not _items(payload)
             and known_media_id is not None
         ):
-            logger.info(
-                "polza_media_async", media_id=known_media_id, status=status
-            )
+            logger.info("polza_media_async", media_id=known_media_id, status=status)
             try:
                 payload = await _poll(
                     client,

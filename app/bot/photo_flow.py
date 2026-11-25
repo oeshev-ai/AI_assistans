@@ -778,8 +778,10 @@ async def _generate_video(
                 saved = await note_failed_video(
                     media.chat_id, user_id, source, filename
                 )
-            text = VIDEO_KEEP_TEXT if saved else (
-                "Ролик готов, но отправить его в чат не удалось."
+            text = (
+                VIDEO_KEEP_TEXT
+                if saved
+                else ("Ролик готов, но отправить его в чат не удалось.")
             )
             if not await _reply_failure(message, text):
                 status_error = text
@@ -945,9 +947,7 @@ async def _generate(
     except AssistAIError as exc:
         from app.bot.image_retry import image_failure_reply
 
-        text = await image_failure_reply(
-            media.chat_id, user_id, exc, as_file=as_file
-        )
+        text = await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
         if not await _reply_failure(message, text):
             status_error = text
     except Exception:
