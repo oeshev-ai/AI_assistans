@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import httpx
 import structlog
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import BufferedInputFile
 
 from app.llm.errors import AssistAIError
@@ -253,7 +253,7 @@ async def _send_bytes(bot: Bot, chat_id: int, raw: bytes, filename: str) -> None
             caption=VIDEO_LATE_CAPTION,
             request_timeout=180,
         )
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramNetworkError):
         await bot.send_document(
             chat_id,
             BufferedInputFile(raw, filename=filename),

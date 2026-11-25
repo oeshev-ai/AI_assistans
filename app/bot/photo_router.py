@@ -34,7 +34,12 @@ ROUTER_SYSTEM = """Ты маршрутизатор фото. Определи н
 Референсы (reference_indexes) — ОТКУДА берём элементы.
 Порядок в альбоме роли не задаёт. Индексы с нуля: фото 1 = 0.
 
-Примеры:
+Одно фото (доступно 1): base_index=0, reference_indexes всегда [].
+Одно и то же фото нельзя указать и как основу, и как референс.
+«нарисуй такое же», «сделай копию», «повтори», «как на фото» при одном
+снимке → generate, base_index=0, reference_indexes=[].
+
+Несколько фото:
 - «костюм с фото 1 надень на человека с фото 2» → base_index=1, reference_indexes=[0]
 - «лицо с фото 1 замени лицом с фото 2» → base_index=1, reference_indexes=[0]
 - «предмет с фото 1 помести на фото 2» → base_index=1, reference_indexes=[0]
@@ -164,6 +169,7 @@ def guard_decision(
         if not decision.question_ru:
             return decision.model_copy(update={"question_ru": _UNCLEAR})
         return decision
+    decision = _normalize_roles(decision, count)
     if decision.confidence < min_confidence:
         return _unclear(decision, "Уточните, что сделать с фото.")
     if decision.intent == "video":
@@ -186,6 +192,48 @@ def guard_decision(
             return _unclear(decision, "Не понял, какое фото основа, а какое пример.")
         seen.add(index)
     return decision
+
+
+def _normalize_roles(decision: PhotoDecision, count: int) -> PhotoDecision:
+    """Чинит самоссылки роутера: одно фото не бывает и основой, и референсом.
+
+    Модель часто ставит ``reference_indexes=[0]`` при одном снимке («копия»,
+    «такое же»). Без правки guard спрашивает про основу и сбрасывает альбом.
+    """
+    if count < 1 or decision.intent in {"unclear", "chat"}:
+        return decision
+    updates: dict[str, Any] = {}
+    if decision.intent in {"edit", "generate"}:
+        base = decision.base_index
+        if count == 1 and (base is None or not 0 <= base < count):
+            updates["base_index"] = 0
+            base = 0
+        elif base is not None and not 0 <= base < count:
+            base = None
+        cleaned: list[int] = []
+        seen: set[int] = set()
+        # Один снимок — только основа; при нескольких выкидываем самоссылки.
+        source = [] if count == 1 else decision.reference_indexes
+        for index in source:
+            if index < 0 or index >= count or index == base or index in seen:
+                continue
+            seen.add(index)
+            cleaned.append(index)
+        if cleaned != list(decision.reference_indexes):
+            updates["reference_indexes"] = cleaned
+    elif decision.intent == "video":
+        cleaned_video: list[int] = []
+        seen_video: set[int] = set()
+        for index in decision.reference_indexes:
+            if index < 0 or index >= count or index in seen_video:
+                continue
+            seen_video.add(index)
+            cleaned_video.append(index)
+        if cleaned_video != list(decision.reference_indexes):
+            updates["reference_indexes"] = cleaned_video
+    if not updates:
+        return decision
+    return decision.model_copy(update=updates)
 
 
 def _unclear(decision: PhotoDecision, question: str) -> PhotoDecision:

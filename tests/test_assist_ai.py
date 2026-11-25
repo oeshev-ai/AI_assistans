@@ -538,7 +538,7 @@ async def test_image_model_scope_used_when_tool_omits_model(
 async def test_image_size_scope_used_when_tool_omits_size(
     assist_client: AssistAIClient,
 ) -> None:
-    """Размер персоны подставляется, если инструмент вызван без size."""
+    """Размер персоны доходит до генерации и не затирается аргументом инструмента."""
     seen: dict[str, str | None] = {}
     sizes: list[str] = []
 
@@ -561,8 +561,33 @@ async def test_image_size_scope_used_when_tool_omits_size(
 
     assert explicit["status"] == "success"
     assert scoped["status"] == "success"
-    assert sizes == ["1K", "2K"]
+    assert sizes == ["2K", "2K"]
     assert seen["model"] == "black-forest-labs/flux-3-image"
+
+
+@pytest.mark.asyncio
+async def test_persona_openai_size_reaches_generate_despite_tool_default(
+    assist_client: AssistAIClient,
+) -> None:
+    """Кнопка 1024x1792 не подменяется дефолтом схемы 1024x1024."""
+    sizes: list[str] = []
+
+    async def _fake_generate(
+        prompt: str,
+        model: str | None = None,
+        size: str = "1024x1024",
+        background: str | None = None,
+    ) -> list[str]:
+        sizes.append(size)
+        return ["https://cdn.example/cat.png"]
+
+    assist_client.generate_image = _fake_generate  # type: ignore[method-assign]
+    tool = assist_client._tools_registry["generate_image"]
+    with ImageModelScope("openai/gpt-image-2.6-flare", "1024x1792"):
+        payload = json.loads(await tool.execute(prompt="маяк", size="1024x1024"))
+
+    assert payload["status"] == "success"
+    assert sizes == ["1024x1792"]
 
 
 @pytest.mark.asyncio

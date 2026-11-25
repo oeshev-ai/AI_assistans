@@ -39,6 +39,27 @@ def test_openai_size_aliases_stay_valid() -> None:
     assert _size_ok("openai/gpt-image-2.6-flare", "1024x1536")
 
 
+def test_preset_card_marks_vision_on_the_text_model() -> None:
+    from types import SimpleNamespace
+
+    from app.bot.screens.presets import _preset_preview_parts
+
+    assistant = SimpleNamespace(
+        config=SimpleNamespace(
+            default_text_model="openai/gpt-6-luna",
+            default_image_model="openai/gpt-image-2.6-flare",
+            default_tts_model="openai/gpt-4o-mini-tts",
+        )
+    )
+    helper = get_preset("helper")
+    eco = get_preset("eco")
+    assert helper is not None and eco is not None
+    helper_text, _markup = _preset_preview_parts(helper, assistant)  # type: ignore[arg-type]
+    eco_text, _markup = _preset_preview_parts(eco, assistant)  # type: ignore[arg-type]
+    assert "Vision: +" in helper_text
+    assert "Vision: +" in eco_text
+
+
 def test_helper_generates_on_flux_klein() -> None:
     preset = get_preset("helper")
     assert preset is not None

@@ -516,12 +516,14 @@ class GenerateVideoTool(BaseTool):
 
         bucket = _outbound()
         if bucket is not None:
+            source = video.source_url if isinstance(video.source_url, str) else None
             bucket.add(
                 OutboundMedia(
                     kind="video",
                     filename=video.filename,
                     mime_type=video.mime_type,
                     data=video.data,
+                    url=source,
                 )
             )
         sent = 0 if references is None else len(references)

@@ -133,9 +133,10 @@ ImageModelFamily = Literal["openai", "flux", "qwen", "seedream", "recraft", "ban
 class ImageModelScope:
     """На время запроса подставляет image-модель персоны и собирает картинки.
 
-    Если модель сама передала ``model`` или ``size``, её значение важнее.
-    Пустая строка означает дефолт клиента. Размер без явного ``size``
-    берётся из персоны, а если его нет — ``1024x1024``.
+    Если модель сама передала ``model``, её значение важнее.
+    Размер персоны важнее аргумента ``size`` инструмента: выбор в настройках
+    должен дойти до провайдера. Пустой размер персоны оставляет аргумент
+    инструмента, а если его нет — ``1024x1024``.
     Байты и URL из ``generate_image`` копятся в ``images`` и не уходят
     обратно в контекст текстовой модели.
     """
@@ -230,10 +231,8 @@ class GenerateImageTool(BaseTool):
                 "size": {
                     "type": "string",
                     "description": (
-                        "Размер. OpenAI — пиксели (1024x1024). "
-                        "FLUX/Seedream — ярус 1K или 2K (пиксели тоже принимаются). "
-                        "Qwen/Recraft — соотношение сторон 1:1, 16:9, 9:16. "
-                        "По умолчанию 1024x1024."
+                        "Не передавай. Размер берётся из настроек персоны. "
+                        "Аргумент используется только если в настройках размера нет."
                     ),
                 },
             },
@@ -257,13 +256,15 @@ class GenerateImageTool(BaseTool):
             )
         if model is not None and not isinstance(model, str):
             return _error_json("Параметр model должен быть строкой.")
-        if raw_size is None:
-            scoped = _REQUEST_IMAGE_SIZE.get()
-            size = scoped if isinstance(scoped, str) and scoped.strip() else "1024x1024"
+        scoped = _REQUEST_IMAGE_SIZE.get()
+        if isinstance(scoped, str) and scoped.strip():
+            size = scoped.strip()
+        elif raw_size is None:
+            size = "1024x1024"
         elif not isinstance(raw_size, str) or not raw_size.strip():
             return _error_json("Параметр size должен быть строкой, например 1024x1024.")
         else:
-            size = raw_size
+            size = raw_size.strip()
         selected_model = (
             model.strip() if isinstance(model, str) and model.strip() else None
         )

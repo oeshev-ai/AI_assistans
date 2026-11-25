@@ -61,13 +61,29 @@ async def test_garbage_retries_once_then_unclear() -> None:
 
 @pytest.mark.asyncio
 async def test_out_of_range_and_low_confidence_become_unclear() -> None:
-    far = _Router(
+    # Одно фото: несуществующий base_index просто становится 0.
+    far_single = _Router(
         [
             '{"intent":"edit","base_index":4,"instruction_en":"x",'
             '"confidence":0.9,"reference_indexes":[]}'
         ]
     )
-    decision = await decide(far, _images(), "правь")  # type: ignore[arg-type]
+    fixed = await decide(far_single, _images(), "правь")  # type: ignore[arg-type]
+    assert fixed.intent == "edit"
+    assert fixed.base_index == 0
+
+    # Несколько фото: номер вне альбома — уточнение.
+    far_multi = _Router(
+        [
+            '{"intent":"edit","base_index":4,"instruction_en":"x",'
+            '"confidence":0.9,"reference_indexes":[]}'
+        ]
+    )
+    decision = await decide(  # type: ignore[arg-type]
+        far_multi,
+        [{"data": b"a", "mime": "image/png"}, {"data": b"b", "mime": "image/png"}],
+        "правь",
+    )
     assert decision.intent == "unclear"
 
     shy = _Router(
@@ -128,6 +144,76 @@ def test_guard_accepts_video_without_a_base_photo() -> None:
     )
     assert decision.intent == "video"
     assert decision.base_index is None
+
+
+def test_guard_drops_self_reference_on_single_photo_copy() -> None:
+    """Роутер часто ставит base=0 и refs=[0] на «сделай копию» одного фото."""
+    decision = guard_decision(
+        PhotoDecision(
+            intent="generate",
+            base_index=0,
+            reference_indexes=[0],
+            edit_type="style_transfer",
+            instruction_en="draw the same image",
+            instruction_ru="нарисуй такое же",
+            confidence=0.9,
+        ),
+        1,
+        0.55,
+    )
+    assert decision.intent == "generate"
+    assert decision.base_index == 0
+    assert decision.reference_indexes == []
+
+
+def test_guard_fills_base_and_clears_refs_for_one_photo() -> None:
+    decision = guard_decision(
+        PhotoDecision(
+            intent="edit",
+            base_index=None,
+            reference_indexes=[0],
+            instruction_en="make a copy",
+            confidence=0.95,
+        ),
+        1,
+        0.55,
+    )
+    assert decision.intent == "edit"
+    assert decision.base_index == 0
+    assert decision.reference_indexes == []
+
+
+def test_guard_strips_self_ref_but_keeps_other_refs() -> None:
+    decision = guard_decision(
+        PhotoDecision(
+            intent="edit",
+            base_index=1,
+            reference_indexes=[0, 1],
+            instruction_en="put suit from image 1 on person",
+            confidence=0.9,
+        ),
+        2,
+        0.55,
+    )
+    assert decision.intent == "edit"
+    assert decision.base_index == 1
+    assert decision.reference_indexes == [0]
+
+
+@pytest.mark.asyncio
+async def test_single_photo_copy_survives_router_self_ref() -> None:
+    router = _Router(
+        [
+            '{"intent":"generate","base_index":0,"edit_type":"style_transfer",'
+            '"instruction_en":"draw the same","instruction_ru":"копия",'
+            '"confidence":0.92,"reference_indexes":[0]}'
+        ]
+    )
+    decision = await decide(router, _images(), "нарисуй такое же")  # type: ignore[arg-type]
+    assert decision.intent == "generate"
+    assert decision.base_index == 0
+    assert decision.reference_indexes == []
+    assert decision.confidence >= 0.55
 
 
 @pytest.mark.asyncio
@@ -258,7 +344,9 @@ async def test_photo_video_sends_the_photos_as_references(
             self.texts.append(text)
             return SimpleNamespace(message_id=1)
 
-        async def answer_video(self, *, video: Any) -> SimpleNamespace:
+        async def answer_video(
+            self, *, video: Any, request_timeout: int | None = None
+        ) -> SimpleNamespace:
             payload = video.data
             self.videos.append(
                 payload if isinstance(payload, bytes) else payload.read()
@@ -391,7 +479,9 @@ async def test_photo_video_keeps_router_reference_subset(
         async def answer(self, text: str) -> SimpleNamespace:
             return SimpleNamespace(message_id=1)
 
-        async def answer_video(self, *, video: Any) -> SimpleNamespace:
+        async def answer_video(
+            self, *, video: Any, request_timeout: int | None = None
+        ) -> SimpleNamespace:
             return SimpleNamespace(message_id=2)
 
     class _Assistant:

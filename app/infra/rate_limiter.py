@@ -19,8 +19,6 @@ logger = structlog.get_logger("rate_limiter")
 
 TEXT_LIMIT = 10
 TEXT_WINDOW_SECONDS = 60.0
-IMAGE_LIMIT = 5
-IMAGE_WINDOW_SECONDS = 3600.0
 MEDIA_LIMIT = 10
 MEDIA_WINDOW_SECONDS = 3600.0
 # HTTP загрузки нет в Telegram-лимите: страница и POST идут снаружи бота.
@@ -106,7 +104,7 @@ _IMAGE_BUCKET_OPS = frozenset({"image_generate", "image_edit"})
 
 
 class RateLimiter:
-    """Sliding-window limiter for LLM text and image generation.
+    """Sliding window for text and media. Images use a token bucket.
 
     When a Redis client is attached, counters survive process restarts.
     Otherwise an in-memory deque is used (single-process only).
@@ -116,7 +114,6 @@ class RateLimiter:
         self._redis: Any | None = None
         self._lock = asyncio.Lock()
         self._text_hits: dict[int, deque[float]] = defaultdict(deque)
-        self._image_hits: dict[int, deque[float]] = defaultdict(deque)
         self._media_hits: dict[int, deque[float]] = defaultdict(deque)
         self._upload_hits: dict[str, dict[str, deque[float]]] = defaultdict(
             lambda: defaultdict(deque)
@@ -138,15 +135,6 @@ class RateLimiter:
             operation="text",
             limit=TEXT_LIMIT,
             window=TEXT_WINDOW_SECONDS,
-        )
-
-    async def check_image_limit(self, user_id: int) -> bool:
-        """Legacy sliding window. Image entry points use ``consume_image_bucket``."""
-        return await self._allow(
-            user_id,
-            operation="image",
-            limit=IMAGE_LIMIT,
-            window=IMAGE_WINDOW_SECONDS,
         )
 
     async def consume_image_bucket(self, user_id: int, operation: str) -> bool:
@@ -249,7 +237,7 @@ class RateLimiter:
         elif operation == "media":
             window, limit = MEDIA_WINDOW_SECONDS, MEDIA_LIMIT
         else:
-            window, limit = IMAGE_WINDOW_SECONDS, IMAGE_LIMIT
+            raise ValueError(f"unknown rate limit operation {operation}")
         now = time.time()
 
         if self._redis is not None:
@@ -503,7 +491,7 @@ class RateLimiter:
             return self._text_hits[user_id]
         if operation == "media":
             return self._media_hits[user_id]
-        return self._image_hits[user_id]
+        raise ValueError(f"unknown rate limit operation {operation}")
 
     def _drop_hits(self, user_id: int, operation: str) -> None:
         if operation == "text":
@@ -511,7 +499,7 @@ class RateLimiter:
         elif operation == "media":
             store = self._media_hits
         else:
-            store = self._image_hits
+            raise ValueError(f"unknown rate limit operation {operation}")
         store.pop(user_id, None)
 
     def _sweep_expired(self, now: float) -> None:
@@ -520,10 +508,6 @@ class RateLimiter:
             self._prune(hits, now, TEXT_WINDOW_SECONDS)
             if not hits:
                 self._text_hits.pop(user_id, None)
-        for user_id, hits in list(self._image_hits.items()):
-            self._prune(hits, now, IMAGE_WINDOW_SECONDS)
-            if not hits:
-                self._image_hits.pop(user_id, None)
         for user_id, hits in list(self._media_hits.items()):
             self._prune(hits, now, MEDIA_WINDOW_SECONDS)
             if not hits:

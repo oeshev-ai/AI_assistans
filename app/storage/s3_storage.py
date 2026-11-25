@@ -193,6 +193,27 @@ class S3Storage:
             )
             raise S3StorageError("Не удалось загрузить объект") from exc
 
+    async def upload_bytes(
+        self, *, object_key: str, data: bytes, content_type: str
+    ) -> None:
+        """Кладёт уже полученные байты в бакет. Локальный файл не нужен."""
+
+        def _put() -> None:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=object_key,
+                Body=data,
+                ContentType=content_type,
+            )
+
+        try:
+            await asyncio.to_thread(_put)
+        except _storage_error_types() as exc:
+            logger.exception(
+                "s3_upload_bytes_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось загрузить объект") from exc
+
     async def head_object(self, object_key: str) -> dict[str, Any]:
         def _head() -> dict[str, Any]:
             return self._client.head_object(Bucket=self.config.bucket, Key=object_key)

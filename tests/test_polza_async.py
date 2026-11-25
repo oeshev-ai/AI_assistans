@@ -218,3 +218,34 @@ async def test_client_async_then_completed_records_cost_rub(
         )
         images = await client.generate_image("постер", model=_MODEL, size="1536x1024")
     assert images[0].startswith("https://s3.polza.ai/")
+
+
+@pytest.mark.asyncio
+async def test_create_sends_async_true_and_poll_network_keeps_job(
+    polza_fixture: Callable[[str], dict[str, Any]], sleeps: list[float]
+) -> None:
+    """Короткий async-create + id: обрыв poll не теряет оплаченную задачу."""
+    pending = polza_fixture("async_pending")
+    with respx.mock(assert_all_called=False) as router:
+        create = router.post(_MEDIA_URL).mock(
+            return_value=httpx.Response(200, json=pending)
+        )
+        router.get(f"{_BASE}/v1/media/{pending['id']}").mock(
+            side_effect=httpx.RemoteProtocolError("server disconnected")
+        )
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(AssistAIError) as info:
+                await generate(
+                    client,
+                    make_polza_provider(),
+                    model=_MODEL,
+                    prompt="x",
+                    poll_interval=0.0,
+                    total_wait=1.0,
+                )
+    sent = __import__("json").loads(create.calls[0].request.content)
+    assert sent["async"] is True
+    assert info.value.job_committed is True
+    assert info.value.pending_job_id == pending["id"]
+    assert info.value.pending_provider == "polza"
+    assert fallback_reason(info.value, paid_side_effect=True) is None

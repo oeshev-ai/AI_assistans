@@ -581,6 +581,7 @@ async def _edit(
     status = await _status(turn, "Правлю изображение…")
     token = set_user_media(ordered)
     kept_file_id: str | None = None
+    status_error: str | None = None
     try:
         import app.infra.job_queue as job_queue
 
@@ -597,7 +598,8 @@ async def _edit(
                         size=None,
                     )
             except BudgetExceededError as exc:
-                await message.answer(exc.message)
+                if not await _reply_failure(message, exc.message):
+                    status_error = exc.message
                 return
             except AssistAIError as exc:
                 if "несколько изображений" in exc.message:
@@ -608,11 +610,11 @@ async def _edit(
                     )
                 from app.bot.image_retry import image_failure_reply
 
-                await message.answer(
-                    await image_failure_reply(
-                        media.chat_id, user_id, exc, as_file=as_file
-                    )
+                text = await image_failure_reply(
+                    media.chat_id, user_id, exc, as_file=as_file
                 )
+                if not await _reply_failure(message, text):
+                    status_error = text
                 return
         kept_file_id, delivery_error = await _deliver_images(
             message, result, as_file=as_file
@@ -620,11 +622,11 @@ async def _edit(
         if delivery_error is not None:
             from app.bot.image_retry import image_failure_reply
 
-            await message.answer(
-                await image_failure_reply(
-                    media.chat_id, user_id, delivery_error, as_file=as_file
-                )
+            text = await image_failure_reply(
+                media.chat_id, user_id, delivery_error, as_file=as_file
             )
+            if not await _reply_failure(message, text):
+                status_error = text
             return
         logger.info("edit_image_done", count=len(result), base_index=base)
         fallback = f"Готово. Основа — фото {base + 1}."
@@ -650,9 +652,12 @@ async def _edit(
                 fallback=fallback,
             )
         except BudgetExceededError as exc:
-            await message.answer(exc.message)
+            if not await _reply_failure(message, exc.message):
+                status_error = exc.message
             return
-        await message.answer(reply)
+        if not await _reply_failure(message, reply):
+            status_error = reply
+            return
         await _remember_pair(
             turn,
             topic_id,
@@ -663,8 +668,10 @@ async def _edit(
     finally:
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
-        await _drop_status(turn, status)
-        await _settle_album(turn, media, kept_file_id)
+        try:
+            await _close_status(turn, status, error_text=status_error)
+        finally:
+            await _settle_album(turn, media, kept_file_id)
 
 
 def video_references(
@@ -720,8 +727,6 @@ async def _generate_video(
     profile: Any | None = None,
 ) -> None:
     """Ролик по присланным фото. Повторный запрос сюда не приходит, пока этот ход жив."""
-    from aiogram.types import BufferedInputFile
-
     message = turn.message
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not await rate_limiter.check_media_limit(user_id):
@@ -749,6 +754,7 @@ async def _generate_video(
         turn, "Запускаю ролик по этим фото. Это займёт несколько минут."
     )
     delivered = False
+    status_error: str | None = None
     try:
         settings = video_settings_from(profile)
         video = await turn.assistant.generate_video(
@@ -760,40 +766,36 @@ async def _generate_video(
             generate_audio=settings.generate_audio,
         )
         filename = video.filename or "video.mp4"
-        payload = BufferedInputFile(video.data, filename=filename)
         try:
-            await message.answer_video(video=payload)
+            await R._answer_video_bytes(message, video.data, filename)
         except Exception:
             logger.exception("photo_video_send_failed", chat_id=media.chat_id)
-            try:
-                await message.answer_document(
-                    document=BufferedInputFile(video.data, filename=filename)
-                )
-            except Exception:
-                logger.exception("photo_video_document_failed", chat_id=media.chat_id)
-                from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
+            from app.bot.video_retry import VIDEO_KEEP_TEXT, note_failed_video
 
-                source = getattr(video, "source_url", None)
-                saved = False
-                if isinstance(source, str) and source:
-                    saved = await note_failed_video(
-                        media.chat_id, user_id, source, filename
-                    )
-                if saved:
-                    await message.answer(VIDEO_KEEP_TEXT)
-                else:
-                    await message.answer(
-                        "Ролик готов, но отправить его в чат не удалось."
-                    )
-                return
+            source = getattr(video, "source_url", None)
+            saved = False
+            if isinstance(source, str) and source:
+                saved = await note_failed_video(
+                    media.chat_id, user_id, source, filename
+                )
+            text = (
+                VIDEO_KEEP_TEXT
+                if saved
+                else ("Ролик готов, но отправить его в чат не удалось.")
+            )
+            if not await _reply_failure(message, text):
+                status_error = text
+            return
         delivered = True
-        await message.answer("Ролик готов.")
-        await _remember_pair(
-            turn,
-            topic_id,
-            f"[Альбом: {len(loaded)} фото] {decision.instruction_ru or media.caption}".strip(),
-            "Ролик готов.",
-        )
+        if await _reply_failure(message, "Ролик готов."):
+            await _remember_pair(
+                turn,
+                topic_id,
+                f"[Альбом: {len(loaded)} фото] {decision.instruction_ru or media.caption}".strip(),
+                "Ролик готов.",
+            )
+        else:
+            status_error = "Ролик готов."
         logger.info(
             "photo_video_done",
             chat_id=media.chat_id,
@@ -801,22 +803,29 @@ async def _generate_video(
             photo_numbers=photo_numbers,
         )
     except BudgetExceededError as exc:
-        await message.answer(exc.message)
+        if not await _reply_failure(message, exc.message):
+            status_error = exc.message
     except AssistAIError as exc:
         from app.bot.video_retry import video_failure_reply
 
-        await message.answer(await video_failure_reply(media.chat_id, user_id, exc))
+        text = await video_failure_reply(media.chat_id, user_id, exc)
+        if not await _reply_failure(message, text):
+            status_error = text
     except Exception:
         logger.exception("photo_video_failed", chat_id=media.chat_id)
-        await message.answer("Ролик запустить не удалось.")
+        text = "Ролик запустить не удалось."
+        if not await _reply_failure(message, text):
+            status_error = text
     finally:
         await cost_tracker.release_reservation(user_id)
-        await _drop_status(turn, status)
-        if delivered:
-            await _release_album(turn, media, None)
-        else:
-            await _restore_album(turn, media)
-        await R._reset_flow(turn.state)
+        try:
+            await _close_status(turn, status, error_text=status_error)
+        finally:
+            if delivered:
+                await _release_album(turn, media, None)
+            else:
+                await _restore_album(turn, media)
+            await R._reset_flow(turn.state)
 
 
 async def _generate(
@@ -855,6 +864,8 @@ async def _generate(
     status = await _status(turn, "Рисую изображение…")
     token = set_user_media(loaded)
     kept_file_id: str | None = None
+    status_error: str | None = None
+    as_file = False
     try:
         import app.infra.job_queue as job_queue
 
@@ -891,11 +902,11 @@ async def _generate(
         if delivery_error is not None:
             from app.bot.image_retry import image_failure_reply
 
-            await message.answer(
-                await image_failure_reply(
-                    media.chat_id, user_id, delivery_error, as_file=as_file
-                )
+            text = await image_failure_reply(
+                media.chat_id, user_id, delivery_error, as_file=as_file
             )
+            if not await _reply_failure(message, text):
+                status_error = text
             return
         fallback = "Готово. Это новое изображение по вашему фото."
         user_prompt = (
@@ -918,9 +929,12 @@ async def _generate(
                 fallback=fallback,
             )
         except BudgetExceededError as exc:
-            await message.answer(exc.message)
+            if not await _reply_failure(message, exc.message):
+                status_error = exc.message
             return
-        await message.answer(reply)
+        if not await _reply_failure(message, reply):
+            status_error = reply
+            return
         await _remember_pair(
             turn,
             topic_id,
@@ -928,18 +942,26 @@ async def _generate(
             reply,
         )
     except BudgetExceededError as exc:
-        await message.answer(exc.message)
+        if not await _reply_failure(message, exc.message):
+            status_error = exc.message
     except AssistAIError as exc:
         from app.bot.image_retry import image_failure_reply
 
-        await message.answer(
-            await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
-        )
+        text = await image_failure_reply(media.chat_id, user_id, exc, as_file=as_file)
+        if not await _reply_failure(message, text):
+            status_error = text
+    except Exception:
+        logger.exception("photo_generate_failed", chat_id=media.chat_id)
+        text = "Не удалось создать изображение."
+        if not await _reply_failure(message, text):
+            status_error = text
     finally:
         await cost_tracker.release_reservation(user_id)
         reset_user_media(token)
-        await _drop_status(turn, status)
-        await _settle_album(turn, media, kept_file_id)
+        try:
+            await _close_status(turn, status, error_text=status_error)
+        finally:
+            await _settle_album(turn, media, kept_file_id)
 
 
 async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) -> None:
@@ -1024,7 +1046,36 @@ async def _status(turn: Any, text: str) -> Any:
 async def _drop_status(turn: Any, status: Any) -> None:
     if status is None:
         return
-    await R._delete_bot_message(status)
+    try:
+        await R._delete_bot_message(status)
+    except Exception:
+        logger.info("photo_status_drop_failed", chat_id=turn.message.chat.id)
+
+
+async def _close_status(
+    turn: Any, status: Any, *, error_text: str | None = None
+) -> None:
+    """Снимает статус или заменяет его текстом ошибки, если ответ в чат не ушёл."""
+    if status is None:
+        return
+    if error_text:
+        try:
+            await status.edit_text(error_text)
+            await R._append_chrome(turn.state, [status.message_id])
+            return
+        except Exception:
+            logger.info("photo_status_edit_failed", chat_id=turn.message.chat.id)
+    await _drop_status(turn, status)
+
+
+async def _reply_failure(message: Any, text: str) -> bool:
+    """True, если текст ошибки дошёл до чата."""
+    try:
+        await message.answer(text)
+        return True
+    except Exception:
+        logger.warning("photo_failure_reply_failed", chat_id=message.chat.id)
+        return False
 
 
 def _turn(

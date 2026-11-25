@@ -58,7 +58,7 @@ SpeechKit (`TTS_PROVIDER=speechkit`) ходит в Yandex TTS v3 и в эту с
 - `openai/gpt-image-2.6-flare` — `aspect_ratio` и пиксельный `size`. Поле `image_resolution` этот id не принимает (HTTP 400). Точная сетка нестандартной пропорции может отличаться от запрошенной. Прежнее поведение ProxyAPI: `IMAGE_PROVIDER=proxyapi`.
 - FLUX, Qwen и Nano Banana — `aspect_ratio` и `image_resolution`, без `quality`.
 - `qwen/qwen-image-2.1-pro` на Polza уходит как `qwen/image-2.1`.
-- Референсы — base64. Статус асинхронной задачи — только `GET /v1/media/{id}`.
+- Референсы — base64. Create всегда с `async: true`, статус — только `GET /v1/media/{id}` (иначе обрыв sync-POST теряет оплаченный файл без id).
 - Апстрим картинок пиннится `POLZA_UPSTREAM_ONLY` (по умолчанию `OpenAI`). Потолок цены — `POLZA_MAX_PRICE_IMAGE_RUB` (0 снимает потолок). Для token pricing поле `max_price.image` не отправляется: Polza отвечает 400.
 - Бот скачивает результат и отдаёт в Telegram байтами. Ссылка провайдера в чат не уходит.
 
