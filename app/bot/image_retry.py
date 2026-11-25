@@ -141,6 +141,16 @@ def _stop_retry(exc: AssistAIError) -> bool:
     return code in _STOP_CODES or code.startswith("GUARD_")
 
 
+def _has_arq(record: ImageDelivery) -> bool:
+    return any(job.get("provider") == "arq" for job in record.jobs)
+
+
+def _due_records(records: list[ImageDelivery], now: float) -> list[ImageDelivery]:
+    return [
+        record for record in records if record.expired(now) or record.not_before <= now
+    ]
+
+
 async def deliver_due(
     bot: Bot,
     store: ImageDeliveryStore,
@@ -148,16 +158,87 @@ async def deliver_due(
     *,
     resume: Resume | None = None,
     now: float | None = None,
+    records: list[ImageDelivery] | None = None,
 ) -> None:
-    """Одна проходка: просроченные закрыть, подошедшие скачать и отправить."""
+    """Одна проходка: просроченные закрыть, подошедшие скачать и отправить.
+
+    ``records`` — уже прочитанный индекс. Иначе чтение делает ``store.due``.
+    """
     moment = delivery_clock() if now is None else now
-    for record in await store.due(moment):
+    found = (
+        _due_records(records, moment)
+        if records is not None
+        else await store.due(moment)
+    )
+    for record in found:
         if record.expired(moment):
             await _notify(bot, record.chat_id, IMAGE_EXPIRED_TEXT)
             await store.delete(record.chat_id, record.user_id)
             logger.info("image_delivery_expired", chat_id=record.chat_id)
             continue
         await _deliver_record(bot, store, download, record, moment, resume)
+
+
+async def image_delivery_tick(
+    bot: Bot,
+    store: ImageDeliveryStore,
+    download: Download,
+    *,
+    resume: Resume | None = None,
+    now: float | None = None,
+) -> None:
+    """Индекс читается один раз: arq-задачи, затем подошедшие ссылки.
+
+    Без arq-задач опрос не начинается. Выключенная очередь тоже не ходит
+    в Redis за результатом: живые arq-задачи закрываются отказом.
+    """
+    moment = delivery_clock() if now is None else now
+    records = await store.indexed()
+    live = [
+        record for record in records if not record.expired(moment) and _has_arq(record)
+    ]
+    if not live:
+        await deliver_due(
+            bot, store, download, resume=resume, now=moment, records=records
+        )
+        return
+    from app.infra.job_queue import is_queue_enabled
+
+    if is_queue_enabled():
+        await promote_arq_image_jobs(bot, store, records=live, now=moment)
+    else:
+        await _refuse_arq_without_queue(bot, store, live, moment)
+    await deliver_due(bot, store, download, resume=resume, now=moment, records=records)
+
+
+async def _refuse_arq_without_queue(
+    bot: Bot,
+    store: ImageDeliveryStore,
+    records: list[ImageDelivery],
+    now: float,
+) -> None:
+    """Очередь выключена: arq-задачу больше не у кого спросить."""
+    from app.infra.job_queue import arq_queue_unavailable
+
+    exc = arq_queue_unavailable()
+    for record in records:
+        kept: list[dict[str, str]] = []
+        stopped = False
+        for job in record.jobs:
+            if job.get("provider") != "arq":
+                kept.append(job)
+                continue
+            stopped = True
+            await _notify(bot, record.chat_id, exc.message)
+            logger.info(
+                "image_delivery_arq_stopped",
+                chat_id=record.chat_id,
+                error_code=exc.error_code,
+            )
+        if not stopped:
+            continue
+        record.jobs = kept
+        await store.save(record, now=now)
 
 
 async def image_delivery_loop(
@@ -173,8 +254,7 @@ async def image_delivery_loop(
     stopper = stop or asyncio.Event()
     while not stopper.is_set():
         try:
-            await promote_arq_image_jobs(bot, store)
-            await deliver_due(bot, store, download, resume=resume)
+            await image_delivery_tick(bot, store, download, resume=resume)
         except Exception:
             logger.exception("image_delivery_tick_failed")
         try:
@@ -328,17 +408,80 @@ def _next_image_name(index: int) -> str:
     return f"image_{index + 1}.png"
 
 
-async def promote_arq_image_jobs(bot: Bot, store: ImageDeliveryStore) -> None:
-    """Забирает URL у готовой arq-задачи, пока ключ результата ещё жив.
+async def _hand_off_image_bytes(
+    bot: Bot,
+    record: ImageDelivery,
+    payloads: list[tuple[bytes, str]],
+    *,
+    as_file: bool,
+) -> bool:
+    """Отдаёт байты в чат. False — файл не ушёл и копия в бакет не легла.
 
-    Обычный повтор ждёт минуту и больше. ``keep_result`` картинки короче этого
-    окна, поэтому опрос идёт на каждом тике цикла, не дожидаясь ``not_before``.
+    Пока ключ результата в Redis жив, задача остаётся и следующий тик
+    повторит отправку. В бакете картинок нет: те же 7 дней, что у озвучки,
+    вид отправки — документ.
+    """
+    from app.bot.file_retry import keep_paid_bytes
+
+    pending = False
+    index = len(record.filenames)
+    for raw, mime in payloads:
+        filename = _next_image_name(index)
+        index += 1
+        try:
+            await _send_bytes(
+                bot,
+                record.chat_id,
+                raw,
+                filename,
+                as_file=as_file,
+            )
+        except Exception:
+            logger.exception("image_delivery_send_failed", chat_id=record.chat_id)
+            saved = await keep_paid_bytes(
+                record.chat_id,
+                record.user_id,
+                raw,
+                filename,
+                kind="document",
+                mime=mime or "image/png",
+            )
+            if not saved:
+                pending = True
+                logger.warning(
+                    "image_delivery_bytes_unkept",
+                    chat_id=record.chat_id,
+                    bytes=len(raw),
+                )
+            continue
+        logger.info(
+            "image_delivery_sent",
+            chat_id=record.chat_id,
+            bytes=len(raw),
+        )
+    return not pending
+
+
+async def promote_arq_image_jobs(
+    bot: Bot,
+    store: ImageDeliveryStore,
+    *,
+    records: list[ImageDelivery] | None = None,
+    now: float | None = None,
+) -> None:
+    """Забирает готовую картинку у arq, пока ключ результата ещё жив.
+
+    URL остаётся в очереди скачивания. base64 декодируется и уходит в чат
+    байтами. Обычный повтор ждёт минуту и больше. ``keep_result`` картинки
+    короче этого окна, поэтому опрос идёт на каждом тике, не дожидаясь
+    ``not_before``. ``records`` — уже прочитанный индекс, без второго обхода.
     """
     from app.infra.job_queue import poll_arq_image_urls
 
-    now = delivery_clock()
-    for record in await store.active(now):
-        if not any(job.get("provider") == "arq" for job in record.jobs):
+    moment = delivery_clock() if now is None else now
+    loaded = records if records is not None else await store.active(moment)
+    for record in loaded:
+        if record.expired(moment) or not _has_arq(record):
             continue
         kept: list[dict[str, str]] = []
         added = False
@@ -349,7 +492,7 @@ async def promote_arq_image_jobs(bot: Bot, store: ImageDeliveryStore) -> None:
                 kept.append(job)
                 continue
             try:
-                urls = await poll_arq_image_urls(job["id"])
+                ready = await poll_arq_image_urls(job["id"])
             except AssistAIError as exc:
                 stopped = True
                 await _notify(bot, record.chat_id, exc.message)
@@ -359,24 +502,28 @@ async def promote_arq_image_jobs(bot: Bot, store: ImageDeliveryStore) -> None:
                     error_code=exc.error_code,
                 )
                 continue
-            if urls is None:
+            if ready is None:
                 kept.append(job)
                 continue
             as_file = job.get("as_file") == "1"
-            for url in urls:
+            for url in ready.urls:
                 if url in record.urls:
                     continue
                 flags.append(as_file)
                 record.urls.append(url)
                 record.filenames.append(_next_image_name(len(record.filenames)))
                 added = True
+            if not await _hand_off_image_bytes(
+                bot, record, ready.payloads, as_file=as_file
+            ):
+                kept.append(job)
         if kept == record.jobs and not added and not stopped:
             continue
         record.jobs = kept
         record.as_files = flags
         if added:
-            record.not_before = now
-        await store.save(record, now=now)
+            record.not_before = moment
+        await store.save(record, now=moment)
 
 
 async def _notify(bot: Bot, chat_id: int, text: str) -> None:

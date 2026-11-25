@@ -324,7 +324,8 @@ def _worker_settings_class() -> type:
         max_tries = 1
         job_timeout = get_settings().arq_job_timeout
         # Дефолт arq — час. TTS и STT читаются сразу, в Redis им не место.
-        # Картинки переопределяют срок в ``functions``: цикл доставки забирает URL.
+        # Картинки переопределяют срок в ``functions``: цикл доставки забирает
+        # URL или base64.
         keep_result = 60
 
     return WorkerSettings

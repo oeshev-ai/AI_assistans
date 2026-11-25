@@ -234,7 +234,9 @@ async def _deliver_images(
 ) -> tuple[str | None, AssistAIError | None]:
     """Отправляет пачку. Уже отправленный file_id сохраняется, если следующая упала.
 
-    Повторный flood control не обрывает остальные кадры.
+    Короткий flood ждётся внутри отправки. Длинный кладёт уже скачанные байты
+    в бакет и не обрывает остальные кадры. Сюда ``TelegramRetryAfter`` доходит,
+    только если бакет кадр не принял.
     """
     from aiogram.exceptions import TelegramRetryAfter
 

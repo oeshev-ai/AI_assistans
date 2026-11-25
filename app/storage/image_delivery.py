@@ -221,16 +221,20 @@ class InMemoryImageDeliveryStore:
         current.as_files.append(as_file)
         return True
 
+    async def indexed(self) -> list[ImageDelivery]:
+        """Все записи индекса, включая просроченные и ещё не подошедшие."""
+        return list(self._items.values())
+
     async def due(self, now: float) -> list[ImageDelivery]:
-        found: list[ImageDelivery] = []
-        for record in self._items.values():
-            if record.expired(now) or record.not_before <= now:
-                found.append(record)
-        return found
+        return [
+            record
+            for record in await self.indexed()
+            if record.expired(now) or record.not_before <= now
+        ]
 
     async def active(self, now: float) -> list[ImageDelivery]:
         """Живые записи, в том числе те, чей повтор ещё не подошёл."""
-        return [record for record in self._items.values() if not record.expired(now)]
+        return [record for record in await self.indexed() if not record.expired(now)]
 
     async def save(self, record: ImageDelivery, *, now: float) -> None:
         if record.expired(now) or (not record.urls and not record.jobs):
@@ -317,18 +321,8 @@ class RedisImageDeliveryStore:
 
         return await self._update(chat_id, user_id, now, merge)
 
-    async def due(self, now: float) -> list[ImageDelivery]:
-        found: list[ImageDelivery] = []
-        for record in await self._indexed():
-            if record.expired(now) or record.not_before <= now:
-                found.append(record)
-        return found
-
-    async def active(self, now: float) -> list[ImageDelivery]:
-        """Живые записи, в том числе те, чей повтор ещё не подошёл."""
-        return [record for record in await self._indexed() if not record.expired(now)]
-
-    async def _indexed(self) -> list[ImageDelivery]:
+    async def indexed(self) -> list[ImageDelivery]:
+        """Все записи индекса одним проходом: ``SMEMBERS`` и чтение ключей."""
         try:
             keys = await await_redis(self._redis.smembers(_INDEX_KEY))
         except RedisError:
@@ -354,6 +348,17 @@ class RedisImageDeliveryStore:
                 continue
             found.append(record)
         return found
+
+    async def due(self, now: float) -> list[ImageDelivery]:
+        return [
+            record
+            for record in await self.indexed()
+            if record.expired(now) or record.not_before <= now
+        ]
+
+    async def active(self, now: float) -> list[ImageDelivery]:
+        """Живые записи, в том числе те, чей повтор ещё не подошёл."""
+        return [record for record in await self.indexed() if not record.expired(now)]
 
     async def save(self, record: ImageDelivery, *, now: float) -> None:
         key = self._key(record.chat_id, record.user_id)
