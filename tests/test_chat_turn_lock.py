@@ -104,3 +104,39 @@ async def test_photo_branch_holds_the_chat_lock(
     await photo
     await waiting
     assert order == ["photo-in", "photo-out", "text-in"]
+
+
+@pytest.mark.asyncio
+async def test_text_context_reads_while_the_chat_lock_is_held() -> None:
+    from app.bot import photo_flow
+
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with runtime._chat_turn(9):
+            held.set()
+            await release.wait()
+
+    task = asyncio.create_task(holder())
+    await held.wait()
+
+    class _Storage:
+        async def get_history(
+            self, chat_id: int, assistant_id: str, topic_id: str
+        ) -> list[dict[str, str]]:
+            return [{"role": "user", "content": "сделай ярче"}, {"role": "tool"}]
+
+    try:
+        texts = await asyncio.wait_for(
+            photo_flow._text_context(_Storage(), 9, "persona", "topic"),
+            timeout=1,
+        )
+        gate = runtime._chat_turn_locks.get(9)
+        assert gate is not None and gate.users == 1
+    finally:
+        release.set()
+        await task
+
+    assert texts == [{"role": "user", "content": "сделай ярче"}]
+    assert runtime._chat_turn_locks == {}

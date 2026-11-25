@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from aiogram.exceptions import TelegramRetryAfter
+
 import app.bot.screens as screens
 from app.bot import models as M
 from app.bot.constants import (
@@ -541,10 +543,23 @@ async def _deliver_text(message: Message, payload: str) -> bool:
     return True
 
 
+async def _retry_after_flood(send: Callable[[], Awaitable[Any]]) -> Any:
+    """429: пауза ``retry_after`` и один повтор того же вызова."""
+    try:
+        return await send()
+    except TelegramRetryAfter as exc:
+        logger.warning("Flood control Telegram, пауза %s с", exc.retry_after)
+        await asyncio.sleep(exc.retry_after)
+        return await send()
+
+
 async def _answer_chunk(message: Message, chunk: str) -> bool:
     try:
-        await message.answer(chunk)
+        await _retry_after_flood(lambda: message.answer(chunk))
         return True
+    except TelegramRetryAfter as exc:
+        logger.warning("Повтор после flood control не прошёл: %s", exc)
+        return False
     except TelegramBadRequest as exc:
         if not _message_too_long(exc):
             logger.warning("Не удалось отправить сообщение: %s", exc)
@@ -559,7 +574,10 @@ async def _answer_halved(message: Message, chunk: str) -> bool:
     if not shorter or shorter == chunk:
         return False
     try:
-        await message.answer(shorter)
+        await _retry_after_flood(lambda: message.answer(shorter))
+    except TelegramRetryAfter as exc:
+        logger.warning("Повтор после flood control не прошёл: %s", exc)
+        return False
     except TelegramBadRequest as exc:
         logger.warning("Повторная отправка отклонена: %s", exc)
         return False
@@ -590,7 +608,10 @@ async def _edit_stream(status: Message, text: str, previous: str) -> str:
     if not visible or visible == previous:
         return previous
     try:
-        await status.edit_text(visible)
+        await _retry_after_flood(lambda: status.edit_text(visible))
+    except TelegramRetryAfter as exc:
+        logger.warning("Повтор после flood control не прошёл: %s", exc)
+        return previous
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
             return previous

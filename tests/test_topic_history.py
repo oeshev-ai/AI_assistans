@@ -21,6 +21,10 @@ from app.storage.topic_history import (
 _T = TypeVar("_T")
 
 
+async def test_append_messages_is_abstract() -> None:
+    assert "append_messages" in TopicHistoryStorage.__abstractmethods__
+
+
 async def _await_redis(value: Awaitable[_T] | _T) -> _T:
     """fakeredis/redis-py: ответ может быть и значением, и awaitable."""
     if isinstance(value, Awaitable):

@@ -12,6 +12,12 @@ permissions:
   contents: read
   packages: write
 
+# Два зелёных CI не выкладываются одновременно: второй ждёт, пока первый
+# закончит SSH. Отмена посередине up оставила бы VPS на полусобранном стеке.
+concurrency:
+  group: deploy-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     if: >-
@@ -20,6 +26,7 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -60,6 +67,14 @@ jobs:
           script: |
             set -e
             cd /home/deploy/AI_assistans
+            image='${{ steps.image.outputs.name }}:${{ github.event.workflow_run.head_sha }}'
+            if [ ! -f .env ]; then
+              printf 'APP_IMAGE=%s\n' "$image" > .env
+            elif grep -q '^APP_IMAGE=' .env; then
+              sed -i "s|^APP_IMAGE=.*|APP_IMAGE=${image}|" .env
+            else
+              printf '\nAPP_IMAGE=%s\n' "$image" >> .env
+            fi
             docker compose --profile arq pull
             update_worker=0
             for id in $(docker compose --profile arq ps -aq worker); do

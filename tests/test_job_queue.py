@@ -322,3 +322,77 @@ async def test_staged_payload_ttl_ignores_depth_errors(
             raise ConnectionError("redis down")
 
     assert await job_queue._staged_payload_ttl(Pool()) == 600
+
+
+def test_queue_redis_refuses_writes_instead_of_evicting() -> None:
+    from pathlib import Path
+
+    text = Path("docker-compose.yml").read_text(encoding="utf-8")
+    state, _, queue = text.partition("\n  redis-queue:")
+    assert "--maxmemory-policy volatile-ttl" in state
+    assert "--maxmemory-policy noeviction" in queue
+    assert "--maxmemory-policy volatile-ttl" not in queue
+
+
+@pytest.mark.asyncio
+async def test_missing_result_is_not_a_long_wait() -> None:
+    import asyncio
+
+    from arq.jobs import ResultNotFound
+
+    from app.llm.errors import AssistAIError
+
+    class Job:
+        job_id = "job-lost"
+
+        async def result(self, timeout: float) -> list[str]:
+            raise ResultNotFound("arq:result missing")
+
+        async def status(self) -> str:
+            raise AssertionError("пропавший результат не нужно ждать до таймаута")
+
+    with pytest.raises(AssistAIError, match="не сохранился") as caught:
+        await job_queue._await_job_result(Job(), 450.0, task="generate_image_task")
+    assert caught.value.error_code == "QUEUE_RESULT_LOST"
+    assert caught.value.job_committed is True
+    assert not isinstance(caught.value.__cause__, asyncio.TimeoutError)
+
+
+@pytest.mark.asyncio
+async def test_timeout_while_job_is_queued_is_still_running() -> None:
+
+    from app.llm.errors import AssistAIError
+
+    class Job:
+        job_id = "job-busy"
+
+        async def result(self, timeout: float) -> list[str]:
+            raise TimeoutError
+
+        async def status(self) -> str:
+            return "in_progress"
+
+    with pytest.raises(AssistAIError, match="ещё выполняется") as caught:
+        await job_queue._await_job_result(Job(), 450.0, task="generate_image_task")
+    assert caught.value.error_code == "QUEUE_JOB_RUNNING"
+    assert caught.value.job_committed is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_after_job_left_queue_is_a_lost_result() -> None:
+
+    from app.llm.errors import AssistAIError
+
+    class Job:
+        job_id = "job-gone"
+
+        async def result(self, timeout: float) -> list[str]:
+            raise TimeoutError
+
+        async def status(self) -> str:
+            return "not_found"
+
+    with pytest.raises(AssistAIError, match="не сохранился") as caught:
+        await job_queue._await_job_result(Job(), 450.0, task="edit_image_task")
+    assert caught.value.error_code == "QUEUE_RESULT_LOST"
+    assert caught.value.job_committed is True
