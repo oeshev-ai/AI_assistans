@@ -16,6 +16,8 @@ from app.bot.image_retry import (
     IMAGE_RETRY_TEXT,
     bind_image_delivery,
     deliver_due,
+    image_failure_reply,
+    promote_arq_image_jobs,
     telegram_photo_needs_document,
 )
 from app.bot.runtime import _send_generated_image
@@ -24,6 +26,7 @@ from app.storage.image_delivery import (
     IMAGE_DELIVERY_TTL_SECONDS,
     InMemoryImageDeliveryStore,
     RedisImageDeliveryStore,
+    delivery_clock,
     retry_delay_seconds,
 )
 
@@ -421,6 +424,117 @@ async def test_telegram_disconnect_photo_succeeds_on_retry(
     assert sent is message.sent
     assert message.photos == 3
     assert message.documents == 0
+
+
+@pytest.mark.asyncio
+async def test_running_arq_image_is_scheduled_for_delivery() -> None:
+    store = InMemoryImageDeliveryStore()
+    bind_image_delivery(store)
+    exc = AssistAIError(
+        "Задача ещё выполняется. Повтор может списать деньги ещё раз.",
+        error_code="QUEUE_JOB_RUNNING",
+        job_committed=True,
+        pending_job_id="abc123",
+        pending_provider="arq",
+        pending_kind="image",
+    )
+    try:
+        text = await image_failure_reply(7, 8, exc)
+    finally:
+        bind_image_delivery(None)
+    assert text == IMAGE_KEEP_TEXT
+    waiting = await store.active(delivery_clock())
+    assert waiting[0].jobs == [{"provider": "arq", "id": "abc123"}]
+    assert await store.due(delivery_clock()) == []
+
+
+@pytest.mark.asyncio
+async def test_ready_arq_job_becomes_a_cdn_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    assert await store.add_job(1, 2, "arq", "jobhex", now=now)
+
+    async def _urls(job_id: str) -> list[str]:
+        assert job_id == "jobhex"
+        return ["https://s3.polza.ai/ready.png"]
+
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _urls)
+    await promote_arq_image_jobs(_Bot(), store)  # type: ignore[arg-type]
+    record = (await store.active(now))[0]
+    assert record.urls == ["https://s3.polza.ai/ready.png"]
+    assert record.filenames == ["image.png"]
+    assert record.jobs == []
+    assert record.not_before <= delivery_clock()
+
+
+@pytest.mark.asyncio
+async def test_arq_job_stays_while_the_worker_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(1, 2, "arq", "jobhex", now=now)
+
+    async def _later(_job_id: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _later)
+    await promote_arq_image_jobs(_Bot(), store)  # type: ignore[arg-type]
+    record = (await store.active(now))[0]
+    assert record.jobs == [{"provider": "arq", "id": "jobhex"}]
+    assert record.urls == []
+
+
+@pytest.mark.asyncio
+async def test_lost_arq_result_stops_and_tells_the_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(1, 2, "arq", "jobhex", now=now)
+    bot = _Bot()
+
+    async def _lost(_job_id: str) -> list[str]:
+        raise AssistAIError(
+            "Результат не сохранился в очереди. Повтор может списать деньги ещё раз.",
+            error_code="QUEUE_RESULT_LOST",
+            job_committed=True,
+        )
+
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _lost)
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert await store.active(now) == []
+    assert bot.texts == [
+        "Результат не сохранился в очереди. Повтор может списать деньги ещё раз."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delivery_pass_does_not_resume_an_arq_job() -> None:
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(1, 2, "arq", "jobhex", now=now)
+    record = (await store.active(now))[0]
+    record.not_before = now
+    await store.save(record, now=now)
+
+    async def _resume(_provider: str, _job_id: str) -> bytes:
+        raise AssertionError("arq job is polled by the watcher")
+
+    async def _download(_url: str) -> bytes:
+        raise AssertionError("no url yet")
+
+    await deliver_due(
+        _Bot(),  # type: ignore[arg-type]
+        store,
+        _download,
+        resume=_resume,
+        now=now + 1,
+    )
+    kept = (await store.active(now))[0]
+    assert kept.jobs == [{"provider": "arq", "id": "jobhex"}]
 
 
 def test_photo_size_and_type_errors_fall_back_to_document() -> None:

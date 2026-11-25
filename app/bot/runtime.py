@@ -543,19 +543,53 @@ async def _deliver_text(message: Message, payload: str) -> bool:
     return True
 
 
+_FLOOD_WAIT_LIMIT = 30
+
+
 async def _retry_after_flood(send: Callable[[], Awaitable[Any]]) -> Any:
-    """429: пауза ``retry_after`` и один повтор того же вызова."""
+    """429: пауза не дольше 30 с и один повтор. Дольше — False, без ожидания.
+
+    Пауза стоит внутри лока чата. Десятки секунд ``retry_after`` блокировали
+    бы ход и резерв бюджета.
+    """
     try:
         return await send()
     except TelegramRetryAfter as exc:
+        if exc.retry_after > _FLOOD_WAIT_LIMIT:
+            logger.warning(
+                "Flood control Telegram, пауза %s с длиннее %s с",
+                exc.retry_after,
+                _FLOOD_WAIT_LIMIT,
+            )
+            return False
         logger.warning("Flood control Telegram, пауза %s с", exc.retry_after)
-        await asyncio.sleep(exc.retry_after)
+        await asyncio.sleep(min(exc.retry_after, _FLOOD_WAIT_LIMIT))
         return await send()
+
+
+def _flood_refused() -> TelegramRetryAfter:
+    """Отказ без паузы. Тип тот же, что ловят отправка фото и очередь доставки."""
+    from aiogram.methods import SendMessage
+
+    return TelegramRetryAfter(
+        method=SendMessage(chat_id=0, text=""),
+        message="Flood control exceeded",
+        retry_after=_FLOOD_WAIT_LIMIT + 1,
+    )
+
+
+async def _flood_send(send: Callable[[], Awaitable[Any]]) -> Any:
+    """Повтор flood control. Слишком длинная пауза и второй 429 — ``TelegramRetryAfter``."""
+    sent = await _retry_after_flood(send)
+    if sent is False:
+        raise _flood_refused()
+    return sent
 
 
 async def _answer_chunk(message: Message, chunk: str) -> bool:
     try:
-        await _retry_after_flood(lambda: message.answer(chunk))
+        if await _retry_after_flood(lambda: message.answer(chunk)) is False:
+            return False
         return True
     except TelegramRetryAfter as exc:
         logger.warning("Повтор после flood control не прошёл: %s", exc)
@@ -574,7 +608,8 @@ async def _answer_halved(message: Message, chunk: str) -> bool:
     if not shorter or shorter == chunk:
         return False
     try:
-        await _retry_after_flood(lambda: message.answer(shorter))
+        if await _retry_after_flood(lambda: message.answer(shorter)) is False:
+            return False
     except TelegramRetryAfter as exc:
         logger.warning("Повтор после flood control не прошёл: %s", exc)
         return False
@@ -595,7 +630,16 @@ async def _edit_or_answer(
     if not isinstance(message, Message):
         return
     try:
-        await message.edit_text(text, reply_markup=keyboard)
+        if (
+            await _retry_after_flood(
+                lambda: message.edit_text(text, reply_markup=keyboard)
+            )
+            is False
+        ):
+            return
+    except TelegramRetryAfter as exc:
+        logger.warning("Повтор после flood control не прошёл: %s", exc)
+        return
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
             return
@@ -608,7 +652,8 @@ async def _edit_stream(status: Message, text: str, previous: str) -> str:
     if not visible or visible == previous:
         return previous
     try:
-        await _retry_after_flood(lambda: status.edit_text(visible))
+        if await _retry_after_flood(lambda: status.edit_text(visible)) is False:
+            return previous
     except TelegramRetryAfter as exc:
         logger.warning("Повтор после flood control не прошёл: %s", exc)
         return previous
@@ -744,9 +789,11 @@ async def _answer_photo_bytes(
     from app.bot.photo_pacer import send_photo_paced
 
     if as_file:
-        return await message.answer_document(
-            document=BufferedInputFile(raw, filename=filename),
-            request_timeout=120,
+        return await _flood_send(
+            lambda: message.answer_document(
+                document=BufferedInputFile(raw, filename=filename),
+                request_timeout=120,
+            )
         )
 
     async def _send_photo() -> Message:
@@ -788,9 +835,11 @@ async def _answer_photo_bytes(
             break
     if network_error is not None:
         try:
-            return await message.answer_document(
-                document=BufferedInputFile(raw, filename=filename),
-                request_timeout=120,
+            return await _flood_send(
+                lambda: message.answer_document(
+                    document=BufferedInputFile(raw, filename=filename),
+                    request_timeout=120,
+                )
             )
         except TelegramNetworkError:
             raise network_error
@@ -798,9 +847,11 @@ async def _answer_photo_bytes(
         if last_error is not None:
             raise last_error
         return None
-    return await message.answer_document(
-        document=BufferedInputFile(raw, filename=filename),
-        request_timeout=120,
+    return await _flood_send(
+        lambda: message.answer_document(
+            document=BufferedInputFile(raw, filename=filename),
+            request_timeout=120,
+        )
     )
 
 
@@ -835,9 +886,11 @@ async def _answer_video_bytes(message: Message, raw: bytes, filename: str) -> Me
                 break
             await asyncio.sleep(pause)
     try:
-        return await message.answer_document(
-            document=BufferedInputFile(raw, filename=filename),
-            request_timeout=180,
+        return await _flood_send(
+            lambda: message.answer_document(
+                document=BufferedInputFile(raw, filename=filename),
+                request_timeout=180,
+            )
         )
     except TelegramNetworkError:
         if last_network is not None:
@@ -956,10 +1009,14 @@ async def _send_outbound_media(
                     continue
                 user_id = message.from_user.id if message.from_user else message.chat.id
                 try:
-                    await message.answer_document(
-                        document=BufferedInputFile(item.data, filename=item.filename)
+                    await _flood_send(
+                        lambda: message.answer_document(
+                            document=BufferedInputFile(
+                                item.data, filename=item.filename
+                            )
+                        )
                     )
-                except (TelegramBadRequest, TelegramNetworkError):
+                except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
                     if await keep_paid_bytes(
                         message.chat.id,
                         user_id,
@@ -1671,12 +1728,16 @@ async def _process_s3_upload_session(
 
         transcript_bytes = transcript.encode("utf-8")
         try:
-            await bot.send_document(
-                chat_id,
-                document=BufferedInputFile(transcript_bytes, filename="transcript.txt"),
-                caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
+            await _flood_send(
+                lambda: bot.send_document(
+                    chat_id,
+                    document=BufferedInputFile(
+                        transcript_bytes, filename="transcript.txt"
+                    ),
+                    caption=f"Расшифровка «{filename}» ({len(transcript)} симв.)",
+                )
             )
-        except (TelegramBadRequest, TelegramNetworkError):
+        except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
             from app.bot.file_retry import TEXT_KEEP_TEXT, keep_paid_bytes
 
             if not await keep_paid_bytes(

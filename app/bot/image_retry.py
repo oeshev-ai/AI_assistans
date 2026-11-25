@@ -173,6 +173,7 @@ async def image_delivery_loop(
     stopper = stop or asyncio.Event()
     while not stopper.is_set():
         try:
+            await promote_arq_image_jobs(bot, store)
             await deliver_due(bot, store, download, resume=resume)
         except Exception:
             logger.exception("image_delivery_tick_failed")
@@ -226,6 +227,9 @@ async def _deliver_record(
         logger.info("image_delivery_sent", chat_id=record.chat_id, bytes=len(raw))
     pending_jobs: list[dict[str, str]] = []
     for job in record.jobs:
+        if job.get("provider") == "arq":
+            pending_jobs.append(job)
+            continue
         if resume is None:
             pending_jobs.append(job)
             continue
@@ -288,14 +292,18 @@ async def _send_bytes(
     bot: Bot, chat_id: int, raw: bytes, filename: str, *, as_file: bool = False
 ) -> None:
     from app.bot.photo_pacer import send_photo_paced
+    from app.bot.runtime import _flood_send
 
-    if as_file:
+    async def _document() -> None:
         await bot.send_document(
             chat_id,
             BufferedInputFile(raw, filename=filename),
             caption=IMAGE_LATE_CAPTION,
             request_timeout=120,
         )
+
+    if as_file:
+        await _flood_send(_document)
         return
 
     async def _send_photo() -> None:
@@ -311,12 +319,64 @@ async def _send_bytes(
     except TelegramBadRequest as exc:
         if not telegram_photo_needs_document(exc):
             raise
-        await bot.send_document(
-            chat_id,
-            BufferedInputFile(raw, filename=filename),
-            caption=IMAGE_LATE_CAPTION,
-            request_timeout=120,
-        )
+        await _flood_send(_document)
+
+
+def _next_image_name(index: int) -> str:
+    if index == 0:
+        return "image.png"
+    return f"image_{index + 1}.png"
+
+
+async def promote_arq_image_jobs(bot: Bot, store: ImageDeliveryStore) -> None:
+    """Забирает URL у готовой arq-задачи, пока ключ результата ещё жив.
+
+    Обычный повтор ждёт минуту и больше. ``keep_result`` картинки короче этого
+    окна, поэтому опрос идёт на каждом тике цикла, не дожидаясь ``not_before``.
+    """
+    from app.infra.job_queue import poll_arq_image_urls
+
+    now = delivery_clock()
+    for record in await store.active(now):
+        if not any(job.get("provider") == "arq" for job in record.jobs):
+            continue
+        kept: list[dict[str, str]] = []
+        added = False
+        stopped = False
+        flags = _align_delivery_flags(record)
+        for job in record.jobs:
+            if job.get("provider") != "arq":
+                kept.append(job)
+                continue
+            try:
+                urls = await poll_arq_image_urls(job["id"])
+            except AssistAIError as exc:
+                stopped = True
+                await _notify(bot, record.chat_id, exc.message)
+                logger.info(
+                    "image_delivery_arq_stopped",
+                    chat_id=record.chat_id,
+                    error_code=exc.error_code,
+                )
+                continue
+            if urls is None:
+                kept.append(job)
+                continue
+            as_file = job.get("as_file") == "1"
+            for url in urls:
+                if url in record.urls:
+                    continue
+                flags.append(as_file)
+                record.urls.append(url)
+                record.filenames.append(_next_image_name(len(record.filenames)))
+                added = True
+        if kept == record.jobs and not added and not stopped:
+            continue
+        record.jobs = kept
+        record.as_files = flags
+        if added:
+            record.not_before = now
+        await store.save(record, now=now)
 
 
 async def _notify(bot: Bot, chat_id: int, text: str) -> None:

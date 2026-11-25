@@ -300,15 +300,19 @@ async def transcribe_audio_task(
 
 
 def _worker_settings_class() -> type:
+    from arq import func
+
     _prepare_worker_process()
     require_valid_settings()
 
     class WorkerSettings:
         """Settings consumed by ``arq worker.WorkerSettings``."""
 
+        # Картинка может дописаться после ответа бота. 180 с покрывают тик
+        # доставки (20 с) с запасом; TTS и STT остаются на keep_result класса.
         functions: ClassVar[list] = [
-            generate_image_task,
-            edit_image_task,
+            func(generate_image_task, keep_result=180),
+            func(edit_image_task, keep_result=180),
             synthesize_speech_task,
             transcribe_audio_task,
         ]
@@ -319,7 +323,8 @@ def _worker_settings_class() -> type:
         # Одна попытка: повтор после падения создал бы вторую платную задачу.
         max_tries = 1
         job_timeout = get_settings().arq_job_timeout
-        # Дефолт arq — час. Картинка и TTS уже прочитаны ботом, в Redis им не место.
+        # Дефолт arq — час. TTS и STT читаются сразу, в Redis им не место.
+        # Картинки переопределяют срок в ``functions``: цикл доставки забирает URL.
         keep_result = 60
 
     return WorkerSettings

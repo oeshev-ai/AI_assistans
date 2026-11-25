@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
@@ -200,6 +201,22 @@ async def test_send_text_waits_out_flood_and_sends_the_rest(monkeypatch) -> None
     assert delivered == ["abcd", "efgh"]
 
 
+async def test_send_text_long_flood_does_not_wait(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+
+    class _Message:
+        async def answer(self, value: str) -> None:
+            raise _flood(value, 45)
+
+    await runtime._send_text(_Message(), "hello")  # type: ignore[arg-type]
+    assert sleeps == []
+
+
 async def test_send_text_second_flood_does_not_raise(monkeypatch) -> None:
     sleeps: list[float] = []
 
@@ -235,6 +252,96 @@ async def test_edit_stream_retries_after_flood(monkeypatch) -> None:
     assert sleeps == [1]
     assert edits == ["hello", "hello"]
     assert shown == "hello"
+
+
+async def test_edit_or_answer_retries_short_flood_and_skips_a_long_one(
+    monkeypatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+
+    class _Menu:
+        def __init__(self, retry_after: int, *, always: bool = False) -> None:
+            self.retry_after = retry_after
+            self.always = always
+            self.edits: list[str] = []
+
+        async def edit_text(self, value: str, reply_markup: object = None) -> None:
+            self.edits.append(value)
+            if self.always or len(self.edits) == 1:
+                raise _flood(value, self.retry_after)
+
+    class _Query:
+        def __init__(self, message: _Menu) -> None:
+            self.message = message
+
+    monkeypatch.setattr(runtime, "Message", _Menu)
+    short = _Menu(4)
+    await runtime._edit_or_answer(_Query(short), "меню")  # type: ignore[arg-type]
+    assert sleeps == [4]
+    assert short.edits == ["меню", "меню"]
+
+    sleeps.clear()
+    blocked = _Menu(90, always=True)
+    await runtime._edit_or_answer(_Query(blocked), "меню")  # type: ignore[arg-type]
+    assert sleeps == []
+    assert blocked.edits == ["меню"]
+
+
+async def test_document_send_waits_only_a_short_flood(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(runtime.asyncio, "sleep", _sleep)
+    calls = 0
+
+    class _Chat:
+        id = 3
+
+    class _Message:
+        chat = _Chat()
+
+        async def answer_document(self, **_kwargs: object) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _flood("file", 6)
+            return "sent"
+
+    sent = await runtime._answer_photo_bytes(
+        _Message(),  # type: ignore[arg-type]
+        b"png",
+        "image.png",
+        as_file=True,
+    )
+    assert sent == "sent"
+    assert sleeps == [6]
+    assert calls == 2
+
+    calls = 0
+    sleeps.clear()
+
+    class _Blocked(_Message):
+        async def answer_document(self, **_kwargs: object) -> str:
+            nonlocal calls
+            calls += 1
+            raise _flood("file", 80)
+
+    with pytest.raises(TelegramRetryAfter):
+        await runtime._answer_photo_bytes(
+            _Blocked(),  # type: ignore[arg-type]
+            b"png",
+            "image.png",
+            as_file=True,
+        )
+    assert sleeps == []
+    assert calls == 1
 
 
 async def test_send_text_blank_becomes_placeholder() -> None:

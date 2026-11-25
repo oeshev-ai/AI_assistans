@@ -28,6 +28,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # pip-tools 7.7.0 не имеет --check: тот же pip-compile и diff с файлом в git.
+      - name: pip-compile --check
+        run: |
+          python -m venv /tmp/lock-check
+          /tmp/lock-check/bin/pip install --upgrade pip
+          /tmp/lock-check/bin/pip install pip-tools==7.7.0
+          cp requirements-prod.txt /tmp/requirements-prod.txt
+          cp requirements.txt /tmp/requirements.txt
+          /tmp/lock-check/bin/pip-compile --quiet --no-strip-extras --generate-hashes --output-file=requirements-prod.txt requirements-prod.in
+          /tmp/lock-check/bin/pip-compile --quiet --constraint=requirements-prod.txt --no-strip-extras --generate-hashes --output-file=requirements.txt requirements.in
+          diff -u /tmp/requirements-prod.txt requirements-prod.txt
+          diff -u /tmp/requirements.txt requirements.txt
+
       - name: Ruff
         run: |
           ruff check .

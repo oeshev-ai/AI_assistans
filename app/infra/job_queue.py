@@ -127,6 +127,59 @@ def queue_pool() -> Any | None:
     return _pool
 
 
+async def poll_arq_image_urls(job_id: str) -> list[str] | None:
+    """URL готовой картинки. ``None`` — задача ещё в очереди.
+
+    ``AssistAIError`` — результата больше не будет (ключ истёк или задача упала).
+    Один запрос: ``keep_result`` картинки короткий, ждать здесь нельзя.
+    """
+    from arq.jobs import Job, ResultNotFound
+
+    from app.llm.errors import AssistAIError
+    from app.llm.media_api import public_https_image_url
+
+    pool = queue_pool()
+    if pool is None:
+        return None
+    try:
+        result = await Job(job_id, pool).result(timeout=0)
+    except TimeoutError:
+        return None
+    except ResultNotFound as exc:
+        raise AssistAIError(
+            "Результат не сохранился в очереди. Повтор может списать деньги ещё раз.",
+            error_code="QUEUE_RESULT_LOST",
+            job_committed=True,
+        ) from exc
+    except AssistAIError:
+        raise
+    except Exception as exc:
+        logger.warning("arq_image_result_failed", error=str(exc))
+        raise AssistAIError(
+            "Картинка не получилась.",
+            error_code="FAILED",
+            job_committed=True,
+        ) from exc
+    if not isinstance(result, list):
+        raise AssistAIError(
+            "Картинка не получилась.",
+            error_code="FAILED",
+            job_committed=True,
+        )
+    urls = [
+        item.strip()
+        for item in result
+        if isinstance(item, str) and public_https_image_url(item.strip())
+    ]
+    if not urls:
+        raise AssistAIError(
+            "Картинка не получилась.",
+            error_code="FAILED",
+            job_committed=True,
+        )
+    return urls
+
+
 def _billing_user_id(explicit: int | None = None) -> int | None:
     if explicit is not None:
         return explicit
@@ -260,15 +313,25 @@ def _result_lost(task: str) -> Exception:
     )
 
 
-def _job_still_running(task: str) -> Exception:
-    """Ключ результата ещё не появился, задача по-прежнему в очереди."""
+_IMAGE_TASKS = frozenset({"generate_image_task", "edit_image_task"})
+
+
+def _job_still_running(task: str, job_id: str) -> Exception:
+    """Ключ результата ещё не появился, задача по-прежнему в очереди.
+
+    У картинки id уходит в цикл доставки: воркер допишет URL, пока ключ жив.
+    """
     from app.llm.errors import AssistAIError
 
-    logger.error("arq_job_still_running", task=task)
+    logger.error("arq_job_still_running", task=task, job_id=job_id)
+    image = task in _IMAGE_TASKS and bool(job_id)
     return AssistAIError(
         "Задача ещё выполняется. Повтор может списать деньги ещё раз.",
         error_code="QUEUE_JOB_RUNNING",
         job_committed=True,
+        pending_job_id=job_id or None,
+        pending_provider="arq" if image else None,
+        pending_kind="image" if image else None,
     )
 
 
@@ -306,14 +369,18 @@ async def _await_job_result(job: Any, timeout: float, *, task: str) -> Any:
             except (TimeoutError, ResultNotFound):
                 raise _result_lost(task) from exc
         if status in {"queued", "deferred", "in_progress", ""}:
-            raise _job_still_running(task) from exc
+            raise _job_still_running(
+                task, str(getattr(job, "job_id", "") or "")
+            ) from exc
         raise _result_lost(task) from exc
 
 
 def _arq_enqueue_failed(task: str) -> Exception:
     """Очередь включена, но job не принят — не уходим в inline (риск OOM бота)."""
+    from app.infra.metrics import note_arq_enqueue_failed
     from app.llm.errors import AssistAIError
 
+    note_arq_enqueue_failed(task)
     logger.error("arq_enqueue_failed_closed", task=task)
     kind = (
         "аудио"

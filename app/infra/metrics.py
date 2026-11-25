@@ -60,13 +60,26 @@ ACTIVE_USERS = Gauge(
 
 REDIS_SIZE = Gauge(
     "redis_memory_bytes",
-    "Redis memory usage in bytes (state instance: FSM, topics, budgets, limits)",
+    "used_memory from INFO memory. role=state is chats and limits, role=queue is arq.",
+    ["role"],
+)
+
+REDIS_MAXMEMORY = Gauge(
+    "redis_maxmemory_bytes",
+    "maxmemory from INFO memory, bytes. 0 means Redis has no ceiling.",
+    ["role"],
 )
 
 REDIS_EVICTED = Gauge(
     "redis_evicted_keys",
     "Cumulative evicted_keys from INFO stats. Growth means maxmemory dropped keys.",
     ["role"],
+)
+
+ARQ_ENQUEUE_FAILED = Counter(
+    "arq_enqueue_failed_total",
+    "Queue refused a job before the paid call (full memory, pool error, duplicate id).",
+    ["task"],
 )
 
 _last_evicted: dict[str, int] = {}
@@ -139,6 +152,11 @@ def observe_message(input_kind: str, seconds: float) -> None:
     MESSAGE_LATENCY.labels(input_kind=input_kind).observe(seconds)
 
 
+def note_arq_enqueue_failed(task: str) -> None:
+    """Считает отказ принять задачу в очередь, до платного вызова."""
+    ARQ_ENQUEUE_FAILED.labels(task=task).inc()
+
+
 def note_evicted_keys(role: str, evicted: int) -> None:
     """Публикует ``evicted_keys`` и пишет error, когда счётчик вырос."""
     previous = _last_evicted.get(role)
@@ -154,16 +172,15 @@ def note_evicted_keys(role: str, evicted: int) -> None:
 
 
 async def refresh_redis_gauge(redis_client: Any | None, *, role: str = "state") -> None:
-    """Снимает память и ``evicted_keys``. ``role=state`` ещё обновляет ``REDIS_SIZE``."""
+    """Снимает used/maxmemory и ``evicted_keys`` для ``role``."""
     if redis_client is None:
-        if role == "state":
-            REDIS_SIZE.set(0)
+        REDIS_SIZE.labels(role=role).set(0)
         return
     try:
         memory = await redis_client.info("memory")
         stats = await redis_client.info("stats")
-        if role == "state":
-            REDIS_SIZE.set(int(memory.get("used_memory", 0)))
+        REDIS_SIZE.labels(role=role).set(int(memory.get("used_memory", 0)))
+        REDIS_MAXMEMORY.labels(role=role).set(int(memory.get("maxmemory", 0)))
         note_evicted_keys(role, int(stats.get("evicted_keys", 0)))
     except Exception:
         # Gauge stays at the last known value; health check reports Redis separately.

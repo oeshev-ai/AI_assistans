@@ -32,8 +32,11 @@ def retry_delay_seconds(attempts: int) -> int:
     return min(60 * (2**shift), 1800)
 
 
+_JOB_PROVIDERS = frozenset({"polza", "proxyapi", "arq"})
+
+
 def _safe_job(provider: str, job_id: str) -> dict[str, str] | None:
-    if provider not in {"polza", "proxyapi"} or not paid_job_id(job_id):
+    if provider not in _JOB_PROVIDERS or not paid_job_id(job_id):
         return None
     return {"provider": provider, "id": job_id}
 
@@ -225,6 +228,10 @@ class InMemoryImageDeliveryStore:
                 found.append(record)
         return found
 
+    async def active(self, now: float) -> list[ImageDelivery]:
+        """Живые записи, в том числе те, чей повтор ещё не подошёл."""
+        return [record for record in self._items.values() if not record.expired(now)]
+
     async def save(self, record: ImageDelivery, *, now: float) -> None:
         if record.expired(now) or (not record.urls and not record.jobs):
             self._items.pop((record.chat_id, record.user_id), None)
@@ -311,6 +318,17 @@ class RedisImageDeliveryStore:
         return await self._update(chat_id, user_id, now, merge)
 
     async def due(self, now: float) -> list[ImageDelivery]:
+        found: list[ImageDelivery] = []
+        for record in await self._indexed():
+            if record.expired(now) or record.not_before <= now:
+                found.append(record)
+        return found
+
+    async def active(self, now: float) -> list[ImageDelivery]:
+        """Живые записи, в том числе те, чей повтор ещё не подошёл."""
+        return [record for record in await self._indexed() if not record.expired(now)]
+
+    async def _indexed(self) -> list[ImageDelivery]:
         try:
             keys = await await_redis(self._redis.smembers(_INDEX_KEY))
         except RedisError:
@@ -334,8 +352,7 @@ class RedisImageDeliveryStore:
                         error=str(exc),
                     )
                 continue
-            if record.expired(now) or record.not_before <= now:
-                found.append(record)
+            found.append(record)
         return found
 
     async def save(self, record: ImageDelivery, *, now: float) -> None:

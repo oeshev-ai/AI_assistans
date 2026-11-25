@@ -12,6 +12,12 @@ def test_deploy_pulls_arq_profile_and_ups_only_a_live_worker() -> None:
     assert "docker compose --profile arq pull" in script
     assert "github.event.workflow_run.head_sha" in script
     assert "APP_IMAGE=" in script
+    pull = script.index("docker compose --profile arq pull")
+    rewrite = script.index('sed -i "s|^APP_IMAGE=')
+    assert pull < rewrite
+    assert 'if [ ! -f .env ]' in script
+    assert "exit 1" in script
+    assert " > .env" not in script
     assert "concurrency:" in text
     assert "cancel-in-progress: false" in text
     assert "running|restarting" in script
