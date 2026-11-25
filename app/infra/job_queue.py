@@ -11,12 +11,19 @@ import base64
 import json
 import math
 import uuid
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import structlog
 
-from app.llm.media_api import SpeechResult, TranscriptionResult
+from app.llm.errors import AssistAIError
+from app.llm.media_api import (
+    SpeechResult,
+    TranscriptionResult,
+    decode_image_b64,
+    public_https_image_url,
+)
 
 logger = structlog.get_logger("job_queue")
 
@@ -127,23 +134,85 @@ def queue_pool() -> Any | None:
     return _pool
 
 
-async def poll_arq_image_urls(job_id: str) -> list[str] | None:
-    """URL готовой картинки. ``None`` — задача ещё в очереди.
+@dataclass(frozen=True)
+class ArqImageReady:
+    """Готовая картинка из arq: публичные URL и байты из base64."""
 
-    ``AssistAIError`` — результата больше не будет (ключ истёк или задача упала).
+    urls: list[str]
+    payloads: list[tuple[bytes, str]]
+
+
+def arq_queue_unavailable() -> AssistAIError:
+    """Очередь в этом процессе не поднимется: забирать результат нечем."""
+    return AssistAIError(
+        "Забрать готовую картинку не удалось: очередь обработки выключена. "
+        "Если попросить ещё раз, начнётся новая генерация.",
+        error_code="QUEUE_DISABLED",
+        job_committed=True,
+    )
+
+
+def _image_failed() -> Exception:
+    from app.llm.errors import AssistAIError
+
+    return AssistAIError(
+        "Картинка не получилась.",
+        error_code="FAILED",
+        job_committed=True,
+    )
+
+
+def _ready_images(result: list[Any]) -> ArqImageReady:
+    """Публичный https остаётся ссылкой. base64 декодируется в байты.
+
+    Ссылка на частный хост и ``http`` не становятся байтами: это не картинка
+    провайдера. Пустой разбор — неудача, её поднимает опрос.
+    """
+    urls: list[str] = []
+    payloads: list[tuple[bytes, str]] = []
+    for item in result:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        if text.startswith(("http://", "https://")):
+            if public_https_image_url(text):
+                urls.append(text)
+            continue
+        raw, mime = decode_image_b64(text)
+        if raw:
+            payloads.append((raw, mime))
+    return ArqImageReady(urls=urls, payloads=payloads)
+
+
+async def poll_arq_image_urls(job_id: str) -> ArqImageReady | None:
+    """URL или байты готовой картинки.
+
+    ``None`` — задача ещё в очереди или Redis на этот запрос не ответил.
+    Ключ результата при этом жив, следующий тик опросит его снова.
+    ``AssistAIError`` — результата больше не будет: очередь выключена,
+    ключ истёк, задача упала или в ответе нет ни ссылки, ни картинки.
+    ProxyAPI и fallback на него кладут в результат ``b64_json``: это
+    оплаченная картинка, не ошибка.
     Один запрос: ``keep_result`` картинки короткий, ждать здесь нельзя.
     """
     from arq.jobs import Job, ResultNotFound
+    from redis.exceptions import RedisError
 
     from app.llm.errors import AssistAIError
-    from app.llm.media_api import public_https_image_url
 
     pool = queue_pool()
     if pool is None:
-        return None
+        # Пула не будет и на следующем тике: ARQ выключен или уже закрыт.
+        # Иначе запись с arq-задачей молчит до TTL в 7 дней.
+        logger.info("arq_image_poll_no_queue", job_id=job_id)
+        raise arq_queue_unavailable()
     try:
         result = await Job(job_id, pool).result(timeout=0)
     except TimeoutError:
+        # arq поднимает его, пока задача в очереди (timeout=0). Это подкласс
+        # OSError, поэтому обработчик транспорта стоит ниже.
         return None
     except ResultNotFound as exc:
         raise AssistAIError(
@@ -153,31 +222,18 @@ async def poll_arq_image_urls(job_id: str) -> list[str] | None:
         ) from exc
     except AssistAIError:
         raise
+    except (RedisError, OSError) as exc:
+        logger.warning("arq_image_poll_retry", error=str(exc))
+        return None
     except Exception as exc:
         logger.warning("arq_image_result_failed", error=str(exc))
-        raise AssistAIError(
-            "Картинка не получилась.",
-            error_code="FAILED",
-            job_committed=True,
-        ) from exc
+        raise _image_failed() from exc
     if not isinstance(result, list):
-        raise AssistAIError(
-            "Картинка не получилась.",
-            error_code="FAILED",
-            job_committed=True,
-        )
-    urls = [
-        item.strip()
-        for item in result
-        if isinstance(item, str) and public_https_image_url(item.strip())
-    ]
-    if not urls:
-        raise AssistAIError(
-            "Картинка не получилась.",
-            error_code="FAILED",
-            job_committed=True,
-        )
-    return urls
+        raise _image_failed()
+    ready = _ready_images(result)
+    if not ready.urls and not ready.payloads:
+        raise _image_failed()
+    return ready
 
 
 def _billing_user_id(explicit: int | None = None) -> int | None:
@@ -319,7 +375,8 @@ _IMAGE_TASKS = frozenset({"generate_image_task", "edit_image_task"})
 def _job_still_running(task: str, job_id: str) -> Exception:
     """Ключ результата ещё не появился, задача по-прежнему в очереди.
 
-    У картинки id уходит в цикл доставки: воркер допишет URL, пока ключ жив.
+    У картинки id уходит в цикл доставки: воркер допишет URL или base64,
+    пока ключ жив.
     """
     from app.llm.errors import AssistAIError
 

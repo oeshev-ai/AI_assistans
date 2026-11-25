@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
-from redis.exceptions import WatchError
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError, WatchError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from app.bot.file_retry import bind_file_delivery
 from app.bot.image_retry import (
     IMAGE_EXPIRED_TEXT,
     IMAGE_KEEP_TEXT,
@@ -16,12 +20,16 @@ from app.bot.image_retry import (
     IMAGE_RETRY_TEXT,
     bind_image_delivery,
     deliver_due,
+    image_delivery_tick,
     image_failure_reply,
     promote_arq_image_jobs,
     telegram_photo_needs_document,
 )
+from app.bot.photo_flow import _deliver_images
 from app.bot.runtime import _send_generated_image
+from app.infra.job_queue import ArqImageReady, poll_arq_image_urls
 from app.llm.errors import AssistAIError
+from app.storage.file_delivery import InMemoryFileDeliveryStore
 from app.storage.image_delivery import (
     IMAGE_DELIVERY_TTL_SECONDS,
     InMemoryImageDeliveryStore,
@@ -70,6 +78,7 @@ class _Redis:
         self.kv: dict[str, str] = {}
         self.sets: dict[str, set[str]] = {}
         self.ttl: dict[str, int | None] = {}
+        self.scans = 0
 
     async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.kv[key] = value
@@ -88,6 +97,7 @@ class _Redis:
         self.sets.get(key, set()).discard(member)
 
     async def smembers(self, key: str) -> set[str]:
+        self.scans += 1
         return set(self.sets.get(key, set()))
 
     async def expire(self, key: str, seconds: int) -> None:
@@ -456,9 +466,12 @@ async def test_ready_arq_job_becomes_a_cdn_url(
     now = delivery_clock()
     assert await store.add_job(1, 2, "arq", "jobhex", now=now)
 
-    async def _urls(job_id: str) -> list[str]:
+    async def _urls(job_id: str) -> ArqImageReady:
         assert job_id == "jobhex"
-        return ["https://s3.polza.ai/ready.png"]
+        return ArqImageReady(
+            urls=["https://s3.polza.ai/ready.png"],
+            payloads=[],
+        )
 
     monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _urls)
     await promote_arq_image_jobs(_Bot(), store)  # type: ignore[arg-type]
@@ -544,3 +557,422 @@ def test_photo_size_and_type_errors_fall_back_to_document() -> None:
     assert not telegram_photo_needs_document(
         RuntimeError("bot was blocked by the user")
     )
+
+
+def _stub_arq_result(monkeypatch: pytest.MonkeyPatch, value: object) -> None:
+    monkeypatch.setattr("app.infra.job_queue.queue_pool", lambda: object())
+
+    class _Job:
+        def __init__(self, job_id: str, _pool: object) -> None:
+            self.job_id = job_id
+
+        async def result(self, timeout: float = 0) -> object:
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+    monkeypatch.setattr("arq.jobs.Job", _Job)
+
+
+class _DeliveryBot:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.payloads: list[bytes] = []
+        self.captions: list[str | None] = []
+        self.texts: list[str] = []
+
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: object,
+        caption: str | None = None,
+        request_timeout: int | None = None,
+    ) -> None:
+        del chat_id, request_timeout
+        if self.fail:
+            raise TelegramNetworkError(
+                method=SendMessage(chat_id=1, text="x"),
+                message="Server disconnected",
+            )
+        data = getattr(photo, "data", None)
+        assert isinstance(data, (bytes, bytearray))
+        self.payloads.append(bytes(data))
+        self.captions.append(caption)
+
+    async def send_document(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("document")
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        del chat_id
+        self.texts.append(text)
+
+
+class _Bucket:
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    async def upload_bytes(
+        self, *, object_key: str, data: bytes, content_type: str
+    ) -> None:
+        del content_type
+        self.objects[object_key] = data
+
+    async def download_bytes(
+        self, object_key: str, *, max_bytes: int | None = None
+    ) -> bytes:
+        del max_bytes
+        return self.objects[object_key]
+
+    async def delete_object(self, object_key: str) -> None:
+        self.objects.pop(object_key, None)
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_base64_and_drops_private_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"png-bytes"
+    jpeg = b"jpeg-bytes"
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    _stub_arq_result(
+        monkeypatch,
+        [
+            "  https://s3.polza.ai/ready.png  ",
+            base64.b64encode(raw).decode("ascii"),
+            data_uri,
+            "https://127.0.0.1/secret.png",
+            "http://cdn.example/a.png",
+            "   ",
+        ],
+    )
+    ready = await poll_arq_image_urls("jobhex")
+    assert ready is not None
+    assert ready.urls == ["https://s3.polza.ai/ready.png"]
+    assert ready.payloads == [(raw, "image/png"), (jpeg, "image/jpeg")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["https://127.0.0.1/secret.png"],
+        ["http://cdn.example/a.png"],
+        ["!!!"],
+        [],
+        {"data": "nope"},
+    ],
+)
+async def test_poll_rejects_a_result_without_an_image(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    _stub_arq_result(monkeypatch, value)
+    with pytest.raises(AssistAIError) as caught:
+        await poll_arq_image_urls("jobhex")
+    assert caught.value.error_code == "FAILED"
+    assert caught.value.job_committed is True
+    assert caught.value.message == "Картинка не получилась."
+
+
+_QUEUE_OFF = (
+    "Забрать готовую картинку не удалось: очередь обработки выключена. "
+    "Если попросить ещё раз, начнётся новая генерация."
+)
+
+
+@pytest.mark.asyncio
+async def test_tick_reads_the_index_once_and_still_polls_arq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _Redis()
+    store = RedisImageDeliveryStore(redis)  # type: ignore[arg-type]
+    await store.add(61, 2, "https://s3.polza.ai/a.png", "image.png", now=0)
+    await store.add_job(62, 4, "arq", "jobhex", now=60)
+    redis.scans = 0
+    polled: list[str] = []
+
+    async def _later(job_id: str) -> None:
+        polled.append(job_id)
+        return None
+
+    async def _png(_url: str) -> bytes:
+        return b"png"
+
+    monkeypatch.setattr("app.infra.job_queue.is_queue_enabled", lambda: True)
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _later)
+    bot = _Bot()
+    await image_delivery_tick(bot, store, _png, now=60)  # type: ignore[arg-type]
+    assert redis.scans == 1
+    assert polled == ["jobhex"]
+    assert bot.photos == [(61, IMAGE_LATE_CAPTION)]
+    kept = json.loads(redis.kv["image_delivery:62:4"])
+    assert kept["jobs"] == [{"provider": "arq", "id": "jobhex"}]
+    assert "image_delivery:61:2" not in redis.kv
+
+
+@pytest.mark.asyncio
+async def test_disabled_queue_refuses_arq_jobs_without_a_second_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = _Redis()
+    store = RedisImageDeliveryStore(redis)  # type: ignore[arg-type]
+    await store.add(63, 2, "https://s3.polza.ai/a.png", "image.png", now=0)
+    await store.add_job(64, 4, "arq", "jobhex", now=60)
+    redis.scans = 0
+
+    async def _poll(_job_id: str) -> None:
+        raise AssertionError("выключенная очередь не опрашивает результат")
+
+    async def _png(_url: str) -> bytes:
+        return b"png"
+
+    monkeypatch.setattr("app.infra.job_queue.is_queue_enabled", lambda: False)
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _poll)
+    bot = _Bot()
+    await image_delivery_tick(bot, store, _png, now=60)  # type: ignore[arg-type]
+    assert redis.scans == 1
+    assert bot.photos == [(63, IMAGE_LATE_CAPTION)]
+    assert bot.texts == [_QUEUE_OFF]
+    assert "image_delivery:64:4" not in redis.kv
+    assert "image_delivery:63:2" not in redis.kv
+
+
+@pytest.mark.asyncio
+async def test_poll_without_a_queue_is_a_final_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.infra.job_queue.queue_pool", lambda: None)
+    with pytest.raises(AssistAIError) as caught:
+        await poll_arq_image_urls("jobhex")
+    assert caught.value.error_code == "QUEUE_DISABLED"
+    assert caught.value.job_committed is True
+    assert caught.value.message == _QUEUE_OFF
+
+
+@pytest.mark.asyncio
+async def test_disabled_queue_stops_a_leftover_arq_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.infra.job_queue.queue_pool", lambda: None)
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(53, 42, "arq", "jobhex", now=now)
+    bot = _DeliveryBot()
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert bot.texts == [_QUEUE_OFF]
+    assert bot.payloads == []
+    assert await store.active(now) == []
+
+
+@pytest.mark.asyncio
+async def test_poll_waits_while_the_worker_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_arq_result(monkeypatch, TimeoutError())
+    assert await poll_arq_image_urls("jobhex") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RedisError("loading"),
+        RedisTimeoutError("Timeout reading from socket"),
+        RedisConnectionError("Connection closed by server"),
+        ConnectionResetError("connection reset"),
+    ],
+)
+async def test_poll_transport_error_retries_on_the_next_tick(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    _stub_arq_result(monkeypatch, exc)
+    assert await poll_arq_image_urls("jobhex") is None
+
+
+@pytest.mark.asyncio
+async def test_poll_worker_failure_is_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_arq_result(monkeypatch, ValueError("edit payload missing"))
+    with pytest.raises(AssistAIError) as caught:
+        await poll_arq_image_urls("jobhex")
+    assert caught.value.error_code == "FAILED"
+    assert caught.value.job_committed is True
+    assert caught.value.message == "Картинка не получилась."
+
+
+@pytest.mark.asyncio
+async def test_redis_blip_keeps_the_paid_image_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_arq_result(monkeypatch, RedisError("connection reset"))
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(51, 42, "arq", "jobhex", now=now)
+    bot = _DeliveryBot()
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert bot.texts == []
+    record = (await store.active(now))[0]
+    assert record.jobs == [{"provider": "arq", "id": "jobhex"}]
+    assert record.urls == []
+
+
+@pytest.mark.asyncio
+async def test_proxyapi_base64_is_sent_on_the_delivery_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"png-bytes"
+    _stub_arq_result(monkeypatch, [base64.b64encode(raw).decode("ascii")])
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(41, 42, "arq", "jobhex", now=now)
+    bot = _DeliveryBot()
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert bot.payloads == [raw]
+    assert bot.captions == [IMAGE_LATE_CAPTION]
+    assert bot.texts == []
+    assert await store.active(now) == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_tick_keeps_the_url_and_sends_the_base64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"png-bytes"
+    _stub_arq_result(
+        monkeypatch,
+        [
+            "https://s3.polza.ai/ready.png",
+            base64.b64encode(raw).decode("ascii"),
+        ],
+    )
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(43, 42, "arq", "jobhex", now=now)
+    bot = _DeliveryBot()
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert bot.payloads == [raw]
+    assert bot.texts == []
+    record = (await store.active(now))[0]
+    assert record.urls == ["https://s3.polza.ai/ready.png"]
+    assert record.filenames == ["image.png"]
+    assert record.jobs == []
+
+
+@pytest.mark.asyncio
+async def test_base64_is_kept_when_telegram_drops_the_photo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"png-bytes"
+    _stub_arq_result(monkeypatch, [base64.b64encode(raw).decode("ascii")])
+    image_store = InMemoryImageDeliveryStore()
+    file_store = InMemoryFileDeliveryStore()
+    bucket = _Bucket()
+    now = delivery_clock()
+    await image_store.add_job(45, 42, "arq", "jobhex", now=now)
+    bind_file_delivery(file_store, bucket)  # type: ignore[arg-type]
+    bot = _DeliveryBot(fail=True)
+    try:
+        await promote_arq_image_jobs(bot, image_store)  # type: ignore[arg-type]
+    finally:
+        bind_file_delivery(None)
+    assert bot.texts == []
+    assert bot.payloads == []
+    assert list(bucket.objects.values()) == [raw]
+    assert await image_store.active(now) == []
+    waiting = await file_store.due(10**12)
+    assert waiting[0].files[0].kind == "document"
+    assert waiting[0].files[0].filename == "image.png"
+    assert waiting[0].files[0].mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_base64_job_stays_until_the_bytes_can_be_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"png-bytes"
+    _stub_arq_result(monkeypatch, [base64.b64encode(raw).decode("ascii")])
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(47, 42, "arq", "jobhex", now=now)
+    bind_file_delivery(None)
+    bot = _DeliveryBot(fail=True)
+    try:
+        await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    finally:
+        bind_file_delivery(None)
+    assert bot.texts == []
+    assert bot.payloads == []
+    record = (await store.active(now))[0]
+    assert record.jobs == [{"provider": "arq", "id": "jobhex"}]
+    assert record.urls == []
+
+
+@pytest.mark.asyncio
+async def test_private_url_result_still_stops_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_arq_result(monkeypatch, ["https://127.0.0.1/secret.png"])
+    store = InMemoryImageDeliveryStore()
+    now = delivery_clock()
+    await store.add_job(49, 42, "arq", "jobhex", now=now)
+    bot = _DeliveryBot()
+    await promote_arq_image_jobs(bot, store)  # type: ignore[arg-type]
+    assert bot.texts == ["Картинка не получилась."]
+    assert bot.payloads == []
+    assert await store.active(now) == []
+
+
+class _Frame:
+    def __init__(self, file_id: str) -> None:
+        self.file_id = file_id
+
+
+class _SentFrame:
+    def __init__(self, file_id: str) -> None:
+        self.photo = [_Frame(file_id)]
+
+
+class _FloodChat:
+    id = 81
+
+
+class _FloodAlbum:
+    def __init__(self) -> None:
+        self.chat = _FloodChat()
+        self.from_user = _User()
+        self.calls = 0
+
+    async def answer_photo(self, **_kwargs: object) -> _SentFrame:
+        self.calls += 1
+        if self.calls == 1:
+            raise TelegramRetryAfter(
+                method=SendMessage(chat_id=self.chat.id, text="x"),
+                message="flood",
+                retry_after=45,
+            )
+        return _SentFrame("second")
+
+    async def answer_document(self, **_kwargs: object) -> None:
+        raise AssertionError("document")
+
+
+@pytest.mark.asyncio
+async def test_long_flood_keeps_the_frame_and_sends_the_next() -> None:
+    first = base64.b64encode(b"frame-one").decode("ascii")
+    second = base64.b64encode(b"frame-two").decode("ascii")
+    file_store = InMemoryFileDeliveryStore()
+    bucket = _Bucket()
+    bind_file_delivery(file_store, bucket)  # type: ignore[arg-type]
+    message = _FloodAlbum()
+    try:
+        kept, error = await _deliver_images(message, [first, second], as_file=False)
+    finally:
+        bind_file_delivery(None)
+    assert error is None
+    assert kept == "second"
+    assert message.calls == 2
+    assert list(bucket.objects.values()) == [b"frame-one"]
+    waiting = await file_store.due(10**12)
+    assert waiting[0].files[0].filename == "image.png"
+    assert waiting[0].files[0].kind == "document"
+    assert waiting[0].files[0].mime == "image/png"

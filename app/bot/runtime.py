@@ -1045,7 +1045,7 @@ async def _send_generated_image(
     ``s3.polza.ai`` ловит ``Request timeout`` (~30 с). Скачиваем отдельно
     (до 120 с), в Telegram отдаём уже байты.
     """
-    from aiogram.exceptions import TelegramNetworkError
+    from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
     from app.bot.image_retry import (
         IMAGE_KEEP_TEXT,
@@ -1075,6 +1075,24 @@ async def _send_generated_image(
         raise AssistAIError("Провайдер вернул пустое изображение.")
     try:
         return await _answer_photo_bytes(message, raw, filename, as_file=as_file)
+    except TelegramRetryAfter:
+        from app.bot.file_retry import keep_paid_bytes
+
+        saved = await keep_paid_bytes(
+            message.chat.id,
+            user_id,
+            raw,
+            filename,
+            kind="document",
+            mime="image/png",
+        )
+        if saved:
+            logger.info("image_flood_kept", chat_id=message.chat.id, bytes=len(raw))
+            return None
+        logger.warning(
+            "image_flood_bytes_unkept", chat_id=message.chat.id, bytes=len(raw)
+        )
+        raise
     except TelegramNetworkError:
         if _is_http_url(image) and await note_failed_image(
             message.chat.id, user_id, image, filename, as_file=as_file
