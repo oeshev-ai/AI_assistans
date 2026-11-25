@@ -7,7 +7,10 @@ from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
+import structlog
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
+logger = structlog.get_logger("metrics")
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -57,8 +60,16 @@ ACTIVE_USERS = Gauge(
 
 REDIS_SIZE = Gauge(
     "redis_memory_bytes",
-    "Redis memory usage in bytes",
+    "Redis memory usage in bytes (state instance: FSM, topics, budgets, limits)",
 )
+
+REDIS_EVICTED = Gauge(
+    "redis_evicted_keys",
+    "Cumulative evicted_keys from INFO stats. Growth means maxmemory dropped keys.",
+    ["role"],
+)
+
+_last_evicted: dict[str, int] = {}
 
 _metrics_started = False
 _active_user_hits: dict[int, float] = {}
@@ -128,15 +139,46 @@ def observe_message(input_kind: str, seconds: float) -> None:
     MESSAGE_LATENCY.labels(input_kind=input_kind).observe(seconds)
 
 
-async def refresh_redis_gauge(redis_client: Any | None) -> None:
-    """Update ``REDIS_SIZE`` from ``INFO memory`` when a Redis client is available."""
+def note_evicted_keys(role: str, evicted: int) -> None:
+    """Публикует ``evicted_keys`` и пишет error, когда счётчик вырос."""
+    previous = _last_evicted.get(role)
+    _last_evicted[role] = evicted
+    REDIS_EVICTED.labels(role=role).set(evicted)
+    if previous is not None and evicted > previous:
+        logger.error(
+            "redis_keys_evicted",
+            role=role,
+            evicted_keys=evicted,
+            delta=evicted - previous,
+        )
+
+
+async def refresh_redis_gauge(redis_client: Any | None, *, role: str = "state") -> None:
+    """Снимает память и ``evicted_keys``. ``role=state`` ещё обновляет ``REDIS_SIZE``."""
     if redis_client is None:
-        REDIS_SIZE.set(0)
+        if role == "state":
+            REDIS_SIZE.set(0)
         return
     try:
-        info = await redis_client.info("memory")
-        used = int(info.get("used_memory", 0))
-        REDIS_SIZE.set(used)
+        memory = await redis_client.info("memory")
+        stats = await redis_client.info("stats")
+        if role == "state":
+            REDIS_SIZE.set(int(memory.get("used_memory", 0)))
+        note_evicted_keys(role, int(stats.get("evicted_keys", 0)))
     except Exception:
         # Gauge stays at the last known value; health check reports Redis separately.
         pass
+
+
+async def refresh_queue_redis_gauge() -> None:
+    """Очередь на другом инстансе учитывается отдельно. Тот же URL не дублирует алерт."""
+    from app.infra.job_queue import queue_pool
+    from app.infra.settings import get_settings
+
+    pool = queue_pool()
+    if pool is None:
+        return
+    settings = get_settings()
+    if settings.queue_redis_url.strip() == settings.redis_url.strip():
+        return
+    await refresh_redis_gauge(pool, role="queue")

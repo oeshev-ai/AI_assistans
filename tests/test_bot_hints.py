@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app.bot.constants import TELEGRAM_TEXT_LIMIT
+from app.bot.constants import TELEGRAM_TEXT_SAFE
 from app.bot.models import (
     _fit_screen,
     _hints_block,
@@ -13,6 +13,7 @@ from app.bot.models import (
     _text_model_of,
 )
 from app.bot.screens.draft import _icons_keyboard
+from app.bot.telegram_text import telegram_text_units
 from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
@@ -101,11 +102,13 @@ def test_persona_icon_done_closes_picker() -> None:
 
 
 def test_fit_screen_truncates_to_telegram_limit() -> None:
-    long_text = "a" * (TELEGRAM_TEXT_LIMIT + 50)
+    long_text = "a" * (TELEGRAM_TEXT_SAFE + 50)
     fitted = _fit_screen(long_text)
-    assert len(fitted) == TELEGRAM_TEXT_LIMIT
+    assert telegram_text_units(fitted) == TELEGRAM_TEXT_SAFE
+    assert len(fitted) == TELEGRAM_TEXT_SAFE
     assert fitted.endswith("…")
     assert _fit_screen("short") == "short"
+    assert _fit_screen("a" * TELEGRAM_TEXT_SAFE) == "a" * TELEGRAM_TEXT_SAFE
 
 
 def test_text_model_of_stale_falls_back_to_default() -> None:

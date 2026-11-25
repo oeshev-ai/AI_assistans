@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from app.bot import runtime as R
 from app.bot.album import get_album_hub
 from app.bot.constants import (
@@ -343,7 +345,7 @@ async def handle_document(
                     "PDF можно разобрать, но не изменить как фото."
                 )
                 return
-            pages = process_pdf(data)
+            pages = await asyncio.to_thread(process_pdf, data)
             logger.info(
                 "PDF, chat_id=%s name=%s size=%s pages=%s",
                 message.chat.id,

@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 from aiohttp import web
 
-from app.infra.metrics import refresh_redis_gauge
+from app.infra.metrics import refresh_queue_redis_gauge, refresh_redis_gauge
 
 logger = structlog.get_logger("health")
 
@@ -48,7 +48,8 @@ async def readiness_payload(
         try:
             await redis_client.ping()
             health["components"]["redis"] = "ok"
-            await refresh_redis_gauge(redis_client)
+            await refresh_redis_gauge(redis_client, role="state")
+            await refresh_queue_redis_gauge()
         except Exception as exc:
             logger.warning("health_redis_failed", error=str(exc))
             health["components"]["redis"] = "error"

@@ -12,7 +12,7 @@ import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from app.media.upload_server import setup_upload_routes
+from app.media.upload_server import _copy_until_limit, setup_upload_routes
 from app.storage.upload_sessions import UploadSessionStore
 
 
@@ -433,3 +433,66 @@ async def test_request_large_media_upload_tool(monkeypatch: pytest.MonkeyPatch) 
     assert data["status"] == "success"
     assert data["upload_url"].startswith("https://bot.example.com/upload/")
     assert "t=" in data["upload_url"]
+
+
+class _ChunkField:
+    def __init__(self, parts: list[bytes]) -> None:
+        self._parts = list(parts)
+        self.calls = 0
+
+    async def read_chunk(self, size: int = 8192) -> bytes:
+        self.calls += 1
+        if not self._parts:
+            return b""
+        return self._parts.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_copy_stops_after_the_chunk_that_crosses_the_limit() -> None:
+    field = _ChunkField([b"a" * 100, b"b" * 100, b"c" * 100])
+    dest = io.BytesIO()
+    size, too_large = await _copy_until_limit(field, dest, 150)
+    assert too_large is True
+    assert size == 200
+    assert field.calls == 2
+    assert dest.getvalue() == b"a" * 100
+
+
+@pytest.mark.asyncio
+async def test_oversized_upload_closes_without_storing() -> None:
+    store = UploadSessionStore(redis=None)
+    storage = FakeStorage()
+    storage.config.max_upload_mb = 1
+    session = await store.create(chat_id=1, user_id=2, purpose="transcribe")
+    app = web.Application(client_max_size=8 * 1024 * 1024)
+    setup_upload_routes(
+        app,
+        store=store,
+        storage=storage,
+        on_complete=lambda _s: asyncio.sleep(0),
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        form = FormData()
+        form.add_field(
+            "file",
+            b"\x00" * (2 * 1024 * 1024),
+            filename="a.wav",
+            content_type="audio/wav",
+        )
+        resp = await client.post(
+            f"/api/uploads/{session.upload_id}/file",
+            data=form,
+            headers={"X-Upload-Token": session.token},
+        )
+        body = await resp.json()
+        assert resp.status == 413
+        assert resp.headers["Connection"].lower() == "close"
+        assert body["error"] == "Файл больше 1 МБ"
+        saved = await store.get(session.upload_id)
+        assert saved is not None
+        assert saved.status == "pending"
+        assert storage.objects == {}
+    finally:
+        await client.close()

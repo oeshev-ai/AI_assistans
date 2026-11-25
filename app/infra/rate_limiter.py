@@ -310,9 +310,11 @@ class RateLimiter:
     ) -> tuple[bool, float]:
         if operation not in _IMAGE_BUCKET_OPS:
             raise ValueError(f"unknown image bucket {operation}")
-        assert self._redis is not None
+        redis = self._redis
+        if redis is None:
+            raise RuntimeError("Redis лимитера не подключён")
         _capacity, _refill, ttl = self._bucket_params()
-        raw = await self._redis.eval(
+        raw = await redis.eval(
             _BUCKET_LUA,
             1,
             self._key(user_id, operation),
@@ -439,10 +441,12 @@ class RateLimiter:
             return True
 
     async def _allow_redis_key(self, key: str, limit: int, window: float) -> bool:
-        assert self._redis is not None
+        redis = self._redis
+        if redis is None:
+            raise RuntimeError("Redis лимитера не подключён")
         now = time.time()
         member = f"{now}:{uuid.uuid4().hex}"
-        allowed = await self._redis.eval(
+        allowed = await redis.eval(
             _ALLOW_LUA,
             1,
             key,
@@ -457,11 +461,13 @@ class RateLimiter:
     async def _allow_redis(
         self, user_id: int, operation: str, limit: int, window: float
     ) -> bool:
-        assert self._redis is not None
+        redis = self._redis
+        if redis is None:
+            raise RuntimeError("Redis лимитера не подключён")
         key = self._key(user_id, operation)
         now = time.time()
         member = f"{now}:{uuid.uuid4().hex}"
-        allowed = await self._redis.eval(
+        allowed = await redis.eval(
             _ALLOW_LUA,
             1,
             key,

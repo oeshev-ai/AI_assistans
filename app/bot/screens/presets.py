@@ -7,11 +7,15 @@ from app.bot.constants import (
     _VOICE_MODE_LABELS,
     ASSISTANT_PRESETS,
     PAGE_SIZE,
-    TELEGRAM_TEXT_LIMIT,
     AssistAIClient,
     AssistantPreset,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+)
+from app.bot.telegram_text import (
+    TELEGRAM_TEXT_SAFE,
+    clip_telegram_text,
+    telegram_text_units,
 )
 from app.llm.models_config import text_model_supports_vision
 
@@ -83,11 +87,11 @@ def _preset_preview_parts(
         f"TTS голос: {voice_line}\n\n"
     )
     prompt = preset.system_prompt
-    room = TELEGRAM_TEXT_LIMIT - len(header) - 1
+    room = TELEGRAM_TEXT_SAFE - telegram_text_units(header) - 1
     if room < 32:
         prompt = "…"
-    elif len(prompt) > room:
-        prompt = prompt[: room - 1] + "…"
+    elif telegram_text_units(prompt) > room:
+        prompt = clip_telegram_text(prompt, room - 1) + "…"
     text = f"{header}{prompt}"
     markup = InlineKeyboardMarkup(
         inline_keyboard=[

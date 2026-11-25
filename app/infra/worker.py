@@ -24,12 +24,13 @@ import structlog
 
 from app.infra.access import is_production, require_redis_password
 from app.infra.logging_setup import configure_logging
-from app.infra.settings import get_settings, load_project_dotenv
-
-load_project_dotenv()
+from app.infra.settings import (
+    get_settings,
+    load_project_dotenv,
+    require_valid_settings,
+)
 from app.llm.assist_ai import AssistAIClient, AssistAIConfig
 
-configure_logging()
 logger = structlog.get_logger("worker")
 
 
@@ -47,7 +48,7 @@ def _warn_polza_user_hash_secret() -> None:
 def redis_settings() -> Any:
     from arq.connections import RedisSettings
 
-    redis_url = get_settings().worker_redis_url
+    redis_url = get_settings().queue_redis_url
     parsed = urlparse(redis_url)
     return RedisSettings(
         host=parsed.hostname or "localhost",
@@ -93,10 +94,18 @@ async def attach_worker_billing_redis(redis_url: str) -> Any:
         return None
 
 
+def _prepare_worker_process() -> None:
+    """``.env`` и JSON-логи — при старте воркера, не при импорте модуля."""
+    load_project_dotenv()
+    configure_logging()
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     from app.infra.cost_tracker import cost_tracker
     from app.infra.job_queue import validate_arq_image_timeout
 
+    _prepare_worker_process()
+    require_valid_settings()
     require_redis_password()
 
     try:
@@ -290,19 +299,36 @@ async def transcribe_audio_task(
     }
 
 
-class WorkerSettings:
-    """Settings consumed by ``arq worker.WorkerSettings``."""
+def _worker_settings_class() -> type:
+    _prepare_worker_process()
+    require_valid_settings()
 
-    functions: ClassVar[list] = [
-        generate_image_task,
-        edit_image_task,
-        synthesize_speech_task,
-        transcribe_audio_task,
-    ]
-    on_startup = startup
-    on_shutdown = shutdown
-    redis_settings = redis_settings()
-    max_jobs = get_settings().arq_max_jobs
-    # Одна попытка: повтор после падения создал бы вторую платную задачу.
-    max_tries = 1
-    job_timeout = get_settings().arq_job_timeout
+    class WorkerSettings:
+        """Settings consumed by ``arq worker.WorkerSettings``."""
+
+        functions: ClassVar[list] = [
+            generate_image_task,
+            edit_image_task,
+            synthesize_speech_task,
+            transcribe_audio_task,
+        ]
+        on_startup = startup
+        on_shutdown = shutdown
+        redis_settings = redis_settings()
+        max_jobs = get_settings().arq_max_jobs
+        # Одна попытка: повтор после падения создал бы вторую платную задачу.
+        max_tries = 1
+        job_timeout = get_settings().arq_job_timeout
+        # Дефолт arq — час. Картинка и TTS уже прочитаны ботом, в Redis им не место.
+        keep_result = 60
+
+    return WorkerSettings
+
+
+def __getattr__(name: str) -> Any:
+    """arq импортирует класс после старта процесса, тесты — нет."""
+    if name != "WorkerSettings":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    cls = _worker_settings_class()
+    globals()["WorkerSettings"] = cls
+    return cls

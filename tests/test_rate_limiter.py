@@ -121,11 +121,26 @@ async def test_expired_memory_keys_are_dropped(monkeypatch: pytest.MonkeyPatch) 
     assert len(limiter._text_hits) == 1
 
 
-def test_env_int_falls_back_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_int_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.infra.envparse import env_int
 
     monkeypatch.setenv("BAD_PORT", "xyz")
-    assert env_int("BAD_PORT", 8082) == 8082
+    with pytest.raises(ValueError, match="BAD_PORT"):
+        env_int("BAD_PORT", 8082)
+
+
+@pytest.mark.asyncio
+async def test_redis_bucket_without_client_raises() -> None:
+    limiter = RateLimiter()
+    with pytest.raises(RuntimeError, match="Redis лимитера"):
+        await limiter._bucket_redis(
+            1,
+            "image_generate",
+            capacity=1.0,
+            refill_per_min=1.0,
+            now=0.0,
+            consume=True,
+        )
 
 
 @pytest.mark.asyncio

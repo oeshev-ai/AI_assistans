@@ -756,3 +756,24 @@ def test_extract_generated_images_matches_tool_call_id() -> None:
     assert _extract_generated_images(messages) == [
         {"type": "url", "value": "https://cdn.example/cat.png"}
     ]
+
+
+def test_paid_demo_lives_outside_the_package() -> None:
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    package = ast.parse((root / "app" / "llm" / "assist_ai.py").read_text(encoding="utf-8"))
+    package_names = {
+        node.name
+        for node in package.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert "main" not in package_names
+    demo = ast.parse((root / "scripts" / "demo_assist_ai.py").read_text(encoding="utf-8"))
+    demo_names = {
+        node.name
+        for node in demo.body
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert "main" in demo_names

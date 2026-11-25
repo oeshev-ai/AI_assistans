@@ -30,7 +30,6 @@ from app.bot.constants import (
     MSG_UNAVAILABLE,
     MSG_UPLOAD_PROCESS_FAILED,
     STREAM_EDIT_INTERVAL,
-    TELEGRAM_TEXT_LIMIT,
     Any,
     AssistAIClient,
     AssistAIError,
@@ -122,6 +121,12 @@ from app.bot.models import (  # noqa: F401
     _tts_model_of,
     _tts_voices_for,
     _vision_model_of,
+)
+from app.bot.telegram_text import (
+    TELEGRAM_TEXT_SAFE,
+    clip_telegram_text,
+    split_telegram_text,
+    telegram_text_units,
 )
 from app.infra.cost_tracker import prefer_cost_rub
 from app.llm.video_settings import VideoSettingsScope, video_settings_from
@@ -470,8 +475,9 @@ async def _remember_model_turn(
     if not to_store:
         return
 
-    for item in to_store:
-        await storage.append_message(chat_id, assistant_id, topic_id, item, limit)
+    await storage.append_messages(
+        chat_id, assistant_id, topic_id, to_store, limit
+    )
 
 
 async def _active_topic(
@@ -513,13 +519,56 @@ def _log_handler_error(exc: BaseException) -> None:
     logger.exception("Непредвиденная ошибка")
 
 
+def _message_too_long(exc: TelegramBadRequest) -> bool:
+    text = str(exc).lower()
+    return "message is too long" in text or "message_too_long" in text
+
+
 async def _send_text(message: Message, text: str) -> None:
-    """Отправляет текст частями: у Telegram лимит 4096 символов на сообщение."""
+    """Отправляет текст частями.
+
+    Кусок не длиннее TELEGRAM_TEXT_SAFE UTF-16 code units (потолок API — 4096).
+    TelegramBadRequest не пробрасывается: ответ уже оплачен, а отказ
+    sendMessage иначе откатывает ход.
+    """
     payload = text.strip() or "Пустой ответ."
-    offset = 0
-    while offset < len(payload):
-        await message.answer(payload[offset : offset + TELEGRAM_TEXT_LIMIT])
-        offset += TELEGRAM_TEXT_LIMIT
+    await _deliver_text(message, payload)
+
+
+async def _deliver_text(message: Message, payload: str) -> bool:
+    """False — кусок не ушёл, хвост слать не нужно."""
+    for chunk in split_telegram_text(payload, TELEGRAM_TEXT_SAFE):
+        if not await _answer_chunk(message, chunk):
+            return False
+    return True
+
+
+async def _answer_chunk(message: Message, chunk: str) -> bool:
+    try:
+        await message.answer(chunk)
+        return True
+    except TelegramBadRequest as exc:
+        if not _message_too_long(exc):
+            logger.warning("Не удалось отправить сообщение: %s", exc)
+            return False
+        logger.warning("Сообщение длиннее лимита Telegram, режу повторно: %s", exc)
+        return await _answer_halved(message, chunk)
+
+
+async def _answer_halved(message: Message, chunk: str) -> bool:
+    """Один запасной рез пополам. Повторный отказ наружу не уходит."""
+    shorter = clip_telegram_text(chunk, max(1, telegram_text_units(chunk) // 2))
+    if not shorter or shorter == chunk:
+        return False
+    try:
+        await message.answer(shorter)
+    except TelegramBadRequest as exc:
+        logger.warning("Повторная отправка отклонена: %s", exc)
+        return False
+    rest = chunk[len(shorter) :]
+    if rest:
+        return await _deliver_text(message, rest)
+    return True
 
 
 async def _edit_or_answer(
@@ -539,7 +588,7 @@ async def _edit_or_answer(
 
 async def _edit_stream(status: Message, text: str, previous: str) -> str:
     """Обновляет черновик ответа. Повтор того же текста Telegram отвергает."""
-    visible = text[:TELEGRAM_TEXT_LIMIT]
+    visible = clip_telegram_text(text, TELEGRAM_TEXT_SAFE)
     if not visible or visible == previous:
         return previous
     try:
@@ -554,11 +603,10 @@ async def _edit_stream(status: Message, text: str, previous: str) -> str:
 
 async def _send_overflow(message: Message, text: str) -> None:
     """Доставляет хвост ответа, который не поместился в редактируемое сообщение."""
-    rest = text[TELEGRAM_TEXT_LIMIT:]
-    while rest:
-        chunk = rest[:TELEGRAM_TEXT_LIMIT]
-        rest = rest[TELEGRAM_TEXT_LIMIT:]
-        await message.answer(chunk)
+    head = clip_telegram_text(text, TELEGRAM_TEXT_SAFE)
+    rest = text[len(head) :]
+    if rest.strip():
+        await _deliver_text(message, rest)
 
 
 def _is_http_url(value: str) -> bool:
@@ -699,7 +747,8 @@ async def _answer_photo_bytes(
                 if pause <= 0:
                     raise
                 await asyncio.sleep(pause)
-        assert last_network is not None
+        if last_network is None:
+            raise RuntimeError("Повтор отправки фото закончился без ошибки сети")
         raise last_network
 
     last_error: TelegramBadRequest | None = None
@@ -1139,6 +1188,8 @@ async def _process_user_message_locked(
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     started = time.perf_counter()
+    keep: Token[bool] | None = None
+    metered = False
     bind_request_context(user_id=user_id, chat_id=chat_id)
     set_billing_user(user_id)
     note_active_user(user_id)
@@ -1148,162 +1199,156 @@ async def _process_user_message_locked(
         UploadRequestContext(chat_id=chat_id, user_id=user_id)
     )
     try:
-        await cost_tracker.check_budget(
-            user_id,
-            cost_tracker.estimate_chat_cost(
-                input_chars=len(user_text), output_chars=500
-            ),
-        )
-    except BudgetExceededError as exc:
-        await message.answer(exc.message)
-        reset_user_media(media_token)
-        reset_upload_request_context(upload_ctx_token)
-        clear_request_context()
-        return
-    try:
-        profile = await _active_profile(chat_id, assistant_storage)
-        topic_id = await _active_topic(chat_id, profile.id, topic_storage)
-        bind_request_context(
-            user_id=user_id,
-            chat_id=chat_id,
-            assistant_id=profile.id,
-            topic_id=topic_id,
-        )
-        history_copy = await _prepare_messages(
-            chat_id, profile.id, user_text, topic_id, topic_storage, profile
-        )
-    except AssistantStorageError:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        reset_upload_request_context(upload_ctx_token)
-        clear_request_context()
-        await _reply_profile_error(message)
-        return
-    except TopicStorageError:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        reset_upload_request_context(upload_ctx_token)
-        clear_request_context()
-        await _reply_history_error(message)
-        return
-    text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
-    logger.info(
-        "processing_message",
-        kind=input_kind,
-        model=text_model,
-        message_count=len(history_copy),
-    )
-    keep: Token[bool] | None = _KEEP_OUTGOING.set(True)
-    if status is None:
-        status = await message.answer("Готовлю ответ…")
-    parts: list[str] = []
-    shown = ""
-    last_edit = 0.0
-    scope = ImageModelScope(
-        profile.image_model,
-        profile.image_size,
-        background=M._image_background_of(profile, assistant),
-        as_file=profile.image_as_file,
-    )
-    video_scope = VideoSettingsScope(video_settings_from(profile))
-    media_scope = MediaTurnScope()
-    turn_start = len(history_copy)
-    try:
-        if message.bot is not None:
-            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, video_scope, media_scope:
-            async for delta in assistant.stream_chat(
-                messages=history_copy, model=text_model
-            ):
-                if delta.kind != "content" or not delta.text:
-                    continue
-                parts.append(delta.text)
-                now = asyncio.get_running_loop().time()
-                if now - last_edit < STREAM_EDIT_INTERVAL:
-                    continue
-                shown = await _edit_stream(status, "".join(parts), shown)
-                last_edit = now
-        answer = "".join(parts).strip()
-        images = scope.images
-        outbound = media_scope.bucket.items
-        if not answer and not images and not outbound:
-            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _edit_stream(status, "Пустой ответ.", shown)
-            keep = _release_outgoing(keep)
-            await _append_chrome(state, [status.message_id])
-            return
-        if answer:
-            visible = await _edit_stream(status, answer, shown)
-            head = answer[:TELEGRAM_TEXT_LIMIT]
-            if visible == head:
-                await _send_overflow(message, answer)
-            else:
-                await _send_text(message, answer)
-        else:
-            await _delete_bot_message(status)
-        keep = _release_outgoing(keep)
         try:
-            await _remember_model_turn(
-                chat_id,
-                profile.id,
-                topic_id,
-                topic_storage,
-                history_copy[turn_start:],
-                answer=answer,
-                images=images,
+            await cost_tracker.check_budget(
+                user_id,
+                cost_tracker.estimate_chat_cost(
+                    input_chars=len(user_text), output_chars=500
+                ),
             )
+        except BudgetExceededError as exc:
+            await message.answer(exc.message)
+            return
+        try:
+            profile = await _active_profile(chat_id, assistant_storage)
+            topic_id = await _active_topic(chat_id, profile.id, topic_storage)
+            bind_request_context(
+                user_id=user_id,
+                chat_id=chat_id,
+                assistant_id=profile.id,
+                topic_id=topic_id,
+            )
+            history_copy = await _prepare_messages(
+                chat_id, profile.id, user_text, topic_id, topic_storage, profile
+            )
+        except AssistantStorageError:
+            await _reply_profile_error(message)
+            return
         except TopicStorageError:
-            fallback = answer.strip()
-            if not fallback and images:
-                fallback = _image_completion_text(
-                    history_copy[turn_start:], len(images)
-                )
-            if fallback:
-                try:
-                    await topic_storage.append_message(
-                        chat_id,
-                        profile.id,
-                        topic_id,
-                        {"role": "assistant", "content": fallback},
-                        topic_storage.max_length,
-                    )
-                except TopicStorageError:
-                    await _reply_history_error(message)
-            else:
-                await _reply_history_error(message)
-        await _send_extracted_images(message, images, profile)
-        await _send_outbound_media(message, outbound, profile)
+            await _reply_history_error(message)
+            return
+        text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
         logger.info(
-            "message_answered",
-            chars=len(answer),
-            images=len(images),
-            outbound=len(outbound),
+            "processing_message",
+            kind=input_kind,
+            model=text_model,
+            message_count=len(history_copy),
         )
-        if answer and M._should_send_voice_reply(profile, input_kind):
-            await _send_voice_reply(message, assistant, profile, answer)
-    except (AssistAIError, httpx.TimeoutException) as exc:
-        keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images, profile)
-        await _send_outbound_media(message, media_scope.bucket.items, profile)
-        _log_handler_error(exc)
-        sentry_sdk.capture_exception(exc)
-        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-        await _report_stream_error(message, status, parts, _public_error(exc), state)
-    except Exception as exc:
-        keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images, profile)
-        await _send_outbound_media(message, media_scope.bucket.items, profile)
-        _log_handler_error(exc)
-        sentry_sdk.capture_exception(exc)
-        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-        await _report_stream_error(message, status, parts, MSG_INTERNAL, state)
+        keep = _KEEP_OUTGOING.set(True)
+        if status is None:
+            status = await message.answer("Готовлю ответ…")
+        parts: list[str] = []
+        shown = ""
+        last_edit = 0.0
+        scope = ImageModelScope(
+            profile.image_model,
+            profile.image_size,
+            background=M._image_background_of(profile, assistant),
+            as_file=profile.image_as_file,
+        )
+        video_scope = VideoSettingsScope(video_settings_from(profile))
+        media_scope = MediaTurnScope()
+        turn_start = len(history_copy)
+        try:
+            metered = True
+            if message.bot is not None:
+                await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+            with scope, video_scope, media_scope:
+                async for delta in assistant.stream_chat(
+                    messages=history_copy, model=text_model
+                ):
+                    if delta.kind != "content" or not delta.text:
+                        continue
+                    parts.append(delta.text)
+                    now = asyncio.get_running_loop().time()
+                    if now - last_edit < STREAM_EDIT_INTERVAL:
+                        continue
+                    shown = await _edit_stream(status, "".join(parts), shown)
+                    last_edit = now
+            answer = "".join(parts).strip()
+            images = scope.images
+            outbound = media_scope.bucket.items
+            if not answer and not images and not outbound:
+                await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+                await _edit_stream(status, "Пустой ответ.", shown)
+                keep = _release_outgoing(keep)
+                await _append_chrome(state, [status.message_id])
+                return
+            if answer:
+                visible = await _edit_stream(status, answer, shown)
+                head = clip_telegram_text(answer, TELEGRAM_TEXT_SAFE)
+                if visible == head:
+                    await _send_overflow(message, answer)
+                else:
+                    await _send_text(message, answer)
+            else:
+                await _delete_bot_message(status)
+            keep = _release_outgoing(keep)
+            try:
+                await _remember_model_turn(
+                    chat_id,
+                    profile.id,
+                    topic_id,
+                    topic_storage,
+                    history_copy[turn_start:],
+                    answer=answer,
+                    images=images,
+                )
+            except TopicStorageError:
+                fallback = answer.strip()
+                if not fallback and images:
+                    fallback = _image_completion_text(
+                        history_copy[turn_start:], len(images)
+                    )
+                if fallback:
+                    try:
+                        await topic_storage.append_message(
+                            chat_id,
+                            profile.id,
+                            topic_id,
+                            {"role": "assistant", "content": fallback},
+                            topic_storage.max_length,
+                        )
+                    except TopicStorageError:
+                        await _reply_history_error(message)
+                else:
+                    await _reply_history_error(message)
+            await _send_extracted_images(message, images, profile)
+            await _send_outbound_media(message, outbound, profile)
+            logger.info(
+                "message_answered",
+                chars=len(answer),
+                images=len(images),
+                outbound=len(outbound),
+            )
+            if answer and M._should_send_voice_reply(profile, input_kind):
+                await _send_voice_reply(message, assistant, profile, answer)
+        except (AssistAIError, httpx.TimeoutException) as exc:
+            keep = _release_outgoing(keep)
+            await _send_extracted_images(message, scope.images, profile)
+            await _send_outbound_media(message, media_scope.bucket.items, profile)
+            _log_handler_error(exc)
+            sentry_sdk.capture_exception(exc)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            await _report_stream_error(message, status, parts, _public_error(exc), state)
+        except Exception as exc:
+            keep = _release_outgoing(keep)
+            await _send_extracted_images(message, scope.images, profile)
+            await _send_outbound_media(message, media_scope.bucket.items, profile)
+            _log_handler_error(exc)
+            sentry_sdk.capture_exception(exc)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            await _report_stream_error(message, status, parts, MSG_INTERNAL, state)
     finally:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        reset_upload_request_context(upload_ctx_token)
-        observe_message(input_kind, time.perf_counter() - started)
-        clear_request_context()
-        _release_outgoing(keep)
+        try:
+            await cost_tracker.release_reservation(user_id)
+        finally:
+            reset_user_media(media_token)
+            reset_upload_request_context(upload_ctx_token)
+            if metered:
+                observe_message(input_kind, time.perf_counter() - started)
+            clear_request_context()
+            _release_outgoing(keep)
 
 
 async def _download_voice(message: Message) -> tuple[bytes, str]:
@@ -1622,33 +1667,30 @@ async def _process_s3_upload_session(
                 raise
             await bot.send_message(chat_id, TEXT_KEEP_TEXT)
 
-        # Короткая запись в историю активной темы.
+        # Короткая запись в историю активной темы — одним куском, под локом чата.
         try:
-            profile = await _active_profile(chat_id, assistant_storage)
-            topic_id = await _active_topic(chat_id, profile.id, topic_storage)
-            await topic_storage.append_message(
-                chat_id,
-                profile.id,
-                topic_id,
-                {
-                    "role": "user",
-                    "content": f"[Большой файл загружен в облако: {filename}]",
-                },
-                topic_storage.max_length,
-            )
-            await topic_storage.append_message(
-                chat_id,
-                profile.id,
-                topic_id,
-                {
-                    "role": "assistant",
-                    "content": (
-                        f"Расшифровка «{filename}» отправлена файлом transcript.txt "
-                        f"({len(transcript)} символов)."
-                    ),
-                },
-                topic_storage.max_length,
-            )
+            async with _chat_turn(chat_id):
+                profile = await _active_profile(chat_id, assistant_storage)
+                topic_id = await _active_topic(chat_id, profile.id, topic_storage)
+                await topic_storage.append_messages(
+                    chat_id,
+                    profile.id,
+                    topic_id,
+                    [
+                        {
+                            "role": "user",
+                            "content": f"[Большой файл загружен в облако: {filename}]",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"Расшифровка «{filename}» отправлена файлом "
+                                f"transcript.txt ({len(transcript)} символов)."
+                            ),
+                        },
+                    ],
+                    topic_storage.max_length,
+                )
         except Exception:
             logger.exception("upload_history_append_failed", chat_id=chat_id)
 
@@ -1786,152 +1828,154 @@ async def _process_vision_message_locked(
     """History-mutating body of ``_process_vision_message`` (caller holds chat lock)."""
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
+    keep: Token[bool] | None = None
+    media_token: Token[list[UserMedia] | None] | None = None
     set_billing_user(user_id)
     try:
-        await cost_tracker.check_budget(
-            user_id,
-            cost_tracker.estimate_chat_cost(input_chars=1200, output_chars=500),
-        )
-    except BudgetExceededError as exc:
-        await message.answer(exc.message)
-        return
-    media_token = set_user_media(user_media or [])
-    try:
-        profile = await _active_profile(chat_id, assistant_storage)
-        topic_id = await _active_topic(chat_id, profile.id, topic_storage)
-        history_copy = await _prepare_messages_with_image(
-            chat_id,
-            profile.id,
-            multimodal_content,
-            history_placeholder,
-            topic_id,
-            topic_storage,
-            profile,
-        )
-    except AssistantStorageError:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        await _reply_profile_error(message)
-        return
-    except TopicStorageError:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        await _reply_history_error(message)
-        return
-    vision_model = M._vision_model_of(profile, assistant, chat_id=chat_id)
-    logger.info(
-        "Vision, chat_id=%s topic_id=%s, модель=%s, сообщений в запросе=%s",
-        chat_id,
-        topic_id,
-        vision_model,
-        len(history_copy),
-    )
-    keep: Token[bool] | None = _KEEP_OUTGOING.set(True)
-    status = await message.answer(status_text)
-    parts: list[str] = []
-    shown = ""
-    last_edit = 0.0
-    scope = ImageModelScope(
-        profile.image_model,
-        profile.image_size,
-        background=M._image_background_of(profile, assistant),
-        as_file=profile.image_as_file,
-    )
-    video_scope = VideoSettingsScope(video_settings_from(profile))
-    media_scope = MediaTurnScope()
-    turn_start = len(history_copy)
-    try:
-        if message.bot is not None:
-            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-        with scope, video_scope, media_scope:
-            async for delta in assistant.stream_chat(
-                messages=history_copy, model=vision_model
-            ):
-                if delta.kind != "content" or not delta.text:
-                    continue
-                parts.append(delta.text)
-                now = asyncio.get_running_loop().time()
-                if now - last_edit < STREAM_EDIT_INTERVAL:
-                    continue
-                shown = await _edit_stream(status, "".join(parts), shown)
-                last_edit = now
-        answer = "".join(parts).strip()
-        images = scope.images
-        outbound = media_scope.bucket.items
-        if not answer and not images and not outbound:
-            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _edit_stream(status, "Пустой ответ.", shown)
-            keep = _release_outgoing(keep)
-            await _append_chrome(state, [status.message_id])
-            return
-        if answer:
-            visible = await _edit_stream(status, answer, shown)
-            head = answer[:TELEGRAM_TEXT_LIMIT]
-            if visible == head:
-                await _send_overflow(message, answer)
-            else:
-                await _send_text(message, answer)
-        else:
-            await _delete_bot_message(status)
-        keep = _release_outgoing(keep)
         try:
-            await _remember_model_turn(
+            await cost_tracker.check_budget(
+                user_id,
+                cost_tracker.estimate_chat_cost(input_chars=1200, output_chars=500),
+            )
+        except BudgetExceededError as exc:
+            await message.answer(exc.message)
+            return
+        media_token = set_user_media(user_media or [])
+        try:
+            profile = await _active_profile(chat_id, assistant_storage)
+            topic_id = await _active_topic(chat_id, profile.id, topic_storage)
+            history_copy = await _prepare_messages_with_image(
                 chat_id,
                 profile.id,
+                multimodal_content,
+                history_placeholder,
                 topic_id,
                 topic_storage,
-                history_copy[turn_start:],
-                answer=answer,
-                images=images,
+                profile,
             )
+        except AssistantStorageError:
+            await _reply_profile_error(message)
+            return
         except TopicStorageError:
-            fallback = answer.strip()
-            if not fallback and images:
-                fallback = _image_completion_text(
-                    history_copy[turn_start:], len(images)
-                )
-            if fallback:
-                try:
-                    await topic_storage.append_message(
-                        chat_id,
-                        profile.id,
-                        topic_id,
-                        {"role": "assistant", "content": fallback},
-                        topic_storage.max_length,
-                    )
-                except TopicStorageError:
-                    await _reply_history_error(message)
-            else:
-                await _reply_history_error(message)
-        await _send_extracted_images(message, images, profile)
-        await _send_outbound_media(message, outbound, profile)
+            await _reply_history_error(message)
+            return
+        vision_model = M._vision_model_of(profile, assistant, chat_id=chat_id)
         logger.info(
-            "Vision-ответ, chat_id=%s topic_id=%s, символов=%s, картинок=%s",
+            "Vision, chat_id=%s topic_id=%s, модель=%s, сообщений в запросе=%s",
             chat_id,
             topic_id,
-            len(answer),
-            len(images),
+            vision_model,
+            len(history_copy),
         )
-        if answer and M._should_send_voice_reply(profile, "text"):
-            await _send_voice_reply(message, assistant, profile, answer)
-    except (AssistAIError, httpx.TimeoutException) as exc:
-        keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images, profile)
-        await _send_outbound_media(message, media_scope.bucket.items, profile)
-        _log_handler_error(exc)
-        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-        await _report_stream_error(message, status, parts, _public_error(exc), state)
-    except Exception as exc:
-        keep = _release_outgoing(keep)
-        await _send_extracted_images(message, scope.images, profile)
-        await _send_outbound_media(message, media_scope.bucket.items, profile)
-        _log_handler_error(exc)
-        await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-        await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
+        keep = _KEEP_OUTGOING.set(True)
+        status = await message.answer(status_text)
+        parts: list[str] = []
+        shown = ""
+        last_edit = 0.0
+        scope = ImageModelScope(
+            profile.image_model,
+            profile.image_size,
+            background=M._image_background_of(profile, assistant),
+            as_file=profile.image_as_file,
+        )
+        video_scope = VideoSettingsScope(video_settings_from(profile))
+        media_scope = MediaTurnScope()
+        turn_start = len(history_copy)
+        try:
+            if message.bot is not None:
+                await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+            with scope, video_scope, media_scope:
+                async for delta in assistant.stream_chat(
+                    messages=history_copy, model=vision_model
+                ):
+                    if delta.kind != "content" or not delta.text:
+                        continue
+                    parts.append(delta.text)
+                    now = asyncio.get_running_loop().time()
+                    if now - last_edit < STREAM_EDIT_INTERVAL:
+                        continue
+                    shown = await _edit_stream(status, "".join(parts), shown)
+                    last_edit = now
+            answer = "".join(parts).strip()
+            images = scope.images
+            outbound = media_scope.bucket.items
+            if not answer and not images and not outbound:
+                await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+                await _edit_stream(status, "Пустой ответ.", shown)
+                keep = _release_outgoing(keep)
+                await _append_chrome(state, [status.message_id])
+                return
+            if answer:
+                visible = await _edit_stream(status, answer, shown)
+                head = clip_telegram_text(answer, TELEGRAM_TEXT_SAFE)
+                if visible == head:
+                    await _send_overflow(message, answer)
+                else:
+                    await _send_text(message, answer)
+            else:
+                await _delete_bot_message(status)
+            keep = _release_outgoing(keep)
+            try:
+                await _remember_model_turn(
+                    chat_id,
+                    profile.id,
+                    topic_id,
+                    topic_storage,
+                    history_copy[turn_start:],
+                    answer=answer,
+                    images=images,
+                )
+            except TopicStorageError:
+                fallback = answer.strip()
+                if not fallback and images:
+                    fallback = _image_completion_text(
+                        history_copy[turn_start:], len(images)
+                    )
+                if fallback:
+                    try:
+                        await topic_storage.append_message(
+                            chat_id,
+                            profile.id,
+                            topic_id,
+                            {"role": "assistant", "content": fallback},
+                            topic_storage.max_length,
+                        )
+                    except TopicStorageError:
+                        await _reply_history_error(message)
+                else:
+                    await _reply_history_error(message)
+            await _send_extracted_images(message, images, profile)
+            await _send_outbound_media(message, outbound, profile)
+            logger.info(
+                "Vision-ответ, chat_id=%s topic_id=%s, символов=%s, картинок=%s",
+                chat_id,
+                topic_id,
+                len(answer),
+                len(images),
+            )
+            if answer and M._should_send_voice_reply(profile, "text"):
+                await _send_voice_reply(message, assistant, profile, answer)
+        except (AssistAIError, httpx.TimeoutException) as exc:
+            keep = _release_outgoing(keep)
+            await _send_extracted_images(message, scope.images, profile)
+            await _send_outbound_media(message, media_scope.bucket.items, profile)
+            _log_handler_error(exc)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            await _report_stream_error(message, status, parts, _public_error(exc), state)
+        except Exception as exc:
+            keep = _release_outgoing(keep)
+            await _send_extracted_images(message, scope.images, profile)
+            await _send_outbound_media(message, media_scope.bucket.items, profile)
+            _log_handler_error(exc)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            await _report_stream_error(message, status, parts, MSG_UNAVAILABLE, state)
     finally:
-        await cost_tracker.release_reservation(user_id)
-        reset_user_media(media_token)
-        _release_outgoing(keep)
+        try:
+            await cost_tracker.release_reservation(user_id)
+        finally:
+            if media_token is not None:
+                reset_user_media(media_token)
+            _release_outgoing(keep)
 
 
 _DocumentMediaKind = Literal["audio", "video"]

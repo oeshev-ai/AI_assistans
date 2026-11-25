@@ -288,3 +288,79 @@ async def test_legacy_catalog_moves_to_the_reader(
     assert await _await_redis(client.get("chat:10:topics")) is None
     assert await _await_redis(client.lrange("chat:10:topic:abc:history", 0, -1)) == []
     assert await redis_storage.list_topics(10, OTHER) == []
+
+
+@pytest.mark.parametrize("storage_name", ["memory", "redis"])
+async def test_append_messages_writes_a_tool_round_at_once(
+    storage_name: str,
+    memory_storage: InMemoryTopicStorage,
+    redis_storage: RedisTopicStorage,
+) -> None:
+    storage = _pick(storage_name, memory_storage, redis_storage)
+    topic_id = await storage.create_topic(4, AID, "Рисование")
+    await storage.append_message(
+        4, AID, topic_id, {"role": "user", "content": "нарисуй"}, 20
+    )
+    updates = 0
+    original = storage._update_history if storage_name == "redis" else None
+
+    async def counting(*args: object, **kwargs: object) -> None:
+        nonlocal updates
+        updates += 1
+        assert original is not None
+        await original(*args, **kwargs)
+
+    if original is not None:
+        storage._update_history = counting  # type: ignore[method-assign]
+
+    await storage.append_messages(
+        4,
+        AID,
+        topic_id,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{}"},
+            {"role": "assistant", "content": "готово"},
+        ],
+        20,
+    )
+
+    history = await storage.get_history(4, AID, topic_id)
+    assert [item["role"] for item in history] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    if storage_name == "redis":
+        assert updates == 1
+
+
+@pytest.mark.parametrize("storage_name", ["memory", "redis"])
+async def test_append_messages_keeps_history_when_a_later_item_is_invalid(
+    storage_name: str,
+    memory_storage: InMemoryTopicStorage,
+    redis_storage: RedisTopicStorage,
+) -> None:
+    storage = _pick(storage_name, memory_storage, redis_storage)
+    topic_id = await storage.create_topic(5, AID, "Общая")
+    await storage.append_message(
+        5, AID, topic_id, {"role": "user", "content": "было"}, 20
+    )
+    with pytest.raises(TopicStorageError):
+        await storage.append_messages(
+            5,
+            AID,
+            topic_id,
+            [
+                {"role": "assistant", "content": "не должно сохраниться"},
+                {"content": "без role"},
+            ],
+            20,
+        )
+    history = await storage.get_history(5, AID, topic_id)
+    assert history == [{"role": "user", "content": "было"}]

@@ -14,7 +14,6 @@ from app.bot.constants import (
     OPENAI_TTS_VOICES,
     PAGE_SIZE,
     SPEECHKIT_VOICES,
-    TELEGRAM_TEXT_LIMIT,
     TTS_MAX_CHARS,
     Any,
     AssistAIClient,
@@ -29,6 +28,11 @@ from app.bot.constants import (
     logger,
     model_hint,
     resolve_speechkit_voice,
+)
+from app.bot.telegram_text import (
+    TELEGRAM_TEXT_SAFE,
+    clip_telegram_text,
+    telegram_text_units,
 )
 from app.llm.models_config import resolve_text_model, resolve_tts_model
 
@@ -344,12 +348,12 @@ def _hints_block(models: tuple[str, ...], current: str | None = None) -> str:
 
 
 def _fit_screen(text: str) -> str:
-    """Обрезает текст до TELEGRAM_TEXT_LIMIT с «…» на конце."""
-    if len(text) <= TELEGRAM_TEXT_LIMIT:
+    """Обрезает текст до безопасного лимита Telegram (UTF-16) с «…» на конце."""
+    if telegram_text_units(text) <= TELEGRAM_TEXT_SAFE:
         return text
-    if TELEGRAM_TEXT_LIMIT <= 1:
+    if TELEGRAM_TEXT_SAFE <= 1:
         return "…"
-    return text[: TELEGRAM_TEXT_LIMIT - 1] + "…"
+    return clip_telegram_text(text, TELEGRAM_TEXT_SAFE - 1) + "…"
 
 
 def _clip_label(prefix: str, name: str, *, suffix: str = "") -> str:

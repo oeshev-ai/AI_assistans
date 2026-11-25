@@ -8,29 +8,31 @@ logger = structlog.get_logger("envparse")
 
 
 def env_int(name: str, default: int) -> int:
+    """Пустая переменная оставляет дефолт. Нецелое значение — ошибка старта."""
     from app.infra.settings import getenv
 
     raw = getenv(name)
     if raw is None or not str(raw).strip():
         return default
+    text = str(raw).strip()
     try:
-        return int(str(raw).strip())
-    except ValueError:
-        logger.warning("env_int_invalid", name=name, value=raw, default=default)
-        return default
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{name}={text!r} не целое число") from exc
 
 
 def env_float(name: str, default: float) -> float:
+    """Пустая переменная оставляет дефолт. Нечисло, включая «1,5», — ошибка."""
     from app.infra.settings import getenv
 
     raw = getenv(name)
     if raw is None or not str(raw).strip():
         return default
+    text = str(raw).strip()
     try:
-        return float(str(raw).strip())
-    except ValueError:
-        logger.warning("env_float_invalid", name=name, value=raw, default=default)
-        return default
+        return float(text)
+    except ValueError as exc:
+        raise ValueError(f"{name}={text!r} не число") from exc
 
 
 def ensure_https_url(url: str, *, name: str, default: str) -> str:

@@ -14,6 +14,8 @@ scripts/*
 !scripts/docker-entrypoint.sh
 artifacts
 backups
+# Внутренние ТЗ и контракты. В git их нет, при локальной сборке не должны попасть в слой.
+app/docs/
 *.md
 !README.md
 *.log

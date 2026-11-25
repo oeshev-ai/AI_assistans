@@ -183,7 +183,8 @@ class EditImageTool(BaseTool):
         base, refs, error = _resolve_edit_indexes(images, kwargs)
         if error is not None:
             return _error_json(error)
-        assert base is not None
+        if base is None:
+            raise RuntimeError("Индекс основы не выбран")
         ordered = [images[base]]
         labels = [str(base + 1)]
         for index in refs:

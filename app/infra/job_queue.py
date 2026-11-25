@@ -122,6 +122,11 @@ def is_queue_enabled() -> bool:
     return _enabled and _pool is not None
 
 
+def queue_pool() -> Any | None:
+    """Пул arq, если очередь поднята. На нём же лежат payload и результаты."""
+    return _pool
+
+
 def _billing_user_id(explicit: int | None = None) -> int | None:
     if explicit is not None:
         return explicit
@@ -272,10 +277,12 @@ async def generate_image(
     """Generate an image via arq worker or inline client."""
     user_id = _billing_user_id(billing_user_id)
     if is_queue_enabled():
-        assert _pool is not None
-        wait = image_result_timeout(timeout, queued=await _queue_depth(_pool))
+        pool = _pool
+        if pool is None:
+            raise RuntimeError("Пул arq не поднят")
+        wait = image_result_timeout(timeout, queued=await _queue_depth(pool))
         try:
-            job = await _pool.enqueue_job(
+            job = await pool.enqueue_job(
                 "generate_image_task",
                 prompt,
                 model,
@@ -377,9 +384,11 @@ async def synthesize_speech(
     user_id = _billing_user_id(billing_user_id)
     timeout = audio_result_timeout(timeout)
     if is_queue_enabled():
-        assert _pool is not None
+        pool = _pool
+        if pool is None:
+            raise RuntimeError("Пул arq не поднят")
         try:
-            job = await _pool.enqueue_job(
+            job = await pool.enqueue_job(
                 "synthesize_speech_task",
                 text,
                 model,

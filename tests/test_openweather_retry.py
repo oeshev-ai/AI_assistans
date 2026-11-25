@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
 import pytest
 
-from app.llm.openweather import OpenWeatherAPIError, OpenWeatherClient, OWMConfig
+from app.llm.openweather import (
+    OpenWeatherAPIError,
+    OpenWeatherClient,
+    OWMConfig,
+    _city_local_stamp,
+)
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -110,3 +116,51 @@ async def test_retries_network_error(fast_retry: None) -> None:
     finally:
         await client.close()
     assert calls == 3
+
+
+def test_city_stamp_uses_owm_offset_not_utc() -> None:
+    observed = 1_705_320_000
+    offset = 7 * 3600
+    city = datetime.fromtimestamp(
+        observed, timezone(timedelta(seconds=offset))
+    ).strftime("%Y-%m-%d %H:%M")
+    utc = datetime.fromtimestamp(observed, UTC).strftime("%Y-%m-%d %H:%M")
+    assert city != utc
+    assert _city_local_stamp(observed, offset) == city
+    assert _city_local_stamp(observed, 0) == utc
+
+
+@pytest.mark.asyncio
+async def test_notification_updated_shows_city_time() -> None:
+    observed = 1_705_320_000
+    offset = 7 * 3600
+    city = datetime.fromtimestamp(
+        observed, timezone(timedelta(seconds=offset))
+    ).strftime("%Y-%m-%d %H:%M")
+    client = OpenWeatherClient(OWMConfig(api_key="test-key"))
+
+    async def weather(city_name: str, country_code: str | None = None) -> dict:
+        return {
+            "lat": 56.01,
+            "lon": 92.87,
+            "timezone": offset,
+            "current": {
+                "dt": observed,
+                "temp": -8.0,
+                "feels_like": -12.0,
+                "humidity": 70,
+                "wind_speed": 2.0,
+                "weather": [{"description": "ясно", "icon": "01n"}],
+            },
+        }
+
+    async def air(lat: float, lon: float) -> dict:
+        return {"list": []}
+
+    client.get_weather_by_city = weather  # type: ignore[method-assign]
+    client.get_air_pollution = air  # type: ignore[method-assign]
+    try:
+        text = await client.format_notification("Красноярск")
+    finally:
+        await client.close()
+    assert f"Обновлено: {city}" in text

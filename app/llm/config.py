@@ -9,11 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.infra.settings import get_settings
 from app.infra.settings import load_project_dotenv as load_dotenv
-
-# Ключи лежат рядом с модулем. Загружаем их до импорта клиентов,
-# чтобы те увидели то же окружение, даже если процесс запущен не из каталога проекта.
-load_dotenv()
-
 from app.llm.models_config import (
     resolve_image_model,
     resolve_text_model,
@@ -222,7 +217,7 @@ class AssistAIConfig(BaseModel):
                 Literal["source", "auto", "fixed"],
                 settings.image_edit_size_mode,
             ),
-            legacy_model_aliases=settings.image_legacy_aliases_strict,
+            legacy_model_aliases=settings.image_legacy_aliases,
             default_video_model=settings.video_model,
             tts_provider=provider,
             speechkit_api_key=settings.speechkit_api_key,

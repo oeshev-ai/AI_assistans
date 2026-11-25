@@ -54,6 +54,38 @@ def test_active_users_gauge() -> None:
     assert ACTIVE_USERS._value.get() >= 2
 
 
+class _InfoRedis:
+    def __init__(self, *, used: int, evicted: int) -> None:
+        self.used = used
+        self.evicted = evicted
+
+    async def info(self, section: str) -> dict[str, int]:
+        if section == "memory":
+            return {"used_memory": self.used}
+        return {"evicted_keys": self.evicted}
+
+
+@pytest.mark.asyncio
+async def test_eviction_growth_is_logged() -> None:
+    from structlog.testing import capture_logs
+
+    from app.infra.metrics import note_evicted_keys, refresh_redis_gauge
+
+    metrics_mod._last_evicted.pop("state", None)
+    client = _InfoRedis(used=1000, evicted=4)
+    with capture_logs() as logs:
+        await refresh_redis_gauge(client, role="state")
+        client.evicted = 7
+        await refresh_redis_gauge(client, role="state")
+    assert metrics_mod.REDIS_SIZE._value.get() == 1000
+    assert note_evicted_keys is not None
+    evicted = [item for item in logs if item["event"] == "redis_keys_evicted"]
+    assert len(evicted) == 1
+    assert evicted[0]["delta"] == 3
+    assert evicted[0]["role"] == "state"
+    metrics_mod._last_evicted.pop("state", None)
+
+
 def test_metrics_server_defaults_to_localhost_bind() -> None:
     source = inspect.getsource(start_metrics_server)
     assert "METRICS_BIND" in source

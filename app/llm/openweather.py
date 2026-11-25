@@ -174,6 +174,28 @@ def _normalize_current(data: dict) -> dict:
     }
 
 
+def _timezone_offset(value: object) -> int:
+    """Секунды сдвига от UTC из поля ``timezone`` ответа OWM."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _city_local_stamp(dt: object, timezone_offset: object) -> str:
+    """Момент наблюдения в часовом поясе города, не в поясе сервера."""
+    tz = timezone(timedelta(seconds=_timezone_offset(timezone_offset)))
+    try:
+        instant = float(dt)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        instant = 0.0
+    if instant > 0:
+        moment = datetime.fromtimestamp(instant, tz)
+    else:
+        moment = datetime.now(tz)
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
 def _daily_from_forecast(forecast: dict, days: int, timezone_offset: int) -> list[dict]:
     """Собирает суточные точки из 3-часового прогноза на 5 дней."""
     if days <= 0:
@@ -498,7 +520,10 @@ class OpenWeatherClient:
             }
             emoji = icon_map.get(current.icon, "🌡️")
 
-            updated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+            updated_at = _city_local_stamp(
+                weather_data.get("current", {}).get("dt"),
+                weather_data.get("timezone", 0),
+            )
             notification = (
                 f"{emoji} **Погода в городе {city_name.title()}**\n\n"
                 f"🌡️ Температура: **{current.temp:.1f}°C** (ощущается как {current.feels_like:.1f}°C)\n"
