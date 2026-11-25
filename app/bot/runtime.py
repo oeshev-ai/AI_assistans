@@ -1007,12 +1007,13 @@ async def _send_outbound_media(
 
                 if not item.data:
                     continue
+                document_bytes = item.data
                 user_id = message.from_user.id if message.from_user else message.chat.id
                 try:
                     await _flood_send(
                         lambda: message.answer_document(
                             document=BufferedInputFile(
-                                item.data, filename=item.filename
+                                document_bytes, filename=item.filename
                             )
                         )
                     )
@@ -1020,7 +1021,7 @@ async def _send_outbound_media(
                     if await keep_paid_bytes(
                         message.chat.id,
                         user_id,
-                        item.data,
+                        document_bytes,
                         item.filename,
                         kind="document",
                         mime=item.mime_type,
