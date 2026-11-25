@@ -622,10 +622,7 @@ def setup_upload_routes(
         too_large = False
         try:
             declared = request.content_length
-            if (
-                declared is not None
-                and declared > max_bytes + _MULTIPART_FRAMING_BYTES
-            ):
+            if declared is not None and declared > max_bytes + _MULTIPART_FRAMING_BYTES:
                 await _release_claim()
                 return _payload_too_large(request, storage.config.max_upload_mb)
             try:

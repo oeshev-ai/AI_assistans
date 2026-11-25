@@ -39,9 +39,7 @@ def test_percent_s_is_interpolated_into_json_event(capsys) -> None:
 
     records = _json_records(out)
     ours = [
-        item
-        for item in records
-        if item.get("logger") == "test.positional.arguments"
+        item for item in records if item.get("logger") == "test.positional.arguments"
     ]
     assert [item["event"] for item in ours] == [
         "Redis: активная тема chat_id=7 topic_id=t-1",

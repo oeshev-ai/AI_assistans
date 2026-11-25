@@ -1113,9 +1113,7 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        edit_size = await asyncio.to_thread(
-            self._resolve_edit_size, None, image_bytes
-        )
+        edit_size = await asyncio.to_thread(self._resolve_edit_size, None, image_bytes)
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,
@@ -1220,9 +1218,7 @@ class ImageOpsMixin(ProviderTransportMixin):
             raise AssistAIError("Клиент уже закрыт.")
 
         selected_model = model or self.config.default_image_edit_model
-        edit_size = await asyncio.to_thread(
-            self._resolve_edit_size, size, files[0][0]
-        )
+        edit_size = await asyncio.to_thread(self._resolve_edit_size, size, files[0][0])
         image_cost = cost_tracker.estimate_image_cost(
             1,
             model=selected_model,

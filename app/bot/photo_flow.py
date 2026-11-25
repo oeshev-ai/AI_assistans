@@ -741,9 +741,7 @@ async def _generate_video(
 ) -> None:
     """Ролик по присланным фото. Держит лок чата, пока ход не записан в историю."""
     async with R._chat_turn(turn.message.chat.id):
-        await _generate_video_locked(
-            turn, media, loaded, decision, topic_id, profile
-        )
+        await _generate_video_locked(turn, media, loaded, decision, topic_id, profile)
 
 
 async def _generate_video_locked(

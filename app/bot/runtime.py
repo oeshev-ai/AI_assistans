@@ -475,9 +475,7 @@ async def _remember_model_turn(
     if not to_store:
         return
 
-    await storage.append_messages(
-        chat_id, assistant_id, topic_id, to_store, limit
-    )
+    await storage.append_messages(chat_id, assistant_id, topic_id, to_store, limit)
 
 
 async def _active_topic(
@@ -1269,7 +1267,9 @@ async def _process_user_message_locked(
             images = scope.images
             outbound = media_scope.bucket.items
             if not answer and not images and not outbound:
-                await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+                await _rollback_user(
+                    chat_id, profile.id, topic_storage, topic_id, message
+                )
                 await _edit_stream(status, "Пустой ответ.", shown)
                 keep = _release_outgoing(keep)
                 await _append_chrome(state, [status.message_id])
@@ -1330,7 +1330,9 @@ async def _process_user_message_locked(
             _log_handler_error(exc)
             sentry_sdk.capture_exception(exc)
             await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _report_stream_error(message, status, parts, _public_error(exc), state)
+            await _report_stream_error(
+                message, status, parts, _public_error(exc), state
+            )
         except Exception as exc:
             keep = _release_outgoing(keep)
             await _send_extracted_images(message, scope.images, profile)
@@ -1900,7 +1902,9 @@ async def _process_vision_message_locked(
             images = scope.images
             outbound = media_scope.bucket.items
             if not answer and not images and not outbound:
-                await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+                await _rollback_user(
+                    chat_id, profile.id, topic_storage, topic_id, message
+                )
                 await _edit_stream(status, "Пустой ответ.", shown)
                 keep = _release_outgoing(keep)
                 await _append_chrome(state, [status.message_id])
@@ -1961,7 +1965,9 @@ async def _process_vision_message_locked(
             await _send_outbound_media(message, media_scope.bucket.items, profile)
             _log_handler_error(exc)
             await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
-            await _report_stream_error(message, status, parts, _public_error(exc), state)
+            await _report_stream_error(
+                message, status, parts, _public_error(exc), state
+            )
         except Exception as exc:
             keep = _release_outgoing(keep)
             await _send_extracted_images(message, scope.images, profile)
