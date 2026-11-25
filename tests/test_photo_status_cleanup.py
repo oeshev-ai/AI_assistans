@@ -57,8 +57,9 @@ async def test_generate_settles_when_status_delete_fails(
     await pending.put(media)
 
     class _Status:
-        message_id = 99
-        edits: list[str] = []
+        def __init__(self) -> None:
+            self.message_id = 99
+            self.edits: list[str] = []
 
         async def edit_text(self, text: str) -> None:
             self.edits.append(text)
@@ -73,7 +74,7 @@ async def test_generate_settles_when_status_delete_fails(
         chat = SimpleNamespace(id=1)
         from_user = SimpleNamespace(id=2)
 
-        async def answer(self, text: str, **_kwargs: Any) -> SimpleNamespace:
+        async def answer(self, text: str, **_kwargs: Any) -> Any:
             if text == "Рисую изображение…":
                 return status
             answers.append(text)
