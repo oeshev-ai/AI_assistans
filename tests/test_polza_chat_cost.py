@@ -273,7 +273,9 @@ async def test_stream_chat_bills_final_usage_chunk(
     )
     before = _sample("chat", "cost_rub", "polza", _MODEL)
     with respx.mock(assert_all_called=False) as router:
-        router.post(_POLZA_CHAT).mock(return_value=httpx.Response(200, text=stream))
+        route = router.post(_POLZA_CHAT).mock(
+            return_value=httpx.Response(200, text=stream)
+        )
         with structlog.testing.capture_logs() as logs:
             chunks = [
                 delta
@@ -282,6 +284,8 @@ async def test_stream_chat_bills_final_usage_chunk(
                     use_tools=False,
                 )
             ]
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["stream_options"] == {"include_usage": True}
     assert "".join(delta.text for delta in chunks) == "ok"
     spends = _spend(logs, "chat")
     assert len(spends) == 1
@@ -308,7 +312,9 @@ async def test_stream_chat_falls_back_without_usage(
         ]
     )
     with respx.mock(assert_all_called=False) as router:
-        router.post(_POLZA_CHAT).mock(return_value=httpx.Response(200, text=stream))
+        route = router.post(_POLZA_CHAT).mock(
+            return_value=httpx.Response(200, text=stream)
+        )
         with structlog.testing.capture_logs() as logs:
             chunks = [
                 delta
@@ -317,6 +323,8 @@ async def test_stream_chat_falls_back_without_usage(
                     use_tools=False,
                 )
             ]
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["stream_options"] == {"include_usage": True}
     assert "".join(delta.text for delta in chunks) == "ok"
     spends = _spend(logs, "chat")
     assert len(spends) == 1

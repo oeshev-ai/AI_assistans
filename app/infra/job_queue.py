@@ -153,8 +153,6 @@ def arq_queue_unavailable() -> AssistAIError:
 
 
 def _image_failed() -> Exception:
-    from app.llm.errors import AssistAIError
-
     return AssistAIError(
         "Картинка не получилась.",
         error_code="FAILED",
@@ -199,8 +197,6 @@ async def poll_arq_image_urls(job_id: str) -> ArqImageReady | None:
     """
     from arq.jobs import Job, ResultNotFound
     from redis.exceptions import RedisError
-
-    from app.llm.errors import AssistAIError
 
     pool = queue_pool()
     if pool is None:

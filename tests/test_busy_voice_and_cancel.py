@@ -2,14 +2,33 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram import Dispatcher
+from aiogram.types import Message
 
-from app.bot.handlers.chat import handle_voice
+from app.bot.handlers.assistants import (
+    sg_edit_name,
+    sg_edit_prompt,
+    sg_new_assistant_models,
+    sg_new_assistant_name,
+    sg_new_assistant_prompt,
+)
+from app.bot.handlers.chat import handle_text, handle_voice
 from app.bot.handlers.commands import cmd_cancel
+from app.bot.handlers.media import handle_audio, handle_video_file
+from app.bot.handlers.register import _register_handlers
+from app.bot.handlers.topics import sg_new_topic_name, sg_rename_topic_name
+from app.bot.states import (
+    EditAssistantSG,
+    NewAssistantSG,
+    NewTopicSG,
+    RenameTopicSG,
+)
 from app.storage.pending_media import (
     InMemoryPendingMediaStorage,
     PendingMedia,
@@ -60,6 +79,79 @@ async def test_voice_rejected_while_wizard_open() -> None:
     )
     assert answers
     assert "Отмена" in answers[0]
+
+
+def _message(**content: object) -> Message:
+    return Message.model_validate(
+        {
+            "message_id": 1,
+            "date": datetime.now(UTC).isoformat(),
+            "chat": {"id": 1, "type": "private"},
+            **content,
+        }
+    )
+
+
+async def _first_message_handler(message: Message, raw_state: str | None) -> Any:
+    dispatcher = Dispatcher()
+    _register_handlers(dispatcher)
+    for handler in dispatcher.message.handlers:
+        matched, _data = await handler.check(
+            message, raw_state=raw_state, bot=SimpleNamespace()
+        )
+        if matched:
+            return handler.callback
+    return None
+
+
+@pytest.mark.asyncio
+async def test_wizard_text_steps_do_not_swallow_media() -> None:
+    """Голос, аудио и видео в шаге мастера доходят до своих хендлеров."""
+    voice = _message(voice={"file_id": "v", "file_unique_id": "v", "duration": 1})
+    audio = _message(audio={"file_id": "a", "file_unique_id": "a", "duration": 1})
+    video = _message(
+        video={
+            "file_id": "vid",
+            "file_unique_id": "vid",
+            "width": 16,
+            "height": 16,
+            "duration": 1,
+        }
+    )
+    note = _message(
+        video_note={
+            "file_id": "n",
+            "file_unique_id": "n",
+            "length": 16,
+            "duration": 1,
+        }
+    )
+    text = _message(text="Алиса")
+    states = (
+        NewAssistantSG.name.state,
+        NewAssistantSG.prompt.state,
+        NewAssistantSG.models.state,
+        EditAssistantSG.name.state,
+        EditAssistantSG.prompt.state,
+        NewTopicSG.name.state,
+        RenameTopicSG.name.state,
+    )
+    text_handlers = {
+        NewAssistantSG.name.state: sg_new_assistant_name,
+        NewAssistantSG.prompt.state: sg_new_assistant_prompt,
+        NewAssistantSG.models.state: sg_new_assistant_models,
+        EditAssistantSG.name.state: sg_edit_name,
+        EditAssistantSG.prompt.state: sg_edit_prompt,
+        NewTopicSG.name.state: sg_new_topic_name,
+        RenameTopicSG.name.state: sg_rename_topic_name,
+    }
+    for raw_state in states:
+        assert await _first_message_handler(voice, raw_state) is handle_voice
+        assert await _first_message_handler(audio, raw_state) is handle_audio
+        assert await _first_message_handler(video, raw_state) is handle_video_file
+        assert await _first_message_handler(note, raw_state) is handle_video_file
+        assert await _first_message_handler(text, raw_state) is text_handlers[raw_state]
+    assert await _first_message_handler(text, None) is handle_text
 
 
 @pytest.mark.asyncio
@@ -176,7 +268,6 @@ async def test_cancel_words_without_slot_do_not_reach_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import app.bot.runtime as runtime
-    from app.bot.handlers.chat import handle_text
 
     processed: list[str] = []
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -266,6 +267,58 @@ class S3Storage:
         except S3StorageError:
             raise
         except _storage_error_types() as exc:
+            logger.exception(
+                "s3_download_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось скачать объект") from exc
+
+    async def download_file(
+        self,
+        object_key: str,
+        destination: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Пишет объект на диск потоком, не собирая тело в один ``bytes``."""
+        limit = max_bytes
+        if limit is None:
+            limit = self.config.max_upload_mb * 1024 * 1024
+
+        def _get() -> None:
+            response = self._client.get_object(
+                Bucket=self.config.bucket, Key=object_key
+            )
+            content_length = response.get("ContentLength")
+            body = response["Body"]
+            try:
+                if content_length is not None and int(content_length) > limit:
+                    raise S3StorageError(
+                        f"Объект больше лимита ({limit} байт): {object_key}"
+                    )
+                total = 0
+                with destination.open("wb") as handle:
+                    while True:
+                        chunk = body.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > limit:
+                            raise S3StorageError(
+                                f"Объект больше лимита ({limit} байт): {object_key}"
+                            )
+                        handle.write(chunk)
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            finally:
+                body.close()
+
+        try:
+            await asyncio.to_thread(_get)
+        except S3StorageError:
+            raise
+        except _storage_error_types() as exc:
+            destination.unlink(missing_ok=True)
             logger.exception(
                 "s3_download_failed", key=object_key, error=_error_code(exc)
             )

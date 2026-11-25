@@ -145,6 +145,12 @@ def _has_arq(record: ImageDelivery) -> bool:
     return any(job.get("provider") == "arq" for job in record.jobs)
 
 
+def _only_arq(record: ImageDelivery) -> bool:
+    return bool(record.jobs) and all(
+        job.get("provider") == "arq" for job in record.jobs
+    )
+
+
 def _due_records(records: list[ImageDelivery], now: float) -> list[ImageDelivery]:
     return [
         record for record in records if record.expired(now) or record.not_before <= now
@@ -162,6 +168,9 @@ async def deliver_due(
 ) -> None:
     """Одна проходка: просроченные закрыть, подошедшие скачать и отправить.
 
+    Запись без ссылок, где все задачи — arq, пропускается. Её на каждом тике
+    ведёт promote, а пустой проход здесь только сжигал бы ``attempts`` и
+    отодвигал первую настоящую закачку с CDN к потолку в полчаса.
     ``records`` — уже прочитанный индекс. Иначе чтение делает ``store.due``.
     """
     moment = delivery_clock() if now is None else now
@@ -175,6 +184,8 @@ async def deliver_due(
             await _notify(bot, record.chat_id, IMAGE_EXPIRED_TEXT)
             await store.delete(record.chat_id, record.user_id)
             logger.info("image_delivery_expired", chat_id=record.chat_id)
+            continue
+        if not record.urls and _only_arq(record):
             continue
         await _deliver_record(bot, store, download, record, moment, resume)
 
@@ -217,26 +228,23 @@ async def _refuse_arq_without_queue(
     records: list[ImageDelivery],
     now: float,
 ) -> None:
-    """Очередь выключена: arq-задачу больше не у кого спросить."""
+    """Очередь выключена: arq-задачи записи больше не у кого спросить.
+
+    Текст один на запись, даже если задач несколько: сообщение одно и то же.
+    """
     from app.infra.job_queue import arq_queue_unavailable
 
     exc = arq_queue_unavailable()
     for record in records:
-        kept: list[dict[str, str]] = []
-        stopped = False
-        for job in record.jobs:
-            if job.get("provider") != "arq":
-                kept.append(job)
-                continue
-            stopped = True
-            await _notify(bot, record.chat_id, exc.message)
-            logger.info(
-                "image_delivery_arq_stopped",
-                chat_id=record.chat_id,
-                error_code=exc.error_code,
-            )
-        if not stopped:
+        kept = [job for job in record.jobs if job.get("provider") != "arq"]
+        if len(kept) == len(record.jobs):
             continue
+        await _notify(bot, record.chat_id, exc.message)
+        logger.info(
+            "image_delivery_arq_stopped",
+            chat_id=record.chat_id,
+            error_code=exc.error_code,
+        )
         record.jobs = kept
         await store.save(record, now=now)
 
@@ -408,26 +416,38 @@ def _next_image_name(index: int) -> str:
     return f"image_{index + 1}.png"
 
 
+def _payload_skip(job: dict[str, str]) -> int:
+    raw = job.get("sent")
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return 0
+
+
 async def _hand_off_image_bytes(
     bot: Bot,
     record: ImageDelivery,
     payloads: list[tuple[bytes, str]],
     *,
     as_file: bool,
-) -> bool:
-    """Отдаёт байты в чат. False — файл не ушёл и копия в бакет не легла.
+    skip: int = 0,
+) -> int:
+    """Сколько кадров с начала пачки уже ушли в чат или в бакет.
 
-    Пока ключ результата в Redis жив, задача остаётся и следующий тик
-    повторит отправку. В бакете картинок нет: те же 7 дней, что у озвучки,
-    вид отправки — документ.
+    Кадр, который не ушёл и не лёг в бакет, останавливает пачку. Хвост
+    уйдёт следующим тиком: в задаче запоминается длина сданного префикса,
+    уже отправленные кадры не повторяются. Бакет доставки необязателен,
+    без него прогресс всё равно держится на самой задаче.
     """
     from app.bot.file_retry import keep_paid_bytes
 
-    pending = False
+    settled = 0
     index = len(record.filenames)
-    for raw, mime in payloads:
+    for offset, (raw, mime) in enumerate(payloads):
         filename = _next_image_name(index)
         index += 1
+        if offset < skip:
+            settled += 1
+            continue
         try:
             await _send_bytes(
                 bot,
@@ -447,19 +467,21 @@ async def _hand_off_image_bytes(
                 mime=mime or "image/png",
             )
             if not saved:
-                pending = True
                 logger.warning(
                     "image_delivery_bytes_unkept",
                     chat_id=record.chat_id,
                     bytes=len(raw),
                 )
+                return settled
+            settled += 1
             continue
         logger.info(
             "image_delivery_sent",
             chat_id=record.chat_id,
             bytes=len(raw),
         )
-    return not pending
+        settled += 1
+    return settled
 
 
 async def promote_arq_image_jobs(
@@ -486,6 +508,7 @@ async def promote_arq_image_jobs(
         kept: list[dict[str, str]] = []
         added = False
         stopped = False
+        progressed = False
         flags = _align_delivery_flags(record)
         for job in record.jobs:
             if job.get("provider") != "arq":
@@ -513,11 +536,16 @@ async def promote_arq_image_jobs(
                 record.urls.append(url)
                 record.filenames.append(_next_image_name(len(record.filenames)))
                 added = True
-            if not await _hand_off_image_bytes(
-                bot, record, ready.payloads, as_file=as_file
-            ):
+            skip = _payload_skip(job)
+            settled = await _hand_off_image_bytes(
+                bot, record, ready.payloads, as_file=as_file, skip=skip
+            )
+            if settled < len(ready.payloads):
+                if settled > skip:
+                    job["sent"] = str(settled)
+                    progressed = True
                 kept.append(job)
-        if kept == record.jobs and not added and not stopped:
+        if kept == record.jobs and not added and not stopped and not progressed:
             continue
         record.jobs = kept
         record.as_files = flags

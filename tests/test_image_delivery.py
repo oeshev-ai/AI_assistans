@@ -32,6 +32,7 @@ from app.llm.errors import AssistAIError
 from app.storage.file_delivery import InMemoryFileDeliveryStore
 from app.storage.image_delivery import (
     IMAGE_DELIVERY_TTL_SECONDS,
+    ImageDelivery,
     InMemoryImageDeliveryStore,
     RedisImageDeliveryStore,
     delivery_clock,
@@ -548,6 +549,94 @@ async def test_delivery_pass_does_not_resume_an_arq_job() -> None:
     )
     kept = (await store.active(now))[0]
     assert kept.jobs == [{"provider": "arq", "id": "jobhex"}]
+    assert kept.attempts == 0
+    assert kept.not_before == now
+
+
+@pytest.mark.asyncio
+async def test_idle_arq_ticks_do_not_stretch_the_cdn_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Пока воркер считает картинку, пустые проходы не раздувают паузу CDN."""
+    store = InMemoryImageDeliveryStore()
+    now = 1_000.0
+    await store.add_job(1, 2, "arq", "jobhex", now=now)
+
+    async def _no_url(_url: str) -> bytes:
+        raise AssertionError("no url yet")
+
+    for moment in (now + 60, now + 180, now + 420, now + 900, now + 1860):
+        await deliver_due(
+            _Bot(),  # type: ignore[arg-type]
+            store,
+            _no_url,
+            now=moment,
+        )
+    waiting = (await store.active(now))[0]
+    assert waiting.attempts == 0
+    assert waiting.not_before == now + retry_delay_seconds(0)
+    assert waiting.jobs == [{"provider": "arq", "id": "jobhex"}]
+
+    async def _urls(_job_id: str) -> ArqImageReady:
+        return ArqImageReady(
+            urls=["https://s3.polza.ai/ready.png"],
+            payloads=[],
+        )
+
+    monkeypatch.setattr("app.infra.job_queue.poll_arq_image_urls", _urls)
+    ready_at = now + 2_000
+    await promote_arq_image_jobs(_Bot(), store, now=ready_at)  # type: ignore[arg-type]
+
+    async def _timeout(_url: str) -> bytes:
+        raise AssistAIError(
+            "Не удалось скачать изображение с CDN провайдера.",
+            error_code="TIMEOUT",
+        )
+
+    await deliver_due(
+        _Bot(),  # type: ignore[arg-type]
+        store,
+        _timeout,
+        now=ready_at,
+    )
+    retried = (await store.active(ready_at))[0]
+    assert retried.urls == ["https://s3.polza.ai/ready.png"]
+    assert retried.jobs == []
+    assert retried.attempts == 1
+    assert retried.not_before == ready_at + retry_delay_seconds(1)
+
+
+@pytest.mark.asyncio
+async def test_cdn_failure_still_backs_off_while_an_arq_job_waits() -> None:
+    store = InMemoryImageDeliveryStore()
+    now = 50.0
+    await store.add(1, 2, "https://s3.polza.ai/a.png", "image.png", now=0)
+    await store.add_job(1, 2, "arq", "jobhex", now=0)
+    record = (await store.active(0))[0]
+    record.not_before = now
+    await store.save(record, now=now)
+
+    async def _timeout(_url: str) -> bytes:
+        raise AssistAIError(
+            "Не удалось скачать изображение с CDN провайдера.",
+            error_code="TIMEOUT",
+        )
+
+    async def _resume(_provider: str, _job_id: str) -> bytes:
+        raise AssertionError("arq job is polled by the watcher")
+
+    await deliver_due(
+        _Bot(),  # type: ignore[arg-type]
+        store,
+        _timeout,
+        resume=_resume,
+        now=now,
+    )
+    kept = (await store.active(now))[0]
+    assert kept.urls == ["https://s3.polza.ai/a.png"]
+    assert kept.jobs == [{"provider": "arq", "id": "jobhex"}]
+    assert kept.attempts == 1
+    assert kept.not_before == now + retry_delay_seconds(1)
 
 
 def test_photo_size_and_type_errors_fall_back_to_document() -> None:
@@ -605,6 +694,33 @@ class _DeliveryBot:
     async def send_message(self, chat_id: int, text: str) -> None:
         del chat_id
         self.texts.append(text)
+
+
+class _FailAfter(_DeliveryBot):
+    """Первые ``succeed`` кадров уходят, следующий обрывается."""
+
+    def __init__(self, *, succeed: int) -> None:
+        super().__init__()
+        self.succeed = succeed
+
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: object,
+        caption: str | None = None,
+        request_timeout: int | None = None,
+    ) -> None:
+        if len(self.payloads) >= self.succeed:
+            raise TelegramNetworkError(
+                method=SendMessage(chat_id=1, text="x"),
+                message="Server disconnected",
+            )
+        await super().send_photo(
+            chat_id,
+            photo,
+            caption=caption,
+            request_timeout=request_timeout,
+        )
 
 
 class _Bucket:
@@ -734,6 +850,27 @@ async def test_disabled_queue_refuses_arq_jobs_without_a_second_scan(
     assert bot.texts == [_QUEUE_OFF]
     assert "image_delivery:64:4" not in redis.kv
     assert "image_delivery:63:2" not in redis.kv
+
+
+@pytest.mark.asyncio
+async def test_disabled_queue_refuses_a_record_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryImageDeliveryStore()
+    now = 60.0
+    await store.add_job(80, 4, "arq", "jobone", now=now)
+    await store.add_job(80, 4, "arq", "jobtwo", now=now)
+    await store.add_job(80, 4, "polza", "jobthree", now=now)
+    monkeypatch.setattr("app.infra.job_queue.is_queue_enabled", lambda: False)
+
+    async def _png(_url: str) -> bytes:
+        return b"png"
+
+    bot = _Bot()
+    await image_delivery_tick(bot, store, _png, now=now)  # type: ignore[arg-type]
+    assert bot.texts == [_QUEUE_OFF]
+    record = (await store.active(now))[0]
+    assert record.jobs == [{"provider": "polza", "id": "jobthree"}]
 
 
 @pytest.mark.asyncio
@@ -905,6 +1042,91 @@ async def test_base64_job_stays_until_the_bytes_can_be_stored(
     record = (await store.active(now))[0]
     assert record.jobs == [{"provider": "arq", "id": "jobhex"}]
     assert record.urls == []
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def test_sent_prefix_survives_reload_and_drops_garbage() -> None:
+    record = ImageDelivery.from_json(
+        json.dumps(
+            {
+                "chat_id": 1,
+                "user_id": 2,
+                "urls": [],
+                "filenames": [],
+                "created_at": 1,
+                "jobs": [
+                    {"provider": "arq", "id": "jobhex", "sent": "2"},
+                    {"provider": "arq", "id": "otherhex", "sent": "0"},
+                    {"provider": "arq", "id": "thirdhex", "sent": "nope"},
+                ],
+            }
+        )
+    )
+    assert record is not None
+    assert record.jobs == [
+        {"provider": "arq", "id": "jobhex", "sent": "2"},
+        {"provider": "arq", "id": "otherhex"},
+        {"provider": "arq", "id": "thirdhex"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_batch_does_not_resend_frames_already_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Без бакета упавший второй кадр не заставляет слать первый заново."""
+    first, second, third = b"frame-a", b"frame-b", b"frame-c"
+    _stub_arq_result(monkeypatch, [_b64(first), _b64(second), _b64(third)])
+    redis = _Redis()
+    store = RedisImageDeliveryStore(redis)  # type: ignore[arg-type]
+    now = delivery_clock()
+    await store.add_job(71, 42, "arq", "jobhex", now=now)
+    bind_file_delivery(None)
+
+    failed = _FailAfter(succeed=1)
+    await promote_arq_image_jobs(failed, store, now=now)  # type: ignore[arg-type]
+    assert failed.payloads == [first]
+    waiting = (await store.active(now))[0]
+    assert waiting.jobs == [{"provider": "arq", "id": "jobhex", "sent": "1"}]
+
+    stalled = _FailAfter(succeed=0)
+    await promote_arq_image_jobs(stalled, store, now=now)  # type: ignore[arg-type]
+    assert stalled.payloads == []
+    still = (await store.active(now))[0]
+    assert still.jobs == [{"provider": "arq", "id": "jobhex", "sent": "1"}]
+
+    done = _DeliveryBot()
+    await promote_arq_image_jobs(done, store, now=now)  # type: ignore[arg-type]
+    assert done.payloads == [second, third]
+    assert await store.active(now) == []
+
+
+@pytest.mark.asyncio
+async def test_kept_failed_frame_does_not_keep_the_sent_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, second = b"frame-a", b"frame-b"
+    _stub_arq_result(monkeypatch, [_b64(first), _b64(second)])
+    store = InMemoryImageDeliveryStore()
+    file_store = InMemoryFileDeliveryStore()
+    bucket = _Bucket()
+    now = delivery_clock()
+    await store.add_job(73, 42, "arq", "jobhex", now=now)
+    bind_file_delivery(file_store, bucket)  # type: ignore[arg-type]
+    bot = _FailAfter(succeed=1)
+    try:
+        await promote_arq_image_jobs(bot, store, now=now)  # type: ignore[arg-type]
+    finally:
+        bind_file_delivery(None)
+    assert bot.payloads == [first]
+    assert list(bucket.objects.values()) == [second]
+    assert await store.active(now) == []
+    again = _DeliveryBot()
+    await promote_arq_image_jobs(again, store, now=now)  # type: ignore[arg-type]
+    assert again.payloads == []
 
 
 @pytest.mark.asyncio

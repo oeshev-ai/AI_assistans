@@ -140,13 +140,15 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
         on_upload_cancel, F.data.startswith("upload:cancel:")
     )
     dispatcher.message.register(cmd_unknown, F.text.startswith("/"))
-    dispatcher.message.register(sg_new_assistant_name, NewAssistantSG.name)
-    dispatcher.message.register(sg_edit_name, EditAssistantSG.name)
-    dispatcher.message.register(sg_edit_prompt, EditAssistantSG.prompt)
-    dispatcher.message.register(sg_new_assistant_prompt, NewAssistantSG.prompt)
-    dispatcher.message.register(sg_new_assistant_models, NewAssistantSG.models)
-    dispatcher.message.register(sg_new_topic_name, NewTopicSG.name)
-    dispatcher.message.register(sg_rename_topic_name, RenameTopicSG.name)
+    # Только текст: иначе голос, аудио и видео съедает шаг мастера
+    # раньше своих хендлеров, и _reject_if_busy не вызывается.
+    dispatcher.message.register(sg_new_assistant_name, NewAssistantSG.name, F.text)
+    dispatcher.message.register(sg_edit_name, EditAssistantSG.name, F.text)
+    dispatcher.message.register(sg_edit_prompt, EditAssistantSG.prompt, F.text)
+    dispatcher.message.register(sg_new_assistant_prompt, NewAssistantSG.prompt, F.text)
+    dispatcher.message.register(sg_new_assistant_models, NewAssistantSG.models, F.text)
+    dispatcher.message.register(sg_new_topic_name, NewTopicSG.name, F.text)
+    dispatcher.message.register(sg_rename_topic_name, RenameTopicSG.name, F.text)
     dispatcher.callback_query.register(on_asst_use, F.data.startswith("asst:use:"))
     dispatcher.callback_query.register(
         on_asst_del_ask, F.data.startswith("asst:del_ask:")
