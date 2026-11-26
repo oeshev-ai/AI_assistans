@@ -10,10 +10,13 @@ import pytest
 from app.media import media_utils
 from app.media.media_utils import (
     MediaProcessingError,
+    SttChunks,
     _duration_from_ffmpeg_text,
     audio_duration_seconds,
+    close_stt_chunks,
     communicate_with_timeout,
     extract_audio_from_video,
+    iter_stt_chunk_bytes,
     prepare_audio_file_for_stt,
     prepare_audio_for_stt,
     split_audio_file_for_stt,
@@ -37,6 +40,20 @@ class _HungProc:
     async def wait(self) -> int:
         self.returncode = -9
         return -9
+
+
+class _OkProc:
+    def __init__(self) -> None:
+        self.returncode = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"", b""
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        return self.returncode
 
 
 class _FailProc:
@@ -102,6 +119,107 @@ async def test_long_file_is_split_from_disk_not_loaded_whole(
     assert seen["source_bytes"] == 10
     assert b"0123456789" not in {item for item, _name in parts}
     assert parts == [(b"aa", "chunk_001.mp3"), (b"bb", "chunk_002.mp3")]
+
+
+@pytest.mark.asyncio
+async def test_long_split_reads_one_chunk_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "big.mp3"
+    src.write_bytes(b"0123456789")
+    reads: list[int] = []
+
+    async def fake_exec(*args: object, **_kwargs: object) -> _OkProc:
+        pattern = next(
+            item for item in args if isinstance(item, str) and "chunk_%03d.mp3" in item
+        )
+        folder = Path(pattern).parent
+        (folder / "chunk_000.mp3").write_bytes(b"aaaa")
+        (folder / "chunk_001.mp3").write_bytes(b"bbbb")
+        return _OkProc()
+
+    real_read = Path.read_bytes
+
+    def counting_read(self: Path) -> bytes:
+        reads.append(self.stat().st_size)
+        return real_read(self)
+
+    monkeypatch.setattr(media_utils, "_MAX_CHUNK_BYTES", 4)
+    monkeypatch.setattr(media_utils, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(media_utils.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+    chunks = await split_audio_file_for_stt(src, filename="big.mp3")
+    try:
+        assert isinstance(chunks, SttChunks)
+        assert reads == []
+        assert len(chunks) == 2
+        loaded: list[tuple[bytes, str]] = []
+        async for item in iter_stt_chunk_bytes(chunks):
+            loaded.append(item)
+            assert len(reads) == len(loaded)
+        assert loaded == [
+            (b"aaaa", "chunk_001.mp3"),
+            (b"bbbb", "chunk_002.mp3"),
+        ]
+    finally:
+        close_stt_chunks(chunks)
+
+
+@pytest.mark.asyncio
+async def test_oversized_chunk_is_rejected_without_keeping_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "big.mp3"
+    src.write_bytes(b"0123456789")
+    seen: dict[str, Path] = {}
+
+    async def fake_exec(*args: object, **_kwargs: object) -> _OkProc:
+        pattern = next(
+            item for item in args if isinstance(item, str) and "chunk_%03d.mp3" in item
+        )
+        folder = Path(pattern).parent
+        seen["dir"] = folder
+        (folder / "chunk_000.mp3").write_bytes(b"aaaaa")
+        return _OkProc()
+
+    monkeypatch.setattr(media_utils, "_MAX_CHUNK_BYTES", 4)
+    monkeypatch.setattr(media_utils, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(media_utils.asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(MediaProcessingError, match="слишком большой"):
+        await split_audio_file_for_stt(src, filename="big.mp3")
+    assert not seen["dir"].exists()
+
+
+@pytest.mark.asyncio
+async def test_chunk_duration_uses_file_size_not_a_full_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    folder = tempfile.TemporaryDirectory()
+    path = Path(folder.name) / "chunk_000.mp3"
+    path.write_bytes(b"x" * 16000)
+    chunks = SttChunks(folder, [(path, "chunk_001.mp3")], source_bytes=16000)
+
+    async def no_probe(_path: Path) -> None:
+        return None
+
+    reads: list[Path] = []
+    real_read = Path.read_bytes
+
+    def counting_read(self: Path) -> bytes:
+        reads.append(self)
+        return real_read(self)
+
+    monkeypatch.setattr(media_utils, "probe_file_duration_seconds", no_probe)
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+    try:
+        seconds = await audio_duration_seconds(chunks)
+    finally:
+        chunks.close()
+    assert seconds == pytest.approx(2.0)
+    assert reads == []
 
 
 @pytest.mark.asyncio

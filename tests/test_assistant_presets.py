@@ -6,10 +6,14 @@ from app.llm.models_config import (
     AVAILABLE_IMAGE_MODELS,
     AVAILABLE_TEXT_MODELS,
     AVAILABLE_TTS_MODELS,
+    SPEECHKIT_TTS_MODEL,
 )
+from app.llm.speechkit_tts import SPEECHKIT_VOICES
 from app.storage.assistant_presets import (
     ASSISTANT_PRESETS,
+    AssistantPreset,
     _size_ok,
+    _tts_voices_for_model,
     get_preset,
     preset_profile,
     validate_catalog,
@@ -84,6 +88,36 @@ def test_preset_profile_new_id_and_dedup() -> None:
     assert len(second.name) <= 50
     third = preset_profile(preset, [first.name, second.name])
     assert third.name == f"{preset.name} (3)"
+
+
+def test_speechkit_preset_uses_its_voices_and_opus() -> None:
+    voices = _tts_voices_for_model(SPEECHKIT_TTS_MODEL)
+    assert voices == SPEECHKIT_VOICES
+    assert "marina" in voices
+    assert "nova" not in voices
+    assert _tts_voices_for_model("openai/gpt-4o-mini-tts") == (
+        "alloy",
+        "verse",
+        "nova",
+        "shimmer",
+    )
+    preset = AssistantPreset(
+        id="speaker",
+        icon="🎵",
+        name="Диктор",
+        summary="Озвучка SpeechKit",
+        system_prompt="Ты диктор. Говори ясно и коротко, без лишних вступлений.",
+        tts_model=SPEECHKIT_TTS_MODEL,
+        tts_voice="marina",
+    )
+    assert preset.tts_voice in _tts_voices_for_model(preset.tts_model or "")
+    profile = preset_profile(preset, [])
+    assert profile.tts_model == SPEECHKIT_TTS_MODEL
+    assert profile.tts_voice == "marina"
+    assert profile.tts_format == "opus"
+    tutor = get_preset("tutor")
+    assert tutor is not None
+    assert preset_profile(tutor, []).tts_format is None
 
 
 def test_preset_profile_long_name_truncates_with_suffix() -> None:

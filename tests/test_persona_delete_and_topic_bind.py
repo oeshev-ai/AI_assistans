@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.bot.handlers.assistants import on_asst_del_yes
-from app.bot.handlers.topics import on_topic_delete_yes, sg_rename_topic_name
+from app.bot.handlers.topics import (
+    on_topic_delete_yes,
+    sg_new_topic_name,
+    sg_rename_topic_name,
+)
 from app.storage.assistant_storage import (
     DEFAULT_ASSISTANT_ID,
     InMemoryAssistantStorage,
@@ -219,4 +223,84 @@ async def test_rename_uses_flow_assistant_id(
     renamed = await topics.list_topics(1, "bound")
     assert renamed[0]["name"] == "Beta"
     # Активная «стандартная» персона не должна получить эту тему.
+    assert await topics.list_topics(1, DEFAULT_ASSISTANT_ID) == []
+
+
+def _flow_state(data: dict[str, Any]) -> Any:
+    class _State:
+        async def get_data(self) -> dict[str, Any]:
+            return dict(data)
+
+    return _State()
+
+
+def _text_message(body: str) -> Any:
+    answers: list[str] = []
+
+    class _Message:
+        chat = SimpleNamespace(id=1)
+        text = body
+
+        async def answer(self, text: str, **_kwargs: Any) -> None:
+            answers.append(text)
+
+    message = _Message()
+    message.answers = answers  # type: ignore[attr-defined]
+    return message
+
+
+@pytest.mark.asyncio
+async def test_new_topic_without_persona_resets_the_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.bot.runtime as runtime
+
+    topics = InMemoryTopicStorage()
+    monkeypatch.setattr(runtime, "_reset_flow", AsyncMock())
+    monkeypatch.setattr(runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(
+        runtime,
+        "_active_profile",
+        AsyncMock(return_value=SimpleNamespace(id=DEFAULT_ASSISTANT_ID)),
+    )
+    message = _text_message("Работа")
+    await sg_new_topic_name(
+        message,
+        state=_flow_state({}),
+        topic_storage=topics,
+        assistant_storage=SimpleNamespace(),
+    )
+    assert message.answers == ["Персона для новой темы не выбрана."]
+    runtime._reset_flow.assert_awaited_once()
+    runtime._active_profile.assert_not_called()
+    assert await topics.list_topics(1, DEFAULT_ASSISTANT_ID) == []
+
+
+@pytest.mark.asyncio
+async def test_rename_without_persona_resets_the_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.bot.runtime as runtime
+
+    topics = InMemoryTopicStorage()
+    await topics.create_topic(1, "bound", "Alpha")
+    topic_id = (await topics.list_topics(1, "bound"))[0]["id"]
+    monkeypatch.setattr(runtime, "_reset_flow", AsyncMock())
+    monkeypatch.setattr(runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(
+        runtime,
+        "_active_profile",
+        AsyncMock(return_value=SimpleNamespace(id=DEFAULT_ASSISTANT_ID)),
+    )
+    message = _text_message("Beta")
+    await sg_rename_topic_name(
+        message,
+        state=_flow_state({"flow_topic_id": topic_id}),
+        topic_storage=topics,
+        assistant_storage=SimpleNamespace(),
+    )
+    assert message.answers == ["Персона для переименования не выбрана."]
+    runtime._reset_flow.assert_awaited_once()
+    runtime._active_profile.assert_not_called()
+    assert (await topics.list_topics(1, "bound"))[0]["name"] == "Alpha"
     assert await topics.list_topics(1, DEFAULT_ASSISTANT_ID) == []

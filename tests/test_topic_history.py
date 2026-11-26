@@ -9,6 +9,7 @@ from typing import TypeVar
 import pytest
 import pytest_asyncio
 from fakeredis import FakeAsyncRedis
+from redis.exceptions import RedisError, WatchError
 
 from app.storage.topic_history import (
     InMemoryTopicStorage,
@@ -215,6 +216,91 @@ async def test_rename_topic_and_unknown(
         await storage.delete_topic(9, AID, "missing")
 
 
+@pytest.mark.parametrize("storage_name", ["memory", "redis"])
+async def test_topic_names_are_unique_per_persona(
+    storage_name: str,
+    memory_storage: InMemoryTopicStorage,
+    redis_storage: RedisTopicStorage,
+) -> None:
+    storage = _pick(storage_name, memory_storage, redis_storage)
+    first = await storage.create_topic(20, AID, "Работа")
+    second = await storage.create_topic(20, AID, "  Работа ")
+    third = await storage.create_topic(20, AID, "Работа")
+    other = await storage.create_topic(20, OTHER, "Работа")
+    draft = await storage.create_topic(20, AID, "Черновик")
+
+    names = {item["id"]: item["name"] for item in await storage.list_topics(20, AID)}
+    assert names[first] == "Работа"
+    assert names[second] == "Работа (2)"
+    assert names[third] == "Работа (3)"
+    assert names[draft] == "Черновик"
+    assert (await storage.list_topics(20, OTHER))[0]["id"] == other
+    assert (await storage.list_topics(20, OTHER))[0]["name"] == "Работа"
+
+    await storage.rename_topic(20, AID, first, "Работа")
+    await storage.rename_topic(20, AID, draft, "Работа")
+    names = {item["id"]: item["name"] for item in await storage.list_topics(20, AID)}
+    assert names[first] == "Работа"
+    assert names[draft] == "Работа (4)"
+
+    base = "я" * 100
+    await storage.create_topic(21, AID, base)
+    await storage.create_topic(21, AID, base)
+    long_names = [item["name"] for item in await storage.list_topics(21, AID)]
+    assert long_names[0] == base
+    assert long_names[1].endswith(" (2)")
+    assert len(long_names[1]) == 100
+
+    await storage.create_topic(22, AID, "Общая")
+    if isinstance(storage, RedisTopicStorage):
+        await storage._redis.delete(storage._active_key(22, AID))
+    else:
+        storage._chats[(22, AID)].active = ""
+    await storage.ensure_active(22, AID, "Общая")
+    assert [item["name"] for item in await storage.list_topics(22, AID)] == [
+        "Общая",
+        "Общая (2)",
+    ]
+
+
+async def test_delete_topic_failure_keeps_catalog_and_history(
+    redis_storage: RedisTopicStorage,
+) -> None:
+    """Сбой транзакции не убирает тему из списка и не стирает её историю."""
+    topic_id = await redis_storage.create_topic(11, AID, "Работа")
+    await redis_storage.append_message(
+        11, AID, topic_id, {"role": "user", "content": "x"}, 20
+    )
+    history_key = f"chat:11:asst:{AID}:topic:{topic_id}:history"
+    client = redis_storage._redis
+    real_pipeline = client.pipeline
+
+    def pipeline(*args: object, **kwargs: object) -> object:
+        pipe = real_pipeline(*args, **kwargs)
+        real_execute = pipe.execute
+
+        async def execute(*exec_args: object, **exec_kwargs: object) -> object:
+            queued = [part for item in pipe.command_stack for part in item[0]]
+            if history_key in queued:
+                raise RedisError("down")
+            return await real_execute(*exec_args, **exec_kwargs)
+
+        pipe.execute = execute  # type: ignore[method-assign]
+        return pipe
+
+    client.pipeline = pipeline  # type: ignore[method-assign]
+    with pytest.raises(TopicStorageError):
+        await redis_storage.delete_topic(11, AID, topic_id)
+    client.pipeline = real_pipeline  # type: ignore[method-assign]
+
+    assert await redis_storage.list_topics(11, AID) == [
+        {"id": topic_id, "name": "Работа"}
+    ]
+    assert await redis_storage.get_history(11, AID, topic_id) == [
+        {"role": "user", "content": "x"}
+    ]
+
+
 async def test_topic_ttl_is_set(redis_storage: RedisTopicStorage) -> None:
     topic_id = await redis_storage.create_topic(6, AID, "Общая")
     await redis_storage.set_active_topic(6, AID, topic_id)
@@ -292,6 +378,111 @@ async def test_legacy_catalog_moves_to_the_reader(
     assert await _await_redis(client.get("chat:10:topics")) is None
     assert await _await_redis(client.lrange("chat:10:topic:abc:history", 0, -1)) == []
     assert await redis_storage.list_topics(10, OTHER) == []
+
+
+def _count_exists(storage: RedisTopicStorage) -> list[int]:
+    """Подменяет EXISTS и копит число вызовов в одноэлементном списке."""
+    calls = [0]
+    client = storage._redis
+    original = client.exists
+
+    async def counted(*keys: object) -> int:
+        calls[0] += 1
+        return await _await_redis(original(*keys))
+
+    client.exists = counted  # type: ignore[method-assign]
+    return calls
+
+
+async def test_legacy_probe_is_once_per_persona(
+    redis_storage: RedisTopicStorage,
+) -> None:
+    """Повторные чтение и запись той же пары не ходят в EXISTS."""
+    calls = _count_exists(redis_storage)
+
+    await redis_storage.list_topics(3, AID)
+    assert calls[0] == 2
+
+    await redis_storage.get_active_topic(3, AID)
+    await redis_storage.list_topics(3, AID)
+    await redis_storage.get_history(3, AID, "none")
+    await redis_storage.create_topic(3, AID, "Новая")
+    assert calls[0] == 2
+
+    await redis_storage.list_topics(3, OTHER)
+    assert calls[0] == 4
+    await redis_storage.get_active_topic(3, OTHER)
+    assert calls[0] == 4
+
+
+async def test_legacy_probe_is_not_cached_after_redis_error(
+    redis_storage: RedisTopicStorage,
+) -> None:
+    client = redis_storage._redis
+    original = client.exists
+    state = {"fail": True, "calls": 0}
+
+    async def flaky(*keys: object) -> int:
+        state["calls"] += 1
+        if state["fail"]:
+            raise RedisError("down")
+        return await _await_redis(original(*keys))
+
+    client.exists = flaky  # type: ignore[method-assign]
+    with pytest.raises(TopicStorageError):
+        await redis_storage.list_topics(4, AID)
+
+    state["fail"] = False
+    assert await redis_storage.list_topics(4, AID) == []
+    assert state["calls"] == 3
+    await redis_storage.list_topics(4, AID)
+    assert state["calls"] == 3
+
+
+async def test_failed_legacy_migration_is_retried(
+    redis_storage: RedisTopicStorage,
+) -> None:
+    client = redis_storage._redis
+    await _await_redis(
+        client.rpush(
+            "chat:7:topics",
+            json.dumps({"id": "abc", "name": "Старая"}, ensure_ascii=False),
+        )
+    )
+    real_pipeline = client.pipeline
+
+    def busy_pipeline(*_args: object, **_kwargs: object) -> object:
+        class _Pipe:
+            async def __aenter__(self) -> _Pipe:
+                return self
+
+            async def __aexit__(self, *_exc: object) -> bool:
+                return False
+
+            async def watch(self, *_keys: object) -> None:
+                raise WatchError("busy")
+
+        return _Pipe()
+
+    client.pipeline = busy_pipeline  # type: ignore[method-assign]
+    with pytest.raises(TopicStorageError):
+        await redis_storage.list_topics(7, AID)
+
+    client.pipeline = real_pipeline  # type: ignore[method-assign]
+    assert await redis_storage.list_topics(7, AID) == [{"id": "abc", "name": "Старая"}]
+
+
+async def test_deleting_topics_checks_legacy_again(
+    redis_storage: RedisTopicStorage,
+) -> None:
+    await redis_storage.list_topics(8, AID)
+    calls = _count_exists(redis_storage)
+
+    await redis_storage.list_topics(8, AID)
+    assert calls[0] == 0
+    await redis_storage.delete_assistant_topics(8, AID)
+    await redis_storage.list_topics(8, AID)
+    assert calls[0] == 2
 
 
 @pytest.mark.parametrize("storage_name", ["memory", "redis"])

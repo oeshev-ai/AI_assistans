@@ -31,9 +31,16 @@ def _topics_text(topics: list[dict[str, str]], active: str, page: int = 0) -> st
 
 
 def _topics_keyboard(
-    topics: list[dict[str, str]], active: str, page: int = 0
+    topics: list[dict[str, str]],
+    active: str,
+    page: int = 0,
+    *,
+    assistant_id: str,
 ) -> InlineKeyboardMarkup:
-    """Кнопки тем текущей страницы: переключить, переименовать, удалить."""
+    """Кнопки тем текущей страницы и «Готово».
+
+    Id персоны в callback действий, не «кто сейчас активен».
+    """
     current, total = M._page_bounds(len(topics), page)
     chunk = topics[current * PAGE_SIZE : (current + 1) * PAGE_SIZE]
     rows: list[list[InlineKeyboardButton]] = []
@@ -45,28 +52,48 @@ def _topics_keyboard(
             [
                 InlineKeyboardButton(
                     text=M._clip_label(mark, name),
-                    callback_data=f"topic:use:{topic_id}",
+                    callback_data=f"topic:use:{assistant_id}:{topic_id}",
                 ),
                 InlineKeyboardButton(
-                    text="✏️", callback_data=f"topic:rename:{topic_id}"
+                    text="✏️",
+                    callback_data=f"topic:rename:{assistant_id}:{topic_id}",
                 ),
                 InlineKeyboardButton(
-                    text="🗑", callback_data=f"topic_del_ask:{topic_id}"
+                    text="🗑",
+                    callback_data=f"topic_del_ask:{assistant_id}:{topic_id}",
                 ),
             ]
         )
-    rows.append([InlineKeyboardButton(text="Новая тема", callback_data="topic:new")])
-    pager = M._pager_row(current, total, "topic_page")
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Новая тема",
+                callback_data=f"topic:new:{assistant_id}",
+            )
+        ]
+    )
+    pager = M._pager_row(current, total, f"topic_page:{assistant_id}")
     if pager is not None:
         rows.append(pager)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово", callback_data="topic:done", style="success"
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _topics_markup(
-    topics: list[dict[str, str]], active_id: str, page: int = 0
+    topics: list[dict[str, str]],
+    active_id: str,
+    page: int = 0,
+    *,
+    assistant_id: str,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Текст и кнопки экрана тем."""
     return (
         _topics_text(topics, active_id, page),
-        _topics_keyboard(topics, active_id, page),
+        _topics_keyboard(topics, active_id, page, assistant_id=assistant_id),
     )

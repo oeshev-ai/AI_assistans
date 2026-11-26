@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.bot.constants import TELEGRAM_TEXT_SAFE
+from app.bot.models import _fit_screen
 from app.bot.screens.settings import _model_picker_parts, _settings_persona_view
+from app.bot.telegram_text import telegram_text_units
 from app.llm.media_api import VideoResult
 from app.llm.video_settings import (
     VIDEO_ASPECT_RATIOS,
@@ -16,6 +19,7 @@ from app.llm.video_settings import (
     VideoSettings,
     VideoSettingsScope,
     parse_video_callback,
+    split_video_persona,
     video_settings_from,
 )
 from app.media.media_tools import GenerateVideoTool
@@ -135,9 +139,52 @@ def test_persona_menu_puts_video_under_image_model() -> None:
     assert "Видео: 9:16, 10 с, 480p, со звуком" in text
 
 
+def test_settings_screens_fit_telegram_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Длинный каталог или подсказка обрезаются, кнопки экрана остаются."""
+    import app.bot.screens.settings as settings
+
+    calls: list[str] = []
+    real_fit = _fit_screen
+
+    def spy(text: str) -> str:
+        calls.append(text)
+        return real_fit(text)
+
+    monkeypatch.setattr(settings.M, "_fit_screen", spy)
+    monkeypatch.setattr(settings.M, "_hints_block", lambda *_a, **_k: "я" * 5000)
+    monkeypatch.setattr(settings, "model_hint", lambda _model: "я" * 5000)
+    profile = AssistantProfile(name="Кино", system_prompt=_PROMPT)
+    assistant = SimpleNamespace(
+        config=SimpleNamespace(
+            default_text_model="deepseek/deepseek-v4.1-flash-1017",
+            default_image_model="openai/gpt-image-2.6-flare",
+            default_tts_model="openai/gpt-4o-mini-tts",
+            default_tts_voice="alloy",
+            default_tts_format="opus",
+        )
+    )
+    screens = [
+        _model_picker_parts(profile, assistant, "text"),  # type: ignore[arg-type]
+        _model_picker_parts(profile, assistant, "image"),  # type: ignore[arg-type]
+        _model_picker_parts(profile, assistant, "video"),  # type: ignore[arg-type]
+        _model_picker_parts(profile, assistant, "tts"),  # type: ignore[arg-type]
+        _settings_persona_view(profile, assistant),  # type: ignore[arg-type]
+    ]
+    assert len(calls) == len(screens)
+    for text, markup in screens:
+        assert telegram_text_units(text) <= TELEGRAM_TEXT_SAFE
+        assert markup.inline_keyboard
+    assert screens[0][0].endswith("…")
+    assert screens[1][0].endswith("…")
+    assert screens[4][0].endswith("…")
+    assert "Видео — «Кино»" in screens[2][0]
+    assert "Голосовой ответ — «Кино»" in screens[3][0]
+
+
 def test_video_picker_offers_seedance_choices() -> None:
+    profile = default_assistant_profile()
     text, markup = _model_picker_parts(
-        default_assistant_profile(),
+        profile,
         _assistant(),  # type: ignore[arg-type]
         "video",
     )
@@ -145,14 +192,14 @@ def test_video_picker_offers_seedance_choices() -> None:
     data = [button.callback_data for button in buttons]
     labels = [button.text for button in buttons]
     for ratio in VIDEO_ASPECT_RATIOS:
-        assert f"video:aspect:{ratio}" in data
+        assert f"video:{profile.id}:aspect:{ratio}" in data
     for seconds in VIDEO_DURATIONS:
-        assert f"video:dur:{seconds}" in data
+        assert f"video:{profile.id}:dur:{seconds}" in data
     for resolution in VIDEO_RESOLUTIONS:
-        assert f"video:res:{resolution}" in data
-    assert "video:audio:0" in data
-    assert "video:audio:1" in data
-    assert "picker:done" in data
+        assert f"video:{profile.id}:res:{resolution}" in data
+    assert f"video:{profile.id}:audio:0" in data
+    assert f"video:{profile.id}:audio:1" in data
+    assert f"picker:done:{profile.id}" in data
     assert "✅ 16:9" in labels
     assert "✅ 5с" in labels
     assert "✅ 720p" in labels
@@ -188,6 +235,14 @@ def test_parse_video_callback_rejects_unknown_values() -> None:
     assert parse_video_callback("video:dur:3") is None
     assert parse_video_callback("video:res:1080p") is None
     assert parse_video_callback("video:audio:maybe") is None
+    assert split_video_persona("video:aspect:9:16") == (None, "video:aspect:9:16")
+    assert split_video_persona("video:personaA:aspect:21:9") == (
+        "personaA",
+        "video:aspect:21:9",
+    )
+    parsed = parse_video_callback(split_video_persona("video:personaA:aspect:21:9")[1])
+    assert parsed is not None
+    assert parsed[1] == "21:9"
 
 
 @pytest.mark.asyncio

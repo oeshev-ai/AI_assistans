@@ -122,6 +122,22 @@ def video_settings_summary(settings: VideoSettings) -> str:
     )
 
 
+_VIDEO_KINDS = frozenset({"aspect", "dur", "res", "audio"})
+
+
+def split_video_persona(data: str) -> tuple[str | None, str]:
+    """``video:{id}:{kind}:{value}`` → (id, ``video:{kind}:{value}``).
+
+    Старый callback ``video:{kind}:{value}`` возвращает (None, data):
+    персона тогда берётся как активная.
+    """
+    raw = data.removeprefix("video:")
+    head, sep, _tail = raw.partition(":")
+    if not sep or head in _VIDEO_KINDS:
+        return None, data
+    return head, f"video:{raw[len(head) + 1 :]}"
+
+
 def parse_video_callback(data: str) -> tuple[str, str | int | bool, str] | None:
     """``video:{kind}:{value}`` → поле профиля, значение и текст всплывающего ответа.
 

@@ -27,7 +27,12 @@ from app.llm.media_api import (
 )
 from app.llm.tooling import BaseTool, _error_json, _exception_text
 from app.llm.video_settings import current_video_settings
-from app.media.media_utils import MediaProcessingError, prepare_audio_for_stt
+from app.media.media_utils import (
+    MediaProcessingError,
+    close_stt_chunks,
+    iter_stt_chunk_bytes,
+    prepare_audio_for_stt,
+)
 
 logger = structlog.get_logger("media_tools")
 
@@ -602,6 +607,7 @@ class TranscribeMediaTool(BaseTool):
             await cost_tracker.check_budget(estimated=estimated)
         except BudgetExceededError as exc:
             return _error_json(exc.message)
+        chunks = None
         try:
             chunks = await prepare_audio_for_stt(
                 source.data,
@@ -614,7 +620,7 @@ class TranscribeMediaTool(BaseTool):
             models: list[str | None] = []
             import app.infra.job_queue as job_queue
 
-            for audio_bytes, name in chunks:
+            async for audio_bytes, name in iter_stt_chunk_bytes(chunks):
                 recognized = await job_queue.transcribe_audio(
                     self._client,
                     audio_bytes,
@@ -677,6 +683,7 @@ class TranscribeMediaTool(BaseTool):
             logger.exception("transcribe_media_failed")
             return _error_json(_exception_text(exc))
         finally:
+            close_stt_chunks(chunks)
             await cost_tracker.release_reservation()
 
 

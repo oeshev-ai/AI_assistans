@@ -15,6 +15,7 @@ from app.bot.constants import (
     RenameTopicSG,
 )
 from app.bot.handlers.assistants import (
+    on_assistants_done,
     on_assistants_page,
     on_asst_del_ask,
     on_asst_del_yes,
@@ -89,6 +90,7 @@ from app.bot.handlers.topics import (
     on_topic_new,
     on_topic_rename,
     on_topic_use,
+    on_topics_done,
     on_topics_page,
     sg_new_topic_name,
     sg_rename_topic_name,
@@ -123,7 +125,9 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(
         on_assistants_page, F.data.startswith("asst_page:")
     )
+    dispatcher.callback_query.register(on_assistants_done, F.data == "asst:done")
     dispatcher.callback_query.register(on_topics_page, F.data.startswith("topic_page:"))
+    dispatcher.callback_query.register(on_topics_done, F.data == "topic:done")
     dispatcher.callback_query.register(
         on_asst_rename_ask, F.data.startswith("asst_rename:")
     )
@@ -193,12 +197,12 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(
         on_preset_edit, F.data.startswith("preset:edit:")
     )
-    dispatcher.callback_query.register(on_topic_list, F.data == "topic:list")
+    dispatcher.callback_query.register(on_topic_list, F.data.startswith("topic:list"))
     dispatcher.callback_query.register(on_topic_use, F.data.startswith("topic:use:"))
     dispatcher.callback_query.register(
         on_topic_rename, F.data.startswith("topic:rename:")
     )
-    dispatcher.callback_query.register(on_topic_new, F.data == "topic:new")
+    dispatcher.callback_query.register(on_topic_new, F.data.startswith("topic:new"))
     dispatcher.callback_query.register(on_settings_open, F.data == "settings:open")
     dispatcher.callback_query.register(on_settings_close, F.data == "settings:close")
     dispatcher.callback_query.register(
@@ -208,7 +212,7 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_set_image_menu, F.data == "set_image_menu")
     dispatcher.callback_query.register(on_video_menu, F.data == "video_menu")
     dispatcher.callback_query.register(on_set_video, F.data.startswith("video:"))
-    dispatcher.callback_query.register(on_picker_done, F.data == "picker:done")
+    dispatcher.callback_query.register(on_picker_done, F.data.startswith("picker:done"))
     dispatcher.callback_query.register(on_voice_menu, F.data == "voice_menu")
     dispatcher.callback_query.register(
         on_set_persona_size, F.data.startswith("set_size:")

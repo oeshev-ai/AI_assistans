@@ -381,6 +381,22 @@ def _page_bounds(count: int, page: int) -> tuple[int, int]:
     return current, total
 
 
+def _callback_persona(
+    raw: str, *, legacy_values: tuple[str, ...] = ()
+) -> tuple[str | None, str]:
+    """``assistant_id:value`` → (id, value). Без id — старая кнопка, (None, raw).
+
+    Значения вроде ``16:9`` передают в ``legacy_values``: двоеточие там не разделитель.
+    Id персоны двоеточие не содержит — так же устроен ``topic_del_yes``.
+    """
+    if raw in legacy_values:
+        return None, raw
+    assistant_id, sep, value = raw.partition(":")
+    if not sep or not assistant_id:
+        return None, raw
+    return assistant_id, value
+
+
 def _pager_row(page: int, total: int, prefix: str) -> list[InlineKeyboardButton] | None:
     """Строка ◀ / ▶. На одной странице её нет."""
     if total <= 1:

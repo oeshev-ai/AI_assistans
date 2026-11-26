@@ -101,6 +101,16 @@ async def on_assistants_page(
     )
 
 
+async def on_assistants_done(query: CallbackQuery, state: FSMContext) -> None:
+    """Убирает список персон. Нижнее меню не трогает: активная персона та же."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    await query.answer()
+    await R._close_screen(message, state, _SCREEN_ASSISTANTS)
+
+
 async def on_asst_rename_ask(
     query: CallbackQuery, state: FSMContext, assistant_storage: AssistantStorage
 ) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -13,11 +14,13 @@ from aiogram.methods import SendMessage
 
 import app.bot.runtime as runtime
 from app.bot.constants import MSG_UPLOAD_PROCESS_FAILED
+from app.bot.telegram_text import TELEGRAM_TEXT_SAFE, split_telegram_text
 from app.infra import cost_tracker as cost_tracker_mod
 from app.infra.cost_tracker import BudgetExceededError, cost_tracker
 from app.infra.rate_limiter import rate_limiter
 from app.llm.errors import AssistAIError
 from app.llm.media_api import TranscriptionResult
+from app.media.media_utils import MediaProcessingError
 from app.storage.upload_sessions import UploadSession
 
 
@@ -477,6 +480,55 @@ async def test_upload_status_deleted_when_processing_fails(
 
 
 @pytest.mark.asyncio
+async def test_failed_prepare_deletes_the_downloaded_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime._upload_process_sem = asyncio.Semaphore(2)
+    session = _uploaded_session(file_size=12_000, user_id=7)
+    session.verified_mime = session.mime_type
+    status = SimpleNamespace(delete=AsyncMock(), edit_text=AsyncMock())
+    downloaded: list[Path] = []
+
+    async def _download(_key: str, dest: Path, **_kwargs: object) -> None:
+        dest.write_bytes(b"not-a-container")
+        downloaded.append(dest)
+
+    async def _prepare(path: Path, **_kwargs: object) -> None:
+        assert path.is_file()
+        raise MediaProcessingError("битый контейнер")
+
+    bot: Any = SimpleNamespace(
+        send_message=AsyncMock(return_value=status),
+        send_chat_action=AsyncMock(),
+    )
+    store: Any = SimpleNamespace(update=AsyncMock())
+    storage: Any = SimpleNamespace(
+        config=SimpleNamespace(max_upload_mb=64),
+        download_file=AsyncMock(side_effect=_download),
+        delete_object=AsyncMock(),
+    )
+    monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
+    monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock(return_value=None))
+    monkeypatch.setattr(cost_tracker, "release_reservation", AsyncMock())
+    monkeypatch.setattr(runtime, "prepare_audio_file_for_stt", _prepare)
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=MagicMock(),
+        assistant_storage=MagicMock(),
+        store=store,
+        storage=storage,
+        session=session,
+    )
+
+    assert downloaded
+    assert not downloaded[0].exists()
+    assert session.status == "failed"
+    assert session.error == "битый контейнер"
+
+
+@pytest.mark.asyncio
 async def test_upload_progress_names_each_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,6 +638,7 @@ def _patch_paid_transcript(
         config=SimpleNamespace(max_upload_mb=512),
         download_file=AsyncMock(),
         delete_object=AsyncMock(),
+        upload_bytes=AsyncMock(),
     )
     monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
     monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock())
@@ -663,14 +716,14 @@ async def test_unkept_transcript_reaches_chat_and_session_stays_done(
 
 
 @pytest.mark.asyncio
-async def test_unkept_transcript_stays_in_history_when_chat_rejects_text(
+async def test_rejected_transcript_history_is_an_excerpt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    text = "оплаченный текст, который чат не принял"
+    text = "а" * 20_000
     session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
     opened = {"done": False}
 
-    async def _send_message(_chat_id: int, payload: str) -> object:
+    async def _send_message(_chat_id: int, _payload: str) -> object:
         if not opened["done"]:
             opened["done"] = True
             return parts.status
@@ -691,7 +744,46 @@ async def test_unkept_transcript_stays_in_history_when_chat_rejects_text(
     assert session.status == "done"
     assert session.error is None
     stored = parts.topic.append_messages.await_args.args[3][1]["content"]
-    assert text in stored
+    assert text not in stored
+    assert text[:80] in stored
+    assert len(stored) < runtime._TRANSCRIPT_HISTORY_CHARS + 400
+    assert "transcript.txt" in stored
+    parked = parts.storage.upload_bytes.await_args.kwargs
+    assert parked["data"] == text.encode()
+    assert parked["object_key"].endswith("/transcript.txt")
+    assert parked["object_key"] != session.object_key
     assert MSG_UPLOAD_PROCESS_FAILED not in {
         call.args[1] for call in bot.send_message.await_args_list if len(call.args) > 1
     }
+
+
+@pytest.mark.asyncio
+async def test_unkept_transcript_chat_stops_after_five_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "".join(
+        f"#{index:02d}#" + ("x" * (TELEGRAM_TEXT_SAFE - 4)) for index in range(6)
+    )
+    session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=parts.topic,
+        assistant_storage=parts.assistant_storage,
+        store=parts.store,
+        storage=parts.storage,
+        session=session,
+    )
+
+    chunks = split_telegram_text(text, TELEGRAM_TEXT_SAFE)
+    sent = [call.args[1] for call in bot.send_message.await_args_list]
+    assert chunks[0] in sent
+    assert chunks[runtime._TRANSCRIPT_CHAT_CHUNKS - 1] in sent
+    assert chunks[runtime._TRANSCRIPT_CHAT_CHUNKS] not in sent
+    assert runtime._PAID_TRANSCRIPT_MORE in sent
+    stored = parts.topic.append_messages.await_args.args[3][1]["content"]
+    assert text not in stored
+    assert len(stored) < runtime._TRANSCRIPT_HISTORY_CHARS + 400
+    assert parts.storage.upload_bytes.await_args.kwargs["data"] == text.encode()
+    assert session.status == "done"

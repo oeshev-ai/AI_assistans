@@ -71,15 +71,38 @@ def _new_topic_id(existing: set[str]) -> str:
     raise TopicStorageError("Не удалось создать идентификатор темы.")
 
 
+_TOPIC_NAME_LIMIT = 100
+
+
 def _clean_topic_name(topic_name: str) -> str:
     if not isinstance(topic_name, str):
         raise TopicStorageError("Название темы должно быть строкой.")
     name = topic_name.strip()
     if not name:
         raise TopicStorageError("Название темы не может быть пустым.")
-    if len(name) > 100:
+    if len(name) > _TOPIC_NAME_LIMIT:
         raise TopicStorageError("Название темы длиннее 100 символов.")
     return name
+
+
+def _unique_topic_name(name: str, taken: set[str]) -> str:
+    """Суффикс `` (2)``, `` (3)``, если имя уже есть у этой персоны.
+
+    Вместе с суффиксом имя не длиннее 100 символов — как лимит названия.
+    """
+    if name not in taken:
+        return name
+    index = 2
+    while True:
+        suffix = f" ({index})"
+        room = _TOPIC_NAME_LIMIT - len(suffix)
+        if room < 1:
+            candidate = suffix[-_TOPIC_NAME_LIMIT:]
+        else:
+            candidate = f"{name[:room]}{suffix}"
+        if candidate not in taken:
+            return candidate
+        index += 1
 
 
 def _dump_message(message: dict[str, Any]) -> str:
@@ -175,7 +198,10 @@ class TopicHistoryStorage(ABC):
     async def create_topic(
         self, chat_id: int, assistant_id: str, topic_name: str
     ) -> str:
-        """Создаёт тему персоны и возвращает её id. Активную тему не меняет."""
+        """Создаёт тему персоны и возвращает её id. Активную тему не меняет.
+
+        Повтор имени в каталоге этой персоны получает суффикс `` (2)``.
+        """
 
     @abstractmethod
     async def list_topics(
@@ -233,7 +259,10 @@ class TopicHistoryStorage(ABC):
     async def rename_topic(
         self, chat_id: int, assistant_id: str, topic_id: str, new_name: str
     ) -> None:
-        """Меняет название темы. Неизвестная тема — ``TopicStorageError``."""
+        """Меняет название темы. Неизвестная тема — ``TopicStorageError``.
+
+        Имя, которое уже есть у другой темы этой персоны, получает `` (2)``.
+        """
 
     @abstractmethod
     async def rollback_last_user(
@@ -300,8 +329,10 @@ class InMemoryTopicStorage(TopicHistoryStorage):
         self, chat_id: int, assistant_id: str, topic_name: str
     ) -> str:
         self._check_open()
-        name = _clean_topic_name(topic_name)
         chat = self._chat(chat_id, assistant_id)
+        name = _unique_topic_name(
+            _clean_topic_name(topic_name), set(chat.names.values())
+        )
         topic_id = _new_topic_id(set(chat.names))
         chat.names[topic_id] = name
         chat.order.append(topic_id)
@@ -396,7 +427,8 @@ class InMemoryTopicStorage(TopicHistoryStorage):
         chat = self._existing(chat_id, assistant_id)
         if chat is None or topic_id not in chat.names:
             raise TopicStorageError("Тема не найдена.")
-        chat.names[topic_id] = name
+        taken = {label for item, label in chat.names.items() if item != topic_id}
+        chat.names[topic_id] = _unique_topic_name(name, taken)
         logger.info(
             "Память: тема переименована chat_id=%s topic_id=%s", chat_id, topic_id
         )
@@ -424,7 +456,9 @@ class InMemoryTopicStorage(TopicHistoryStorage):
         chat = self._chat(chat_id, assistant_id)
         if chat.active in chat.names:
             return chat.active
-        name = _clean_topic_name(default_name)
+        name = _unique_topic_name(
+            _clean_topic_name(default_name), set(chat.names.values())
+        )
         topic_id = _new_topic_id(set(chat.names))
         chat.names[topic_id] = name
         chat.order.append(topic_id)
@@ -477,6 +511,9 @@ class RedisTopicStorage(TopicHistoryStorage):
             socket_timeout=2.0,
         )
         self._closed = False
+        # Легаси-каталог есть у единиц старых чатов. После первой проверки
+        # пары (chat, персона) повторные EXISTS на каждый ход не нужны.
+        self._legacy_checked: set[tuple[int, str]] = set()
 
     @staticmethod
     def _topics_key(chat_id: int, assistant_id: str) -> str:
@@ -532,16 +569,23 @@ class RedisTopicStorage(TopicHistoryStorage):
                 messages.append(loaded)
         return messages
 
+    def _remember_legacy_checked(self, chat_id: int, assistant_id: str) -> None:
+        self._legacy_checked.add((chat_id, assistant_id))
+
     async def _adopt_legacy(self, chat_id: int, assistant_id: str) -> None:
         """Переносит общий каталог чата в каталог персоны, если своего ещё нет."""
         self._check_open()
+        if (chat_id, assistant_id) in self._legacy_checked:
+            return
         new_topics_key = self._topics_key(chat_id, assistant_id)
         old_topics_key = self._legacy_topics_key(chat_id)
         old_active_key = self._legacy_active_key(chat_id)
         try:
             if await self._redis.exists(new_topics_key):
+                self._remember_legacy_checked(chat_id, assistant_id)
                 return
             if not await self._redis.exists(old_topics_key):
+                self._remember_legacy_checked(chat_id, assistant_id)
                 return
         except RedisError as exc:
             logger.exception(
@@ -553,10 +597,12 @@ class RedisTopicStorage(TopicHistoryStorage):
                 async with self._redis.pipeline() as pipe:
                     await pipe.watch(new_topics_key, old_topics_key, old_active_key)
                     if await pipe.exists(new_topics_key):
+                        self._remember_legacy_checked(chat_id, assistant_id)
                         return
                     raw_topics = await _redis_list(pipe.lrange(old_topics_key, 0, -1))
                     topics = self._decode_topics(raw_topics)
                     if not topics:
+                        self._remember_legacy_checked(chat_id, assistant_id)
                         return
                     active_raw = await pipe.get(old_active_key)
                     active = active_raw if isinstance(active_raw, str) else ""
@@ -588,6 +634,7 @@ class RedisTopicStorage(TopicHistoryStorage):
                         pipe.delete(self._legacy_history_key(chat_id, topic_id))
                     pipe.delete(old_topics_key, old_active_key)
                     await pipe.execute()
+                self._remember_legacy_checked(chat_id, assistant_id)
                 logger.info(
                     "Redis: старые темы перенесены chat_id=%s assistant_id=%s",
                     chat_id,
@@ -607,22 +654,33 @@ class RedisTopicStorage(TopicHistoryStorage):
         raise TopicStorageError("История диалога временно недоступна.")
 
     async def _update_catalog(
-        self, chat_id: int, assistant_id: str, mutator: Any
+        self,
+        chat_id: int,
+        assistant_id: str,
+        mutator: Any,
+        *,
+        drop_keys: tuple[str, ...] = (),
     ) -> Any:
-        """Атомарно меняет список тем и активную тему."""
+        """Атомарно меняет список тем и активную тему.
+
+        ``drop_keys`` удаляются в том же MULTI: сбой не оставляет каталог
+        уже обновлённым, а связанный ключ — нет.
+        """
         await self._adopt_legacy(chat_id, assistant_id)
         topics_key = self._topics_key(chat_id, assistant_id)
         active_key = self._active_key(chat_id, assistant_id)
         for _attempt in range(_APPEND_ATTEMPTS):
             try:
                 async with self._redis.pipeline() as pipe:
-                    await pipe.watch(topics_key, active_key)
+                    await pipe.watch(topics_key, active_key, *drop_keys)
                     raw_topics = await _redis_list(pipe.lrange(topics_key, 0, -1))
                     active_raw = await pipe.get(active_key)
                     active = active_raw if isinstance(active_raw, str) else ""
                     topics = self._decode_topics(raw_topics)
                     new_topics, new_active, result = mutator(topics, active)
                     pipe.multi()
+                    if drop_keys:
+                        pipe.delete(*drop_keys)
                     pipe.delete(topics_key)
                     if new_topics:
                         pipe.rpush(
@@ -730,13 +788,14 @@ class RedisTopicStorage(TopicHistoryStorage):
     async def create_topic(
         self, chat_id: int, assistant_id: str, topic_name: str
     ) -> str:
-        name = _clean_topic_name(topic_name)
+        requested = _clean_topic_name(topic_name)
 
         def mutate(
             topics: list[dict[str, str]],
             active: str,
         ) -> tuple[list[dict[str, str]], str, str]:
             topic_id = _new_topic_id({item["id"] for item in topics})
+            name = _unique_topic_name(requested, {item["name"] for item in topics})
             return [*topics, {"id": topic_id, "name": name}], active, topic_id
 
         topic_id = await self._update_catalog(chat_id, assistant_id, mutate)
@@ -842,28 +901,26 @@ class RedisTopicStorage(TopicHistoryStorage):
                 active = remaining[0]["id"] if remaining else ""
             return remaining, active, None
 
-        await self._update_catalog(chat_id, assistant_id, mutate)
-        try:
-            await self._redis.delete(self._history_key(chat_id, assistant_id, topic_id))
-        except RedisError as exc:
-            logger.exception(
-                "Ошибка Redis при удалении истории темы, chat_id=%s topic_id=%s",
-                chat_id,
-                topic_id,
-            )
-            raise TopicStorageError("История диалога временно недоступна.") from exc
+        await self._update_catalog(
+            chat_id,
+            assistant_id,
+            mutate,
+            drop_keys=(self._history_key(chat_id, assistant_id, topic_id),),
+        )
         logger.info("Redis: удалена тема chat_id=%s topic_id=%s", chat_id, topic_id)
 
     async def rename_topic(
         self, chat_id: int, assistant_id: str, topic_id: str, new_name: str
     ) -> None:
-        name = _clean_topic_name(new_name)
+        requested = _clean_topic_name(new_name)
 
         def mutate(
             topics: list[dict[str, str]],
             active: str,
         ) -> tuple[list[dict[str, str]], str, None]:
             found = False
+            taken = {item["name"] for item in topics if item["id"] != topic_id}
+            name = _unique_topic_name(requested, taken)
             updated: list[dict[str, str]] = []
             for item in topics:
                 if item["id"] == topic_id:
@@ -897,7 +954,7 @@ class RedisTopicStorage(TopicHistoryStorage):
         assistant_id: str,
         default_name: str = _DEFAULT_TOPIC_NAME,
     ) -> str:
-        name = _clean_topic_name(default_name)
+        requested = _clean_topic_name(default_name)
 
         def mutate(
             topics: list[dict[str, str]],
@@ -907,6 +964,7 @@ class RedisTopicStorage(TopicHistoryStorage):
             if active in known:
                 return topics, active, active
             topic_id = _new_topic_id(known)
+            name = _unique_topic_name(requested, {item["name"] for item in topics})
             return [*topics, {"id": topic_id, "name": name}], topic_id, topic_id
 
         topic_id = await self._update_catalog(chat_id, assistant_id, mutate)
@@ -931,6 +989,7 @@ class RedisTopicStorage(TopicHistoryStorage):
                 ],
             ]
             await self._redis.delete(*keys)
+            self._legacy_checked.discard((chat_id, assistant_id))
         except RedisError as exc:
             logger.exception(
                 "Ошибка Redis при удалении тем персоны, chat_id=%s", chat_id
@@ -946,6 +1005,7 @@ class RedisTopicStorage(TopicHistoryStorage):
         if self._closed:
             return
         self._closed = True
+        self._legacy_checked.clear()
         if self._owns_client:
             try:
                 await self._redis.aclose()

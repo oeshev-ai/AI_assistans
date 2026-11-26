@@ -6,6 +6,7 @@ import asyncio
 import re
 import shutil
 import tempfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import structlog
@@ -318,16 +319,78 @@ async def extract_audio_from_video(
         return audio, "audio.mp3"
 
 
+class SttChunks:
+    """Куски лежат файлами. В память читается один, перед самым STT."""
+
+    def __init__(
+        self,
+        directory: tempfile.TemporaryDirectory[str],
+        items: list[tuple[Path, str]],
+        source_bytes: int,
+    ) -> None:
+        self._directory = directory
+        self._items = items
+        self.source_bytes = source_bytes
+        self._closed = False
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._directory.cleanup()
+
+    async def duration_seconds(self) -> float:
+        sizes = [path.stat().st_size for path, _name in self._items]
+        total = 0.0
+        for path, _name in self._items:
+            seconds = await probe_file_duration_seconds(path)
+            if seconds is None:
+                return sum(sizes) / _EXTRACTED_MP3_BYTES_PER_SECOND
+            total += seconds
+        return total
+
+    async def __aiter__(self) -> AsyncIterator[tuple[bytes, str]]:
+        for path, name in self._items:
+            if self._closed:
+                return
+            data = await asyncio.to_thread(path.read_bytes)
+            yield data, name
+
+
+def close_stt_chunks(chunks: object) -> None:
+    """Снимает каталог нарезки. Список байтов закрывать нечего."""
+    if isinstance(chunks, SttChunks):
+        chunks.close()
+
+
+async def iter_stt_chunk_bytes(
+    chunks: SttChunks | list[tuple[bytes, str]],
+) -> AsyncIterator[tuple[bytes, str]]:
+    """По одному куску. Список уже в памяти, файлы читаются здесь."""
+    if isinstance(chunks, SttChunks):
+        async for item in chunks:
+            yield item
+        return
+    for item in chunks:
+        yield item
+
+
 async def _split_audio_path(
     src: Path,
     *,
     source_bytes: int,
     chunk_seconds: int,
-) -> list[tuple[bytes, str]]:
-    """Режет файл на диске. В память попадают только куски, не исходник целиком."""
+) -> SttChunks:
+    """Режет файл на диске и отдаёт пути. Байты куска читает вызывающий."""
     ffmpeg = find_ffmpeg()
-    with tempfile.TemporaryDirectory(prefix="assist_stt_") as tmp:
-        pattern = str(Path(tmp) / "chunk_%03d.mp3")
+    directory = tempfile.TemporaryDirectory(prefix="assist_stt_")
+    owned = True
+    try:
+        tmp = Path(directory.name)
+        pattern = str(tmp / "chunk_%03d.mp3")
         proc = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-y",
@@ -344,8 +407,8 @@ async def _split_audio_path(
             stderr=asyncio.subprocess.PIPE,
         )
         _stdout, stderr = await _run_ffmpeg(proc)
-        chunks = sorted(Path(tmp).glob("chunk_*.mp3"))
-        if proc.returncode != 0 or not chunks:
+        chunk_paths = sorted(tmp.glob("chunk_*.mp3"))
+        if proc.returncode != 0 or not chunk_paths:
             detail = (stderr or b"").decode("utf-8", errors="replace")[-300:]
             logger.warning("ffmpeg_segment_copy_failed", detail=detail)
             proc = await asyncio.create_subprocess_exec(
@@ -366,24 +429,28 @@ async def _split_audio_path(
                 stderr=asyncio.subprocess.PIPE,
             )
             await _run_ffmpeg(proc)
-            chunks = sorted(Path(tmp).glob("chunk_*.mp3"))
-        if not chunks:
+            chunk_paths = sorted(tmp.glob("chunk_*.mp3"))
+        if not chunk_paths:
             raise MediaProcessingError("Не удалось нарезать длинное аудио для STT.")
-        result: list[tuple[bytes, str]] = []
-        for index, path in enumerate(chunks):
-            data = await asyncio.to_thread(path.read_bytes)
-            if not data:
+        items: list[tuple[Path, str]] = []
+        for index, path in enumerate(chunk_paths):
+            size = path.stat().st_size
+            if size <= 0:
                 continue
-            if len(data) > _MAX_CHUNK_BYTES:
+            if size > _MAX_CHUNK_BYTES:
                 raise MediaProcessingError(
                     "Фрагмент аудио слишком большой для распознавания. "
                     "Попробуйте файл покороче или с меньшим битрейтом."
                 )
-            result.append((data, f"chunk_{index + 1:03d}.mp3"))
-        if not result:
+            items.append((path, f"chunk_{index + 1:03d}.mp3"))
+        if not items:
             raise MediaProcessingError("После нарезки не осталось аудиоданных.")
-        logger.info("audio_split", parts=len(result), source_bytes=source_bytes)
-        return result
+        logger.info("audio_split", parts=len(items), source_bytes=source_bytes)
+        owned = False
+        return SttChunks(directory, items, source_bytes)
+    finally:
+        if owned:
+            directory.cleanup()
 
 
 async def split_audio_file_for_stt(
@@ -391,8 +458,8 @@ async def split_audio_file_for_stt(
     *,
     filename: str = "audio.mp3",
     chunk_seconds: int = _DEFAULT_CHUNK_SECONDS,
-) -> list[tuple[bytes, str]]:
-    """Режет файл с диска. Короткий читается один раз, длинный не собирается в ``bytes``."""
+) -> list[tuple[bytes, str]] | SttChunks:
+    """Режет файл с диска. Короткий читается один раз, длинный остаётся путями."""
     size = src.stat().st_size if src.is_file() else 0
     if size <= 0:
         raise MediaProcessingError("Пустой аудиофайл.")
@@ -407,7 +474,7 @@ async def split_audio_for_stt(
     *,
     filename: str = "audio.mp3",
     chunk_seconds: int = _DEFAULT_CHUNK_SECONDS,
-) -> list[tuple[bytes, str]]:
+) -> list[tuple[bytes, str]] | SttChunks:
     """Режет длинное аудио на куски, пригодные для transcriptions API.
 
     Короткий файл возвращается как один элемент без перекодирования.
@@ -437,6 +504,33 @@ def _duration_from_ffmpeg_text(text: str) -> float | None:
     if total <= 0:
         return None
     return total
+
+
+async def probe_file_duration_seconds(path: Path) -> float | None:
+    """Длительность файла на диске. В память процесса байты не копируются."""
+    if not path.is_file():
+        return None
+    try:
+        ffmpeg = find_ffmpeg()
+    except MediaProcessingError:
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _stdout, stderr = await communicate_with_timeout(
+            proc, timeout=_DURATION_PROBE_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        return None
+    text = (stderr or b"").decode("utf-8", errors="replace")
+    return _duration_from_ffmpeg_text(text)
 
 
 async def probe_duration_seconds(data: bytes, *, filename: str) -> float | None:
@@ -470,13 +564,17 @@ async def probe_duration_seconds(data: bytes, *, filename: str) -> float | None:
     return _duration_from_ffmpeg_text(text)
 
 
-async def audio_duration_seconds(chunks: list[tuple[bytes, str]]) -> float:
+async def audio_duration_seconds(
+    chunks: list[tuple[bytes, str]] | SttChunks,
+) -> float:
     """Суммарная длительность кусков, которые уйдут в STT.
 
     Если ffmpeg не прочитал контейнер, оценка по 64 кбит/с — битрейт
     извлечённой дорожки. Для более плотного исходного mp3 это завышение,
-    но не оценка всего видеофайла как аудио.
+    но не оценка всего видеофайла как аудио. Файлы кусков в память не читаются.
     """
+    if isinstance(chunks, SttChunks):
+        return await chunks.duration_seconds()
     total = 0.0
     for data, name in chunks:
         seconds = await probe_duration_seconds(data, filename=name)
@@ -492,7 +590,7 @@ async def prepare_audio_for_stt(
     *,
     filename: str,
     is_video: bool,
-) -> list[tuple[bytes, str]]:
+) -> list[tuple[bytes, str]] | SttChunks:
     """Готовит один или несколько аудиофрагментов для ProxyAPI STT."""
     if is_video:
         data, filename = await extract_audio_from_video(data, source_name=filename)
@@ -504,10 +602,11 @@ async def prepare_audio_file_for_stt(
     *,
     filename: str,
     is_video: bool,
-) -> list[tuple[bytes, str]]:
+) -> list[tuple[bytes, str]] | SttChunks:
     """То же, что ``prepare_audio_for_stt``, но исходник остаётся файлом.
 
-    В память попадают куски для STT. Видео и длинное аудио целиком не читаются.
+    Короткий кусок читается сразу. Длинная нарезка остаётся файлами:
+    байты одного фрагмента читаются уже перед STT.
     """
     if not path.is_file() or path.stat().st_size <= 0:
         raise MediaProcessingError("Пустой файл.")
