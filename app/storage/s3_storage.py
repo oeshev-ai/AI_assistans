@@ -62,6 +62,27 @@ class S3Config:
 
 
 _MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# Нет конфигурации — не ошибка: правило можно создать с нуля.
+_NO_LIFECYCLE_CODES = frozenset(
+    {"NoSuchLifecycleConfiguration", "NoSuchLifecycle", "404", "NotFound"}
+)
+# Префикс припаркованных расшифровок. Срок как у очереди доставки.
+TRANSCRIPT_PREFIX = "transcripts/"
+TRANSCRIPT_RETENTION_DAYS = 7
+# Потолок подписи SigV4. Ссылка живёт столько же, сколько объект по lifecycle.
+TRANSCRIPT_URL_SECONDS = 7 * 24 * 3600
+_TRANSCRIPT_LIFECYCLE_ID = "expire-transcripts"
+_LIFECYCLE_RULE_KEYS = (
+    "Expiration",
+    "ID",
+    "Prefix",
+    "Filter",
+    "Status",
+    "Transitions",
+    "NoncurrentVersionTransitions",
+    "NoncurrentVersionExpiration",
+    "AbortIncompleteMultipartUpload",
+)
 
 
 def _storage_error_types() -> tuple[type[BaseException], ...]:
@@ -94,6 +115,38 @@ def _is_missing(exc: BaseException) -> bool:
     meta = response.get("ResponseMetadata")
     status = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
     return code in _MISSING_CODES or status == 404
+
+
+def _rule_prefix(rule: dict[str, Any]) -> str:
+    filt = rule.get("Filter")
+    if isinstance(filt, dict):
+        prefix = filt.get("Prefix")
+        if isinstance(prefix, str):
+            return prefix
+        both = filt.get("And")
+        if isinstance(both, dict) and isinstance(both.get("Prefix"), str):
+            return str(both["Prefix"])
+    prefix = rule.get("Prefix")
+    return prefix if isinstance(prefix, str) else ""
+
+
+def _transcript_lifecycle_rule() -> dict[str, Any]:
+    return {
+        "ID": _TRANSCRIPT_LIFECYCLE_ID,
+        "Status": "Enabled",
+        "Filter": {"Prefix": TRANSCRIPT_PREFIX},
+        "Expiration": {"Days": TRANSCRIPT_RETENTION_DAYS},
+    }
+
+
+def _is_transcript_lifecycle(rule: dict[str, Any]) -> bool:
+    """Правило уже такое, каким мы его записываем. Лишние поля — повод перезаписать."""
+    return _echo_lifecycle_rule(rule) == _transcript_lifecycle_rule()
+
+
+def _echo_lifecycle_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    """Поля, которые put принимает обратно. Служебный ответ бакета отбрасывается."""
+    return {key: rule[key] for key in _LIFECYCLE_RULE_KEYS if key in rule}
 
 
 def _build_client(config: S3Config) -> Any:
@@ -144,6 +197,7 @@ class S3Storage:
     def __init__(self, config: S3Config) -> None:
         self.config = config
         self._client = _build_client(config)
+        self._transcript_lifecycle_ready = False
 
     async def create_presigned_put(self, *, object_key: str, content_type: str) -> str:
         def _sign() -> str:
@@ -172,6 +226,83 @@ class S3Storage:
                 "s3_presign_failed", key=object_key, error=_error_code(exc)
             )
             raise S3StorageError("Не удалось создать ссылку загрузки") from exc
+
+    async def create_presigned_get(self, object_key: str, *, expires_in: int) -> str:
+        """Ссылка на скачивание. В лог сам URL не пишется."""
+
+        def _sign() -> str:
+            from app.storage.s3_endpoint import allowed_s3_hosts, guard_s3_request
+
+            signed = self._client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": self.config.bucket,
+                    "Key": object_key,
+                },
+                ExpiresIn=expires_in,
+                HttpMethod="GET",
+            )
+            guard_s3_request(
+                signed,
+                allowed=allowed_s3_hosts(self.config.endpoint, self.config.bucket),
+            )
+            return signed
+
+        try:
+            return await asyncio.to_thread(_sign)
+        except _storage_error_types() as exc:
+            logger.exception(
+                "s3_presign_failed", key=object_key, error=_error_code(exc)
+            )
+            raise S3StorageError("Не удалось создать ссылку скачивания") from exc
+
+    async def ensure_transcript_lifecycle(self) -> None:
+        """Правило: объекты ``transcripts/`` удаляются через 7 дней.
+
+        Чужие правила бакета не стираются. Повторный вызов после успеха
+        бакет больше не трогает. Нет конфигурации — создаётся только это правило.
+        """
+        if getattr(self, "_transcript_lifecycle_ready", False):
+            return
+
+        def _apply() -> None:
+            rules = self._lifecycle_rules()
+            others = [
+                rule
+                for rule in rules
+                if _rule_prefix(rule) != TRANSCRIPT_PREFIX
+                and rule.get("ID") != _TRANSCRIPT_LIFECYCLE_ID
+            ]
+            own = [rule for rule in rules if rule not in others]
+            if len(own) == 1 and _is_transcript_lifecycle(own[0]):
+                return
+            kept = [_echo_lifecycle_rule(rule) for rule in others]
+            kept.append(_transcript_lifecycle_rule())
+            self._client.put_bucket_lifecycle_configuration(
+                Bucket=self.config.bucket,
+                LifecycleConfiguration={"Rules": kept},
+            )
+
+        try:
+            await asyncio.to_thread(_apply)
+        except _storage_error_types() as exc:
+            logger.exception("s3_lifecycle_failed", error=_error_code(exc))
+            raise S3StorageError("Не удалось задать срок хранения расшифровок") from exc
+        self._transcript_lifecycle_ready = True
+
+    def _lifecycle_rules(self) -> list[dict[str, Any]]:
+        try:
+            payload = self._client.get_bucket_lifecycle_configuration(
+                Bucket=self.config.bucket
+            )
+        except _storage_error_types() as exc:
+            if _error_code(exc) in _NO_LIFECYCLE_CODES or _is_missing(exc):
+                return []
+            raise
+        rules = payload.get("Rules") if isinstance(payload, dict) else None
+        if not isinstance(rules, list):
+            return []
+        return [rule for rule in rules if isinstance(rule, dict)]
 
     async def upload_file(
         self, *, object_key: str, file_path: str, content_type: str

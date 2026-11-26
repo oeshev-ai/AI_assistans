@@ -21,7 +21,12 @@ from app.infra.rate_limiter import rate_limiter
 from app.llm.errors import AssistAIError
 from app.llm.media_api import TranscriptionResult
 from app.media.media_utils import MediaProcessingError
+from app.storage.s3_storage import TRANSCRIPT_URL_SECONDS, S3StorageError
 from app.storage.upload_sessions import UploadSession
+
+_TRANSCRIPT_URL = (
+    "https://storage.yandexcloud.net/bucket/transcripts/a.txt?X-Amz-Signature=abc"
+)
 
 
 def test_upload_stt_floor_ignores_file_size() -> None:
@@ -639,6 +644,8 @@ def _patch_paid_transcript(
         download_file=AsyncMock(),
         delete_object=AsyncMock(),
         upload_bytes=AsyncMock(),
+        ensure_transcript_lifecycle=AsyncMock(),
+        create_presigned_get=AsyncMock(return_value=_TRANSCRIPT_URL),
     )
     monkeypatch.setattr(rate_limiter, "check_media_limit", AsyncMock(return_value=True))
     monkeypatch.setattr(cost_tracker, "check_budget", AsyncMock())
@@ -713,13 +720,15 @@ async def test_unkept_transcript_reaches_chat_and_session_stays_done(
     stored = parts.topic.append_messages.await_args.args[3][1]["content"]
     assert "отправлена текстом" in stored
     assert text not in stored
+    parts.storage.upload_bytes.assert_not_awaited()
+    parts.storage.ensure_transcript_lifecycle.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_rejected_transcript_history_is_an_excerpt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    text = "а" * 20_000
+    text = "а" * (TELEGRAM_TEXT_SAFE * 5 + 50)
     session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
     opened = {"done": False}
 
@@ -747,11 +756,16 @@ async def test_rejected_transcript_history_is_an_excerpt(
     assert text not in stored
     assert text[:80] in stored
     assert len(stored) < runtime._TRANSCRIPT_HISTORY_CHARS + 400
-    assert "transcript.txt" in stored
+    assert "ссылка в чате" not in stored
+    assert _TRANSCRIPT_URL not in stored
+    assert "не лёг" in stored
     parked = parts.storage.upload_bytes.await_args.kwargs
     assert parked["data"] == text.encode()
+    assert parked["object_key"].startswith("transcripts/")
     assert parked["object_key"].endswith("/transcript.txt")
     assert parked["object_key"] != session.object_key
+    dropped = [call.args[0] for call in parts.storage.delete_object.await_args_list]
+    assert parked["object_key"] in dropped
     assert MSG_UPLOAD_PROCESS_FAILED not in {
         call.args[1] for call in bot.send_message.await_args_list if len(call.args) > 1
     }
@@ -781,9 +795,81 @@ async def test_unkept_transcript_chat_stops_after_five_chunks(
     assert chunks[0] in sent
     assert chunks[runtime._TRANSCRIPT_CHAT_CHUNKS - 1] in sent
     assert chunks[runtime._TRANSCRIPT_CHAT_CHUNKS] not in sent
-    assert runtime._PAID_TRANSCRIPT_MORE in sent
+    assert any(
+        runtime._PAID_TRANSCRIPT_MORE in item and _TRANSCRIPT_URL in item
+        for item in sent
+    )
     stored = parts.topic.append_messages.await_args.args[3][1]["content"]
     assert text not in stored
+    assert _TRANSCRIPT_URL not in stored
+    assert "ссылка в чате" in stored
     assert len(stored) < runtime._TRANSCRIPT_HISTORY_CHARS + 400
-    assert parts.storage.upload_bytes.await_args.kwargs["data"] == text.encode()
+    parked = parts.storage.upload_bytes.await_args.kwargs
+    assert parked["data"] == text.encode()
+    assert parked["object_key"].startswith("transcripts/")
+    parts.storage.create_presigned_get.assert_awaited_once()
+    assert (
+        parts.storage.create_presigned_get.await_args.kwargs["expires_in"]
+        == TRANSCRIPT_URL_SECONDS
+    )
+    parts.storage.ensure_transcript_lifecycle.assert_awaited_once()
+    dropped = [call.args[0] for call in parts.storage.delete_object.await_args_list]
+    assert parked["object_key"] not in dropped
+    assert session.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_unkept_transcript_without_link_does_not_keep_the_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "я" * (TELEGRAM_TEXT_SAFE * 5 + 50)
+    session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
+    parts.storage.create_presigned_get = AsyncMock(
+        side_effect=S3StorageError("Не удалось создать ссылку скачивания")
+    )
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=parts.topic,
+        assistant_storage=parts.assistant_storage,
+        store=parts.store,
+        storage=parts.storage,
+        session=session,
+    )
+
+    sent = [call.args[1] for call in bot.send_message.await_args_list]
+    assert runtime._PAID_TRANSCRIPT_MORE_UNSTORED in sent
+    assert not any(runtime._PAID_TRANSCRIPT_MORE in item for item in sent)
+    parked = parts.storage.upload_bytes.await_args.kwargs["object_key"]
+    dropped = [call.args[0] for call in parts.storage.delete_object.await_args_list]
+    assert parked in dropped
+    stored = parts.topic.append_messages.await_args.args[3][1]["content"]
+    assert "не лёг" in stored
+    assert session.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_unkept_transcript_is_not_parked_when_lifecycle_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "я" * (TELEGRAM_TEXT_SAFE * 5 + 50)
+    session, bot, parts = _patch_paid_transcript(monkeypatch, text=text, keep=False)
+    parts.storage.ensure_transcript_lifecycle = AsyncMock(
+        side_effect=S3StorageError("Не удалось задать срок хранения расшифровок")
+    )
+
+    await runtime._process_s3_upload_session(
+        bot=bot,
+        assistant=MagicMock(),
+        topic_storage=parts.topic,
+        assistant_storage=parts.assistant_storage,
+        store=parts.store,
+        storage=parts.storage,
+        session=session,
+    )
+
+    sent = [call.args[1] for call in bot.send_message.await_args_list]
+    assert runtime._PAID_TRANSCRIPT_MORE_UNSTORED in sent
+    parts.storage.upload_bytes.assert_not_awaited()
     assert session.status == "done"

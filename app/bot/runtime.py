@@ -127,6 +127,7 @@ from app.bot.models import (  # noqa: F401
     _vision_model_of,
 )
 from app.bot.telegram_text import (
+    TELEGRAM_TEXT_LIMIT,
     TELEGRAM_TEXT_SAFE,
     clip_telegram_text,
     split_telegram_text,
@@ -135,6 +136,11 @@ from app.bot.telegram_text import (
 from app.infra.cost_tracker import prefer_cost_rub
 from app.llm.video_settings import VideoSettingsScope, video_settings_from
 from app.media.media_utils import prepare_audio_file_for_stt
+from app.storage.s3_storage import (
+    TRANSCRIPT_PREFIX,
+    TRANSCRIPT_RETENTION_DAYS,
+    TRANSCRIPT_URL_SECONDS,
+)
 
 
 async def _active_profile(chat_id: int, storage: AssistantStorage) -> AssistantProfile:
@@ -614,7 +620,10 @@ async def _deliver_text(message: Message, payload: str) -> bool:
 
 _PAID_TRANSCRIPT_INTRO = "Файл расшифровки в чат не дошёл. Ниже уже готовый текст."
 _PAID_TRANSCRIPT_PREVIEW = "Файл расшифровки в чат не дошёл. Ниже начало текста."
-_PAID_TRANSCRIPT_MORE = "Дальше текст не присылаю: остальное в файле transcript.txt."
+_PAID_TRANSCRIPT_MORE = (
+    "Дальше текст не присылаю. Полный файл по ссылке, "
+    f"она действует {TRANSCRIPT_RETENTION_DAYS} дней."
+)
 _PAID_TRANSCRIPT_MORE_UNSTORED = (
     "Дальше текст не присылаю: полная копия в хранилище не легла."
 )
@@ -625,9 +634,9 @@ _TRANSCRIPT_HISTORY_CHARS = 4000
 
 
 def _transcript_history_body(
-    filename: str, transcript: str, *, parked: bool, shown: bool
+    filename: str, transcript: str, *, link_sent: bool, shown: bool
 ) -> str:
-    """Короткая реплика для темы. Полный текст сюда не кладётся."""
+    """Короткая реплика для темы. Полный текст и ссылка сюда не кладутся."""
     excerpt = clip_telegram_text(transcript, _TRANSCRIPT_HISTORY_CHARS)
     if shown and excerpt == transcript:
         return (
@@ -635,10 +644,10 @@ def _transcript_history_body(
         )
     if excerpt != transcript:
         excerpt = excerpt.rstrip() + "…"
-    if parked:
+    if link_sent:
         where = (
             f"Полный текст ({len(transcript)} символов) — "
-            "файл transcript.txt в хранилище."
+            f"ссылка в чате, действует {TRANSCRIPT_RETENTION_DAYS} дней."
         )
     else:
         where = f"Полный текст ({len(transcript)} символов) в хранилище не лёг."
@@ -649,33 +658,80 @@ def _transcript_history_body(
     return f"{lead} {where}\n\n{excerpt}"
 
 
+async def _drop_transcript_object(
+    storage: S3Storage, object_key: str, chat_id: int
+) -> None:
+    """Снимает копию, которую не удалось отдать ссылкой. Ключ в лог не пишется."""
+    try:
+        await storage.delete_object(object_key)
+    except Exception:
+        logger.warning("upload_transcript_park_delete_failed", chat_id=chat_id)
+
+
 async def _park_transcript_copy(
     storage: S3Storage, chat_id: int, user_id: int, raw: bytes
-) -> bool:
-    """Полный текст в бакет загрузки. Ключ не совпадает с исходным аудио."""
+) -> tuple[str, str] | None:
+    """Полный текст и ссылка на скачивание. None — копии, которой можно пользоваться, нет.
+
+    Ключ не совпадает с исходным аудио. Сессия его не удаляет: бакет снимает
+    префикс ``transcripts/`` через 7 дней. Без lifecycle объект не кладётся.
+    """
     import uuid
 
-    object_key = f"transcripts/{chat_id}/{user_id}/{uuid.uuid4().hex}/transcript.txt"
+    try:
+        await storage.ensure_transcript_lifecycle()
+    except Exception:
+        logger.warning("upload_transcript_lifecycle_failed", chat_id=chat_id)
+        return None
+    object_key = (
+        f"{TRANSCRIPT_PREFIX}{chat_id}/{user_id}/{uuid.uuid4().hex}/transcript.txt"
+    )
     try:
         await storage.upload_bytes(
             object_key=object_key, data=raw, content_type="text/plain"
         )
     except Exception:
         logger.warning("upload_transcript_park_failed", chat_id=chat_id, bytes=len(raw))
-        return False
+        return None
+    try:
+        url = await storage.create_presigned_get(
+            object_key, expires_in=TRANSCRIPT_URL_SECONDS
+        )
+    except Exception:
+        logger.warning("upload_transcript_link_failed", chat_id=chat_id)
+        await _drop_transcript_object(storage, object_key, chat_id)
+        return None
+    if not url or telegram_text_units(url) > TELEGRAM_TEXT_LIMIT:
+        await _drop_transcript_object(storage, object_key, chat_id)
+        return None
     logger.info("upload_transcript_parked", chat_id=chat_id, bytes=len(raw))
+    return url, object_key
+
+
+async def _send_transcript_link(bot: Bot, chat_id: int, url: str) -> bool:
+    """Одно сообщение: пояснение и ссылка. Обещание без URL не отправляется."""
+    from aiogram.exceptions import TelegramNetworkError
+
+    payload = f"{_PAID_TRANSCRIPT_MORE}\n{url}"
+    if telegram_text_units(payload) > TELEGRAM_TEXT_LIMIT:
+        return False
+    try:
+        await _flood_send(lambda: bot.send_message(chat_id, payload))
+    except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
+        logger.warning("upload_transcript_more_failed", chat_id=chat_id)
+        return False
     return True
 
 
 async def _send_paid_transcript_text(
-    bot: Bot, chat_id: int, text: str, *, parked: bool
-) -> bool:
-    """Не больше пяти кусков. True — всё, что собирались показать, ушло в чат."""
+    bot: Bot, chat_id: int, text: str, *, download_url: str | None
+) -> tuple[bool, bool]:
+    """Не больше пяти кусков. Пара: превью ушло целиком, ссылка ушла в чат."""
     from aiogram.exceptions import TelegramNetworkError
 
     chunks = split_telegram_text(text, TELEGRAM_TEXT_SAFE)
     if not chunks:
-        return True
+        return True, False
     shown = chunks[:_TRANSCRIPT_CHAT_CHUNKS]
     intro = (
         _PAID_TRANSCRIPT_PREVIEW if len(chunks) > len(shown) else _PAID_TRANSCRIPT_INTRO
@@ -684,6 +740,7 @@ async def _send_paid_transcript_text(
         await _flood_send(lambda: bot.send_message(chat_id, intro))
     except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
         logger.warning("upload_transcript_intro_failed", chat_id=chat_id)
+    preview_sent = True
     for chunk in shown:
         try:
             await _flood_send(lambda: bot.send_message(chat_id, chunk))
@@ -693,14 +750,20 @@ async def _send_paid_transcript_text(
                 chat_id=chat_id,
                 chars=len(text),
             )
-            return False
+            preview_sent = False
+            break
+    link_sent = False
     if len(chunks) > len(shown):
-        note = _PAID_TRANSCRIPT_MORE if parked else _PAID_TRANSCRIPT_MORE_UNSTORED
-        try:
-            await _flood_send(lambda: bot.send_message(chat_id, note))
-        except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
-            logger.warning("upload_transcript_more_failed", chat_id=chat_id)
-    return True
+        if download_url:
+            link_sent = await _send_transcript_link(bot, chat_id, download_url)
+        else:
+            try:
+                await _flood_send(
+                    lambda: bot.send_message(chat_id, _PAID_TRANSCRIPT_MORE_UNSTORED)
+                )
+            except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
+                logger.warning("upload_transcript_more_failed", chat_id=chat_id)
+    return preview_sent, link_sent
 
 
 _FLOOD_WAIT_LIMIT = 30
@@ -2066,14 +2129,24 @@ async def _process_s3_upload_session(
                     chat_id=chat_id,
                     chars=len(transcript),
                 )
-                parked = await _park_transcript_copy(
-                    storage, chat_id, user_id, transcript_bytes
+                # Очередь доставки уже отказала. Хвост, который не влезает
+                # в пять сообщений, отдаётся ссылкой. Короткий текст в бакет не кладётся.
+                download_url: str | None = None
+                parked_key: str | None = None
+                pieces = split_telegram_text(transcript, TELEGRAM_TEXT_SAFE)
+                if len(pieces) > _TRANSCRIPT_CHAT_CHUNKS:
+                    parked = await _park_transcript_copy(
+                        storage, chat_id, user_id, transcript_bytes
+                    )
+                    if parked is not None:
+                        download_url, parked_key = parked
+                shown, link_sent = await _send_paid_transcript_text(
+                    bot, chat_id, transcript, download_url=download_url
                 )
-                shown = await _send_paid_transcript_text(
-                    bot, chat_id, transcript, parked=parked
-                )
+                if parked_key is not None and not link_sent:
+                    await _drop_transcript_object(storage, parked_key, chat_id)
                 history_body = _transcript_history_body(
-                    filename, transcript, parked=parked, shown=shown
+                    filename, transcript, link_sent=link_sent, shown=shown
                 )
 
         # Короткая запись в историю активной темы — одним куском, под локом чата.
@@ -2140,6 +2213,8 @@ async def _process_s3_upload_session(
         # добора, поэтому остаток снимается на любом выходе.
         await cost_tracker.release_reservation(user_id)
         sem.release()
+        # Исходное аудио. transcript.txt под transcripts/ сессия не удаляет:
+        # его забирает lifecycle бакета, пока жива ссылка на скачивание.
         try:
             await storage.delete_object(object_key)
         except Exception:
@@ -3131,12 +3206,22 @@ async def _finish_topic_delete(
     topic_id: str,
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
-) -> tuple[str, InlineKeyboardMarkup, ReplyKeyboardMarkup]:
-    """Удаляет тему. Пустой каталог получает «Общая», меню берёт её имя."""
+) -> tuple[str, InlineKeyboardMarkup, ReplyKeyboardMarkup | None]:
+    """Удаляет тему. Меню — только если это активная персона.
+
+    Пустой каталог получает «Общая». Тема другой персоны нижние кнопки
+    не меняет, поэтому меню не собирается.
+    """
     await topic_storage.delete_topic(chat_id, assistant_id, topic_id)
     if not await topic_storage.get_active_topic(chat_id, assistant_id):
         await topic_storage.ensure_active(chat_id, assistant_id, "Общая")
     text, markup = await _topics_screen(chat_id, assistant_id, topic_storage)
+    try:
+        active = await _active_profile(chat_id, assistant_storage)
+    except AssistantStorageError:
+        active = None
+    if active is not None and active.id != assistant_id:
+        return text, markup, None
     menu = await _menu_for(chat_id, assistant_storage, topic_storage)
     return text, markup, menu
 

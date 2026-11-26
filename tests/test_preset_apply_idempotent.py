@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -228,3 +229,83 @@ async def test_apply_retries_same_id_when_activation_fails(
     active = await storage.get_active_assistant(chat_id)
     assert active is not None
     assert active.id == saved[0].id
+
+
+class _StallingState(_State):
+    """Первая запись flow_id ждёт: второй callback успевает дойти до лока."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claims = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def update_data(self, **kwargs: Any) -> dict[str, Any]:
+        if "flow_id" in kwargs:
+            self.claims += 1
+            if self.claims == 1:
+                self.entered.set()
+                await self.release.wait()
+        self.data.update(kwargs)
+        return dict(self.data)
+
+
+@pytest.mark.asyncio
+async def test_parallel_apply_claims_one_persona(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.bot.runtime as runtime
+
+    preset = get_preset("helper")
+    assert preset is not None
+    storage = InMemoryAssistantStorage()
+    chat_id = 11
+    state = _StallingState()
+    monkeypatch.setattr(runtime, "_query_message", lambda query: query.message)
+    monkeypatch.setattr(runtime, "_edit_inline", AsyncMock())
+    monkeypatch.setattr(runtime, "_menu_for", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(runtime, "_close_screen", AsyncMock())
+    monkeypatch.setattr(runtime, "_apply_reply_menu", AsyncMock())
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        message_id=24,
+        answer=AsyncMock(),
+    )
+    query = SimpleNamespace(
+        data=f"preset:apply:{preset.id}",
+        message=message,
+        answer=AsyncMock(),
+    )
+
+    async def apply() -> None:
+        await on_preset_apply(
+            query,  # type: ignore[arg-type]
+            assistant=_assistant(),  # type: ignore[arg-type]
+            assistant_storage=storage,
+            topic_storage=SimpleNamespace(),
+            state=state,  # type: ignore[arg-type]
+        )
+
+    first = asyncio.create_task(apply())
+    await state.entered.wait()
+    second = asyncio.create_task(apply())
+    for _ in range(50):
+        gate = runtime._chat_turn_locks.get(chat_id)
+        if gate is not None and gate.users == 2:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("второй callback не встал в очередь лока чата")
+
+    assert state.claims == 1
+    assert _custom(await storage.list_assistants(chat_id)) == []
+    state.release.set()
+    await first
+    await second
+
+    saved = _custom(await storage.list_assistants(chat_id))
+    assert [item.name for item in saved] == [preset.name]
+    assert state.claims == 1
+    assert message.answer.await_count == 1
+    assert runtime._chat_turn_locks == {}

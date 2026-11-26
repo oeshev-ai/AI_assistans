@@ -171,6 +171,72 @@ async def test_topic_delete_uses_assistant_from_callback(
         state=SimpleNamespace(update_data=AsyncMock()),  # type: ignore[arg-type]
     )
     assert called == {"assistant_id": "personaA", "topic_id": "topic99"}
+    runtime._apply_reply_menu.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_topic_delete_skips_menu_for_inactive_persona(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import create_autospec
+
+    from aiogram.types import Message
+
+    import app.bot.runtime as runtime
+
+    assistants = InMemoryAssistantStorage()
+    topics = InMemoryTopicStorage()
+    chat_id = 12
+    active = default_assistant_profile().model_copy(
+        update={"id": "active", "name": "Активная"}
+    )
+    other = default_assistant_profile().model_copy(
+        update={"id": "other", "name": "Другая"}
+    )
+    await assistants.save_assistant(chat_id, active)
+    await assistants.save_assistant(chat_id, other)
+    await assistants.set_active_assistant(chat_id, active.id)
+    active_topic = await topics.create_topic(chat_id, active.id, "Своя")
+    await topics.set_active_topic(chat_id, active.id, active_topic)
+    other_topic = await topics.create_topic(chat_id, other.id, "Чужая")
+
+    monkeypatch.setattr(runtime, "_edit_inline", AsyncMock())
+    monkeypatch.setattr(runtime, "_apply_reply_menu", AsyncMock())
+    message = create_autospec(Message, instance=True)
+    message.chat = SimpleNamespace(id=chat_id)
+    message.message_id = 10
+    state = SimpleNamespace(update_data=AsyncMock())
+
+    foreign = SimpleNamespace(
+        data=f"topic_del_yes:{other.id}:{other_topic}",
+        message=message,
+        answer=AsyncMock(),
+    )
+    await on_topic_delete_yes(
+        foreign,  # type: ignore[arg-type]
+        topic_storage=topics,
+        assistant_storage=assistants,
+        state=state,  # type: ignore[arg-type]
+    )
+    runtime._apply_reply_menu.assert_not_called()
+    foreign_names = [
+        item["name"] for item in await topics.list_topics(chat_id, other.id)
+    ]
+    assert "Чужая" not in foreign_names
+
+    runtime._apply_reply_menu.reset_mock()
+    own = SimpleNamespace(
+        data=f"topic_del_yes:{active.id}:{active_topic}",
+        message=message,
+        answer=AsyncMock(),
+    )
+    await on_topic_delete_yes(
+        own,  # type: ignore[arg-type]
+        topic_storage=topics,
+        assistant_storage=assistants,
+        state=state,  # type: ignore[arg-type]
+    )
+    runtime._apply_reply_menu.assert_awaited_once()
 
 
 @pytest.mark.asyncio
