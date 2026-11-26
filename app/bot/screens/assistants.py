@@ -31,7 +31,7 @@ def _assistants_text(
 def _assistants_keyboard(
     profiles: list[AssistantProfile], active_id: str, page: int = 0
 ) -> InlineKeyboardMarkup:
-    """Кнопки персон текущей страницы и переход по страницам."""
+    """Кнопки персон текущей страницы, страницы и «Готово»."""
     current, total = M._page_bounds(len(profiles), page)
     chunk = profiles[current * PAGE_SIZE : (current + 1) * PAGE_SIZE]
     rows: list[list[InlineKeyboardButton]] = []
@@ -48,6 +48,13 @@ def _assistants_keyboard(
     pager = M._pager_row(current, total, "asst_page")
     if pager is not None:
         rows.append(pager)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово", callback_data="asst:done", style="success"
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

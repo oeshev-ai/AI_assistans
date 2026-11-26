@@ -9,6 +9,7 @@ import pytest
 
 from app.bot.runtime import (
     _compact_tool_content,
+    _drop_open_tool_round,
     _image_completion_text,
     _remember_model_turn,
     _sanitize_history_message,
@@ -86,6 +87,75 @@ def test_image_completion_text_uses_prompt() -> None:
 
     assert "рыжий кот" in text
     assert "generate_image" in text
+
+
+def _tool_call(call_id: str, name: str = "generate_image") -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+
+
+def test_open_tool_round_is_dropped_before_history() -> None:
+    closed = {
+        "role": "assistant",
+        "tool_calls": [_tool_call("done")],
+    }
+    tool = {"role": "tool", "tool_call_id": "done", "content": "ok"}
+    opened = {
+        "role": "assistant",
+        "content": "ещё думаю",
+        "tool_calls": [_tool_call("pending"), _tool_call("other")],
+    }
+    partial = {"role": "tool", "tool_call_id": "pending", "content": "половина"}
+    kept = _drop_open_tool_round([closed, tool, opened, partial])
+    assert kept == [closed, tool]
+
+
+@pytest.mark.asyncio
+async def test_partial_stream_stores_closed_prefix_and_text() -> None:
+    storage = InMemoryTopicStorage()
+    topic_id = await storage.create_topic(1, AID, "Общая")
+    await storage.append_message(
+        1, AID, topic_id, {"role": "user", "content": "нарисуй"}, 50
+    )
+    new_messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "tool_calls": [_tool_call("done")],
+            "reasoning_content": "секрет",
+        },
+        {"role": "tool", "tool_call_id": "done", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_tool_call("pending")],
+        },
+    ]
+
+    await _remember_model_turn(
+        1,
+        AID,
+        topic_id,
+        storage,
+        new_messages,
+        answer="Начал и оборвался\n…ответ прерван",
+        images=[],
+    )
+
+    history = await storage.get_history(1, AID, topic_id)
+    assert [item["role"] for item in history] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert history[1]["tool_calls"][0]["id"] == "done"
+    assert "reasoning_content" not in history[1]
+    assert "tool_calls" not in history[3]
+    assert history[3]["content"] == "Начал и оборвался\n…ответ прерван"
+    await storage.close()
 
 
 @pytest.mark.asyncio

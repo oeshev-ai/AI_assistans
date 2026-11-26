@@ -39,8 +39,8 @@ def test_file_choice_follows_the_selected_model() -> None:
     data = [button.callback_data for row in markup.inline_keyboard for button in row]
     assert "Получать результат файлом: да" in text
     assert "✅ Файлом" in labels
-    assert "set_file:0" in data
-    assert "set_file:1" in data
+    assert f"set_file:{profile.id}:0" in data
+    assert f"set_file:{profile.id}:1" in data
 
     other = profile.model_copy(update={"image_model": _FLUX})
     other_text, other_markup = _model_picker_parts(other, assistant, "image")  # type: ignore[arg-type]

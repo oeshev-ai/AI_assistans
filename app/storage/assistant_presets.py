@@ -14,6 +14,7 @@ from app.llm.models_config import (
     AVAILABLE_TTS_MODELS,
     OPENAI_TTS_VOICES,
 )
+from app.llm.speechkit_tts import SPEECHKIT_VOICES, is_speechkit_tts_model
 from app.storage.assistant_storage import AssistantProfile
 from app.storage.persona_icons import PERSONA_ICONS, normalize_icon
 
@@ -253,6 +254,7 @@ def preset_profile(
         voice_mode=preset.voice_mode,
         tts_model=preset.tts_model,
         tts_voice=preset.tts_voice,
+        tts_format="opus" if is_speechkit_tts_model(preset.tts_model) else None,
     )
 
 
@@ -277,8 +279,9 @@ def _size_ok(model_id: str, size: str) -> bool:
 
 
 def _tts_voices_for_model(model_id: str) -> tuple[str, ...]:
-    if model_id.startswith("openai/") or model_id in AVAILABLE_TTS_MODELS:
-        return OPENAI_TTS_VOICES
+    """Голоса пресета. SpeechKit не из списка OpenAI, иначе каталог не стартует."""
+    if is_speechkit_tts_model(model_id):
+        return SPEECHKIT_VOICES
     return OPENAI_TTS_VOICES
 
 

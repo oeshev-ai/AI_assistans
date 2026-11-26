@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import app.bot.screens as screens
 from app.bot import runtime as R
 from app.bot.constants import (
@@ -25,6 +27,106 @@ from app.bot.constants import (
 from app.bot.states import (
     NewAssistantSG,
 )
+from app.storage.assistant_presets import AssistantPreset
+from app.storage.assistant_storage import AssistantProfile
+
+
+def _applied_assistant_id(
+    data: dict[str, Any], message_id: int, preset_id: str
+) -> str | None:
+    """Id персоны, уже созданной этой кнопкой. Иначе ``None``."""
+    applied = data.get("preset_apply")
+    if not isinstance(applied, dict):
+        return None
+    if applied.get("message_id") != message_id or applied.get("preset_id") != preset_id:
+        return None
+    assistant_id = applied.get("assistant_id")
+    if isinstance(assistant_id, str) and assistant_id.strip():
+        return assistant_id.strip()
+    return None
+
+
+def _valid_profile_id(value: object) -> str | None:
+    if isinstance(value, str) and 1 <= len(value.strip()) <= 32:
+        return value.strip()
+    return None
+
+
+def _pinned_profile(
+    preset: AssistantPreset, profile_id: str, name: str
+) -> AssistantProfile:
+    """Тот же пресет с уже выбранными id и именем, без нового « (2)»."""
+    return preset_profile(preset, []).model_copy(
+        update={"id": profile_id, "name": name}
+    )
+
+
+def _preset_pending_markup(preset_id: str) -> InlineKeyboardMarkup:
+    """Превью без «Создать»: повторный тап не шлёт второй callback."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ Создать и настроить",
+                    callback_data=f"preset:edit:{preset_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="← К каталогу",
+                    callback_data="preset:list",
+                )
+            ],
+        ]
+    )
+
+
+async def _claim_preset_profile(
+    state: FSMContext,
+    preset: AssistantPreset,
+    profiles: list[AssistantProfile],
+    message_id: int,
+) -> AssistantProfile | None:
+    """Профиль для записи. ``None`` — это сообщение уже создало персону.
+
+    Id запоминается до save: повторная доставка пишет ту же персону,
+    а не «Имя (2)».
+    """
+    data = await state.get_data()
+    applied_id = _applied_assistant_id(data, message_id, preset.id)
+    if applied_id is not None:
+        return None
+    stored_id = _valid_profile_id(data.get("flow_id"))
+    stored_name = data.get("flow_name")
+    if data.get("flow_preset_id") == preset.id and stored_id is not None:
+        existing = next((item for item in profiles if item.id == stored_id), None)
+        if existing is not None:
+            return existing
+        if isinstance(stored_name, str) and stored_name.strip():
+            return _pinned_profile(preset, stored_id, stored_name.strip())
+    profile = preset_profile(preset, [item.name for item in profiles])
+    # До записи: иначе второй callback увидит занятое имя и добавит « (2)».
+    await state.update_data(
+        flow_id=profile.id,
+        flow_preset_id=preset.id,
+        flow_name=profile.name,
+    )
+    fresh = await state.get_data()
+    if _applied_assistant_id(fresh, message_id, preset.id) is not None:
+        return None
+    winner_id = _valid_profile_id(fresh.get("flow_id"))
+    winner_name = fresh.get("flow_name")
+    if (
+        winner_id is not None
+        and winner_id != profile.id
+        and isinstance(winner_name, str)
+        and winner_name.strip()
+    ):
+        existing = next((item for item in profiles if item.id == winner_id), None)
+        if existing is not None:
+            return existing
+        return _pinned_profile(preset, winner_id, winner_name.strip())
+    return profile
 
 
 async def on_presets_open(query: CallbackQuery, state: FSMContext) -> None:
@@ -100,7 +202,7 @@ async def on_preset_apply(
     topic_storage: TopicHistoryStorage,
     state: FSMContext,
 ) -> None:
-    """Создаёт персону из пресета и делает её активной."""
+    """Создаёт персону из пресета. Повтор «Создать» пишет тот же id."""
     message = R._query_message(query)
     if message is None:
         await query.answer()
@@ -111,10 +213,25 @@ async def on_preset_apply(
         await query.answer("Пресет не найден", show_alert=True)
         return
     chat_id = message.chat.id
+    if _applied_assistant_id(await state.get_data(), message.message_id, preset.id):
+        await query.answer("Персона создана")
+        return
+    if await state.get_state() is not None:
+        await query.answer(
+            "Сначала завершите текущий шаг или нажмите /cancel.",
+            show_alert=True,
+        )
+        return
+    text, _markup = screens._preset_preview_parts(preset, assistant)
+    await R._edit_inline(message, text, _preset_pending_markup(preset.id))
     try:
         profiles = await assistant_storage.list_assistants(chat_id)
-        taken = [item.name for item in profiles]
-        profile = preset_profile(preset, taken)
+        profile = await _claim_preset_profile(
+            state, preset, profiles, message.message_id
+        )
+        if profile is None:
+            await query.answer("Персона создана")
+            return
         await assistant_storage.save_assistant(chat_id, profile)
         await assistant_storage.set_active_assistant(chat_id, profile.id)
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
@@ -125,6 +242,13 @@ async def on_preset_apply(
         await query.answer(exc.message, show_alert=True)
         return
     await R._reset_flow(state)
+    await state.update_data(
+        preset_apply={
+            "message_id": message.message_id,
+            "preset_id": preset.id,
+            "assistant_id": profile.id,
+        }
+    )
     await query.answer("Персона создана")
     await R._close_screen(message, state, _SCREEN_PRESETS)
     await R._apply_reply_menu(message, menu, state)

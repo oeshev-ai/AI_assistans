@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 from fakeredis import FakeAsyncRedis
+from pydantic import ValidationError
 
 from app.storage.assistant_storage import (
     DEFAULT_ASSISTANT_ID,
@@ -201,3 +202,29 @@ async def test_redis_profile_ttl_is_set(redis_storage: RedisAssistantStorage) ->
     day = 24 * 60 * 60
     assert 29 * day <= hash_ttl <= 30 * day
     assert 29 * day <= active_ttl <= 30 * day
+
+
+async def test_validated_update_runs_model_validators() -> None:
+    profile = AssistantProfile(
+        name="Кино",
+        system_prompt="Ты отвечаешь коротко и по делу всегда.",
+        voice_mode="auto",
+        video_aspect_ratio="16:9",
+    )
+    # model_copy не вызывает валидаторы: мусор остаётся в объекте.
+    raw = profile.model_copy(
+        update={"voice_mode": "loud", "video_aspect_ratio": "99:1"}
+    )
+    assert raw.voice_mode == "loud"
+    assert raw.video_aspect_ratio == "99:1"
+
+    with pytest.raises(ValidationError):
+        profile.validated_update({"voice_mode": "loud"})
+    updated = profile.validated_update(
+        {"voice_mode": "off", "video_aspect_ratio": "99:1"}
+    )
+    assert updated.voice_mode == "off"
+    assert updated.video_aspect_ratio is None
+    assert updated.id == profile.id
+    assert profile.voice_mode == "auto"
+    assert profile.video_aspect_ratio == "16:9"

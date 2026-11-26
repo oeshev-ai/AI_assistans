@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from aiogram.exceptions import TelegramRetryAfter
+from pydantic import ValidationError
 
 import app.bot.screens as screens
 from app.bot import models as M
@@ -375,6 +376,58 @@ def _compact_tool_content(content: str) -> str:
     return json.dumps(compacted, ensure_ascii=False)
 
 
+def _tool_call_ids(message: dict[str, Any]) -> list[str]:
+    """Идентификаторы ``tool_calls``. Пустой список — вызовов нет или они битые."""
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    ids: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id")
+        if isinstance(call_id, str) and call_id:
+            ids.append(call_id)
+    return ids
+
+
+def _drop_open_tool_round(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Оставляет закрытые раунды. Хвост ``tool_calls`` без всех ``role: tool`` срезается.
+
+    Иначе следующий ход получает 400: у вызова нет парного ответа инструмента.
+    """
+    kept: list[dict[str, Any]] = []
+    index = 0
+    total = len(messages)
+    while index < total:
+        item = messages[index]
+        pending = _tool_call_ids(item) if item.get("role") == "assistant" else []
+        if item.get("role") != "assistant" or not item.get("tool_calls"):
+            if item.get("role") == "tool":
+                index += 1
+                continue
+            kept.append(item)
+            index += 1
+            continue
+        if not pending:
+            break
+        needed = set(pending)
+        cursor = index + 1
+        matched: list[dict[str, Any]] = []
+        while cursor < total and messages[cursor].get("role") == "tool":
+            call_id = messages[cursor].get("tool_call_id")
+            if isinstance(call_id, str) and call_id in needed:
+                needed.discard(call_id)
+                matched.append(messages[cursor])
+            cursor += 1
+        if needed:
+            break
+        kept.append(item)
+        kept.extend(matched)
+        index = cursor
+    return kept
+
+
 def _sanitize_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
     """Готовит сообщение раунда модели к записи в тему.
 
@@ -454,6 +507,7 @@ async def _remember_model_turn(
         cleaned = _sanitize_history_message(item)
         if cleaned is not None:
             to_store.append(cleaned)
+    to_store = _drop_open_tool_round(to_store)
 
     _attach_generation_ids(to_store, images)
     final_text = answer.strip()
@@ -559,29 +613,94 @@ async def _deliver_text(message: Message, payload: str) -> bool:
 
 
 _PAID_TRANSCRIPT_INTRO = "Файл расшифровки в чат не дошёл. Ниже уже готовый текст."
+_PAID_TRANSCRIPT_PREVIEW = "Файл расшифровки в чат не дошёл. Ниже начало текста."
+_PAID_TRANSCRIPT_MORE = "Дальше текст не присылаю: остальное в файле transcript.txt."
+_PAID_TRANSCRIPT_MORE_UNSTORED = (
+    "Дальше текст не присылаю: полная копия в хранилище не легла."
+)
+# Пять сообщений, не вся расшифровка: дальше Telegram отвечает flood.
+_TRANSCRIPT_CHAT_CHUNKS = 5
+# В историю темы уходит фрагмент, не час аудио. Лимит истории — число реплик.
+_TRANSCRIPT_HISTORY_CHARS = 4000
 
 
-async def _send_paid_transcript_text(bot: Bot, chat_id: int, text: str) -> str:
-    """Шлёт оплаченную расшифровку сообщениями. Возвращает непринятый хвост."""
+def _transcript_history_body(
+    filename: str, transcript: str, *, parked: bool, shown: bool
+) -> str:
+    """Короткая реплика для темы. Полный текст сюда не кладётся."""
+    excerpt = clip_telegram_text(transcript, _TRANSCRIPT_HISTORY_CHARS)
+    if shown and excerpt == transcript:
+        return (
+            f"Расшифровка «{filename}» отправлена текстом ({len(transcript)} символов)."
+        )
+    if excerpt != transcript:
+        excerpt = excerpt.rstrip() + "…"
+    if parked:
+        where = (
+            f"Полный текст ({len(transcript)} символов) — "
+            "файл transcript.txt в хранилище."
+        )
+    else:
+        where = f"Полный текст ({len(transcript)} символов) в хранилище не лёг."
+    if shown:
+        lead = f"Расшифровка «{filename}»: в чат ушло только начало."
+    else:
+        lead = f"Расшифровка «{filename}» в чат не дошла."
+    return f"{lead} {where}\n\n{excerpt}"
+
+
+async def _park_transcript_copy(
+    storage: S3Storage, chat_id: int, user_id: int, raw: bytes
+) -> bool:
+    """Полный текст в бакет загрузки. Ключ не совпадает с исходным аудио."""
+    import uuid
+
+    object_key = f"transcripts/{chat_id}/{user_id}/{uuid.uuid4().hex}/transcript.txt"
+    try:
+        await storage.upload_bytes(
+            object_key=object_key, data=raw, content_type="text/plain"
+        )
+    except Exception:
+        logger.warning("upload_transcript_park_failed", chat_id=chat_id, bytes=len(raw))
+        return False
+    logger.info("upload_transcript_parked", chat_id=chat_id, bytes=len(raw))
+    return True
+
+
+async def _send_paid_transcript_text(
+    bot: Bot, chat_id: int, text: str, *, parked: bool
+) -> bool:
+    """Не больше пяти кусков. True — всё, что собирались показать, ушло в чат."""
     from aiogram.exceptions import TelegramNetworkError
 
+    chunks = split_telegram_text(text, TELEGRAM_TEXT_SAFE)
+    if not chunks:
+        return True
+    shown = chunks[:_TRANSCRIPT_CHAT_CHUNKS]
+    intro = (
+        _PAID_TRANSCRIPT_PREVIEW if len(chunks) > len(shown) else _PAID_TRANSCRIPT_INTRO
+    )
     try:
-        await _flood_send(lambda: bot.send_message(chat_id, _PAID_TRANSCRIPT_INTRO))
+        await _flood_send(lambda: bot.send_message(chat_id, intro))
     except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
         logger.warning("upload_transcript_intro_failed", chat_id=chat_id)
-    rest = text
-    for chunk in split_telegram_text(text, TELEGRAM_TEXT_SAFE):
+    for chunk in shown:
         try:
             await _flood_send(lambda: bot.send_message(chat_id, chunk))
         except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
             logger.warning(
                 "upload_transcript_text_failed",
                 chat_id=chat_id,
-                chars=len(rest),
+                chars=len(text),
             )
-            return rest
-        rest = rest[len(chunk) :]
-    return ""
+            return False
+    if len(chunks) > len(shown):
+        note = _PAID_TRANSCRIPT_MORE if parked else _PAID_TRANSCRIPT_MORE_UNSTORED
+        try:
+            await _flood_send(lambda: bot.send_message(chat_id, note))
+        except (TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter):
+            logger.warning("upload_transcript_more_failed", chat_id=chat_id)
+    return True
 
 
 _FLOOD_WAIT_LIMIT = 30
@@ -1829,46 +1948,61 @@ async def _process_s3_upload_session(
                 filename=filename,
                 is_video=kind == "video",
             )
-            local_path.unlink(missing_ok=True)
-            local_path = None
-            from app.media.media_utils import audio_duration_seconds
-
-            duration = await audio_duration_seconds(chunks)
-            estimated = cost_tracker.estimate_stt_cost(
-                max(_UPLOAD_STT_FLOOR_SECONDS, duration)
+            from app.media.media_utils import (
+                audio_duration_seconds,
+                close_stt_chunks,
+                iter_stt_chunk_bytes,
             )
-            extra = estimated - floor
-            if extra > 0:
-                try:
-                    await cost_tracker.check_budget(user_id, extra)
-                except BudgetExceededError as exc:
-                    await bot.send_message(chat_id, exc.message)
-                    session.status = "failed"
-                    session.error = "budget_exceeded"
-                    await store.update(session)
-                    return
-            parts: list[str] = []
-            facts: list[tuple[float | None, str | None, float | None]] = []
-            providers: list[str | None] = []
-            models: list[str | None] = []
-            total = len(chunks)
-            for index, (audio_bytes, chunk_name) in enumerate(chunks, start=1):
-                stage = f"Часть {index} из {total}" if total > 1 else "Расшифровываю"
-                await _edit_upload_status(status_msg, f"{progress}{stage}…")
-                recognized = await job_queue.transcribe_audio(
-                    assistant,
-                    audio_bytes,
-                    filename=chunk_name,
-                    language=None,
-                    billing_user_id=user_id,
+
+            try:
+                local_path.unlink(missing_ok=True)
+                local_path = None
+                duration = await audio_duration_seconds(chunks)
+                estimated = cost_tracker.estimate_stt_cost(
+                    max(_UPLOAD_STT_FLOOR_SECONDS, duration)
                 )
-                facts.append(
-                    (recognized.cost_usd, recognized.cost_source, recognized.cost_rub)
-                )
-                providers.append(recognized.provider_id)
-                models.append(recognized.model)
-                if recognized.text:
-                    parts.append(recognized.text)
+                extra = estimated - floor
+                if extra > 0:
+                    try:
+                        await cost_tracker.check_budget(user_id, extra)
+                    except BudgetExceededError as exc:
+                        await bot.send_message(chat_id, exc.message)
+                        session.status = "failed"
+                        session.error = "budget_exceeded"
+                        await store.update(session)
+                        return
+                parts: list[str] = []
+                facts: list[tuple[float | None, str | None, float | None]] = []
+                providers: list[str | None] = []
+                models: list[str | None] = []
+                total = len(chunks)
+                index = 0
+                async for audio_bytes, chunk_name in iter_stt_chunk_bytes(chunks):
+                    index += 1
+                    stage = (
+                        f"Часть {index} из {total}" if total > 1 else "Расшифровываю"
+                    )
+                    await _edit_upload_status(status_msg, f"{progress}{stage}…")
+                    recognized = await job_queue.transcribe_audio(
+                        assistant,
+                        audio_bytes,
+                        filename=chunk_name,
+                        language=None,
+                        billing_user_id=user_id,
+                    )
+                    facts.append(
+                        (
+                            recognized.cost_usd,
+                            recognized.cost_source,
+                            recognized.cost_rub,
+                        )
+                    )
+                    providers.append(recognized.provider_id)
+                    models.append(recognized.model)
+                    if recognized.text:
+                        parts.append(recognized.text)
+            finally:
+                close_stt_chunks(chunks)
         transcript = "\n\n".join(parts).strip()
         amount, source, rub = prefer_cost_rub(facts, estimated)
         provider = providers[0] if providers and len(set(providers)) == 1 else None
@@ -1932,19 +2066,18 @@ async def _process_s3_upload_session(
                     chat_id=chat_id,
                     chars=len(transcript),
                 )
-                unsent = await _send_paid_transcript_text(bot, chat_id, transcript)
-                if unsent:
-                    history_body = (
-                        "Расшифровка не дошла в чат. Текст ниже.\n\n" + unsent
-                    )
-                else:
-                    history_body = (
-                        f"Расшифровка «{filename}» отправлена текстом "
-                        f"({len(transcript)} символов)."
-                    )
+                parked = await _park_transcript_copy(
+                    storage, chat_id, user_id, transcript_bytes
+                )
+                shown = await _send_paid_transcript_text(
+                    bot, chat_id, transcript, parked=parked
+                )
+                history_body = _transcript_history_body(
+                    filename, transcript, parked=parked, shown=shown
+                )
 
         # Короткая запись в историю активной темы — одним куском, под локом чата.
-        # Если чат текст не принял, в реплике лежит сама расшифровка.
+        # Фрагмент ограничен: следующий запрос забирает историю целиком.
         try:
             async with _chat_turn(chat_id):
                 profile = await _active_profile(chat_id, assistant_storage)
@@ -2418,14 +2551,17 @@ async def _apply_model_choice(
         await query.answer()
         return
     raw = (query.data or "").removeprefix(prefix)
+    assistant_id, index_raw = M._callback_persona(raw)
     try:
-        selected: str | None = catalog[int(raw)]
+        selected: str | None = catalog[int(index_raw)]
     except (ValueError, IndexError):
         await query.answer("Неизвестная модель", show_alert=True)
         return
     chat_id = message.chat.id
+    profile = await _profile_for_ui(query, message, assistant_storage, assistant_id)
+    if profile is None:
+        return
     try:
-        profile = await _active_profile(chat_id, assistant_storage)
         fields: dict[str, Any]
         if kind == "image":
             old_model = M._image_model_of(profile, assistant, chat_id=chat_id)
@@ -2433,7 +2569,7 @@ async def _apply_model_choice(
             fields = {"image_model": selected}
             if image_model_family(old_model) != image_model_family(new_model):
                 fields["image_size"] = M._default_image_size(new_model)
-            updated = profile.model_copy(update=fields)
+            updated = profile.validated_update(fields)
         elif kind == "tts":
             effective = selected or assistant.config.default_tts_model
             new_voice = M._compatible_tts_voice(profile, assistant, new_model=selected)
@@ -2453,10 +2589,13 @@ async def _apply_model_choice(
                 )
             else:
                 fields["tts_role"] = None
-            updated = profile.model_copy(update=fields)
+            updated = profile.validated_update(fields)
         else:
-            updated = profile.model_copy(update={"text_model": selected})
+            updated = profile.validated_update({"text_model": selected})
         await assistant_storage.save_assistant(chat_id, updated)
+    except ValidationError:
+        await query.answer("Некорректное значение", show_alert=True)
+        return
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
@@ -2878,7 +3017,7 @@ async def _topics_screen(
     """Собирает экран тем активной персоны."""
     topics = await storage.list_topics(chat_id, assistant_id)
     active = await storage.get_active_topic(chat_id, assistant_id)
-    return screens._topics_markup(topics, active)
+    return screens._topics_markup(topics, active, assistant_id=assistant_id)
 
 
 async def _open_topics(
@@ -2959,6 +3098,31 @@ async def _persona_id_for_query(
         await query.answer(exc.message, show_alert=True)
         return None
     return profile.id
+
+
+async def _profile_for_ui(
+    query: CallbackQuery,
+    message: Message,
+    storage: AssistantStorage,
+    assistant_id: str | None,
+) -> AssistantProfile | None:
+    """Профиль с кнопки экрана. Без id — активная персона (старые сообщения)."""
+    if not assistant_id:
+        try:
+            return await _active_profile(message.chat.id, storage)
+        except AssistantStorageError as exc:
+            await query.answer(exc.message, show_alert=True)
+            return None
+    try:
+        profiles = await storage.list_assistants(message.chat.id)
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return None
+    profile = next((item for item in profiles if item.id == assistant_id), None)
+    if profile is None:
+        await query.answer("Ассистент не найден", show_alert=True)
+        return None
+    return profile
 
 
 async def _finish_topic_delete(

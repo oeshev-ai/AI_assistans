@@ -63,10 +63,12 @@ def _video_picker_parts(
     """Экран формата, длины, разрешения и звука ролика активной персоны."""
     settings = video_settings_from(profile)
     sound = "вкл" if settings.generate_audio else "выкл"
+    # Id в callback: протухший пикер не пишет в ту персону, что стала активной.
+    bound = profile.id
     rows = _choice_rows(
         VIDEO_ASPECT_RATIOS,
         settings.aspect_ratio,
-        prefix="video:aspect:",
+        prefix=f"video:{bound}:aspect:",
         label_of=str,
         per_row=3,
     )
@@ -74,7 +76,7 @@ def _video_picker_parts(
         _choice_rows(
             VIDEO_DURATIONS,
             settings.duration,
-            prefix="video:dur:",
+            prefix=f"video:{bound}:dur:",
             label_of=lambda item: f"{item}с",
             per_row=6,
         )
@@ -83,7 +85,7 @@ def _video_picker_parts(
         _choice_rows(
             VIDEO_RESOLUTIONS,
             settings.resolution,
-            prefix="video:res:",
+            prefix=f"video:{bound}:res:",
             label_of=str,
             per_row=2,
         )
@@ -95,14 +97,16 @@ def _video_picker_parts(
         audio_row.append(
             InlineKeyboardButton(
                 text=f"{mark}{label}",
-                callback_data=f"video:audio:{flag}",
+                callback_data=f"video:{bound}:audio:{flag}",
             )
         )
     rows.append(audio_row)
     rows.append(
         [
             InlineKeyboardButton(
-                text="Готово", callback_data="picker:done", style="success"
+                text="Готово",
+                callback_data=f"picker:done:{bound}",
+                style="success",
             )
         ]
     )
@@ -114,13 +118,13 @@ def _video_picker_parts(
         f"Звук: {sound}\n\n"
         "Выберите формат, длительность, разрешение или звук."
     )
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    return M._fit_screen(text), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _model_picker_parts(
     profile: AssistantProfile, assistant: AssistAIClient, kind: str
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Текст и кнопки выбора модели активной персоны."""
+    """Текст и кнопки выбора модели. В callback — id этой персоны, не активной."""
     rows: list[list[InlineKeyboardButton]] = []
     if kind == "video":
         return _video_picker_parts(profile)
@@ -136,7 +140,7 @@ def _model_picker_parts(
                 [
                     InlineKeyboardButton(
                         text=M._clip_label(mark, model),
-                        callback_data=f"set_image:{index}",
+                        callback_data=f"set_image:{profile.id}:{index}",
                     )
                 ]
             )
@@ -145,7 +149,8 @@ def _model_picker_parts(
             mark = "✅ " if item == shown_size else ""
             size_row.append(
                 InlineKeyboardButton(
-                    text=f"{mark}{item}", callback_data=f"set_size:{item}"
+                    text=f"{mark}{item}",
+                    callback_data=f"set_size:{profile.id}:{item}",
                 )
             )
         rows.append(size_row)
@@ -159,7 +164,7 @@ def _model_picker_parts(
                 bg_row.append(
                     InlineKeyboardButton(
                         text=f"{mark}{label}",
-                        callback_data=f"set_bg:{value}",
+                        callback_data=f"set_bg:{profile.id}:{value}",
                     )
                 )
             rows.append(bg_row)
@@ -173,7 +178,7 @@ def _model_picker_parts(
             file_row.append(
                 InlineKeyboardButton(
                     text=f"{mark}{label}",
-                    callback_data=f"set_file:{flag}",
+                    callback_data=f"set_file:{profile.id}:{flag}",
                 )
             )
         rows.append(file_row)
@@ -181,7 +186,9 @@ def _model_picker_parts(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Готово", callback_data="picker:done", style="success"
+                    text="Готово",
+                    callback_data=f"picker:done:{profile.id}",
+                    style="success",
                 )
             ]
         )
@@ -194,7 +201,7 @@ def _model_picker_parts(
             f"{choose}\n\n"
             f"{M._hints_block(AVAILABLE_IMAGE_MODELS, image_model)}"
         )
-        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+        return M._fit_screen(text), InlineKeyboardMarkup(inline_keyboard=rows)
     if kind == "tts":
         current = M._chosen_model_line(
             profile.tts_model, assistant.config.default_tts_model
@@ -208,7 +215,7 @@ def _model_picker_parts(
                 [
                     InlineKeyboardButton(
                         text=M._clip_label(mark, model),
-                        callback_data=f"set_tts:{index}",
+                        callback_data=f"set_tts:{profile.id}:{index}",
                     )
                 ]
             )
@@ -218,7 +225,7 @@ def _model_picker_parts(
             mode_row.append(
                 InlineKeyboardButton(
                     text=f"{mark}{_VOICE_MODE_LABELS[mode]}",
-                    callback_data=f"voice_mode:{mode}",
+                    callback_data=f"voice_mode:{profile.id}:{mode}",
                 )
             )
         rows.append(mode_row)
@@ -229,7 +236,7 @@ def _model_picker_parts(
             voice_row.append(
                 InlineKeyboardButton(
                     text=f"{mark}{name}",
-                    callback_data=f"voice_name:{index}",
+                    callback_data=f"voice_name:{profile.id}:{index}",
                 )
             )
             if len(voice_row) >= 4:
@@ -249,7 +256,7 @@ def _model_picker_parts(
                     role_row.append(
                         InlineKeyboardButton(
                             text=f"{mark}{name}",
-                            callback_data=f"voice_role:{name}",
+                            callback_data=f"voice_role:{profile.id}:{name}",
                         )
                     )
                     if len(role_row) >= 4:
@@ -267,7 +274,9 @@ def _model_picker_parts(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="Готово", callback_data="picker:done", style="success"
+                    text="Готово",
+                    callback_data=f"picker:done:{profile.id}",
+                    style="success",
                 )
             ]
         )
@@ -279,17 +288,21 @@ def _model_picker_parts(
             f"{extra}\n"
             "Выберите модель, режим, голос или амплуа:"
         )
-        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+        return M._fit_screen(text), InlineKeyboardMarkup(inline_keyboard=rows)
     current = M._chosen_model_line(
         profile.text_model, assistant.config.default_text_model
     )
     text_model = M._text_model_of(profile, assistant)
-    keyboard = M._model_keyboard(AVAILABLE_TEXT_MODELS, "set_text", done="picker:done")
+    keyboard = M._model_keyboard(
+        AVAILABLE_TEXT_MODELS,
+        f"set_text:{profile.id}",
+        done=f"picker:done:{profile.id}",
+    )
     text = (
         f"Текстовая модель ассистента «{profile.name}»:\n{current}\n\n"
         f"Выберите модель:\n\n{M._hints_block(AVAILABLE_TEXT_MODELS, text_model)}"
     )
-    return text, keyboard
+    return M._fit_screen(text), keyboard
 
 
 def _settings_hub_view(profile: AssistantProfile) -> tuple[str, InlineKeyboardMarkup]:
@@ -372,7 +385,7 @@ def _settings_persona_view(
             f"Голосовой ответ: {mode_label}",
         ]
     )
-    text = "\n".join(lines)
+    text = M._fit_screen("\n".join(lines))
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="Иконка", callback_data="asst_icon_menu")],
         [

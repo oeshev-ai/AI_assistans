@@ -216,6 +216,16 @@ class AssistantProfile(BaseModel):
                 self.tts_model = resolved_tts
         return self
 
+    def validated_update(self, changes: dict[str, object]) -> AssistantProfile:
+        """Копия с новыми полями. Значения проходят валидаторы модели.
+
+        ``model_copy(update=...)`` их не вызывает: поле без ручной проверки
+        в хендлере записалось бы как есть.
+        """
+        payload = self.model_dump()
+        payload.update(changes)
+        return type(self).model_validate(payload)
+
 
 def default_assistant_profile() -> AssistantProfile:
     """Базовый ассистент «Стандартный». Его id фиксирован, чтобы на него можно было вернуться."""

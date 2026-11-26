@@ -22,6 +22,38 @@ from app.bot.states import (
 )
 
 
+def _stored_topic_name(
+    topics: list[dict[str, str]], topic_id: str, fallback: str
+) -> str:
+    for item in topics:
+        if item.get("id") == topic_id:
+            return item["name"]
+    return fallback
+
+
+def _persona_suffix(data: str, prefix: str) -> str | None:
+    """``prefix`` или ``prefix:{id}``. Пустой хвост — старая кнопка без id."""
+    if data == prefix:
+        return None
+    head = f"{prefix}:"
+    if not data.startswith(head):
+        return None
+    assistant_id = data[len(head) :]
+    return assistant_id or None
+
+
+async def _bound_assistant_id(
+    query: CallbackQuery,
+    message: Message,
+    assistant_storage: AssistantStorage,
+    assistant_id: str | None,
+) -> str | None:
+    """Id с кнопки. Старые сообщения без id берут активную персону."""
+    if assistant_id:
+        return assistant_id
+    return await R._persona_id_for_query(query, message, assistant_storage)
+
+
 async def on_menu_topics(
     message: Message,
     topic_storage: TopicHistoryStorage,
@@ -43,12 +75,16 @@ async def on_topics_page(
     if not isinstance(message, Message):
         await query.answer()
         return
+    raw = (query.data or "").removeprefix("topic_page:")
+    bound_id, page_raw = M._callback_persona(raw)
     try:
-        page = int((query.data or "").removeprefix("topic_page:"))
+        page = int(page_raw)
     except ValueError:
         await query.answer("Неверная страница", show_alert=True)
         return
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    assistant_id = await _bound_assistant_id(
+        query, message, assistant_storage, bound_id
+    )
     if assistant_id is None:
         return
     try:
@@ -61,7 +97,7 @@ async def on_topics_page(
     await R._edit_or_answer(
         query,
         screens._topics_text(topics, active, page),
-        screens._topics_keyboard(topics, active, page),
+        screens._topics_keyboard(topics, active, page, assistant_id=assistant_id),
     )
 
 
@@ -75,8 +111,15 @@ async def on_topic_delete_ask(
     if not isinstance(message, Message):
         await query.answer()
         return
-    topic_id = (query.data or "").removeprefix("topic_del_ask:")
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    bound_id, topic_id = M._callback_persona(
+        (query.data or "").removeprefix("topic_del_ask:")
+    )
+    if not topic_id:
+        await query.answer("Тема не найдена.", show_alert=True)
+        return
+    assistant_id = await _bound_assistant_id(
+        query, message, assistant_storage, bound_id
+    )
     if assistant_id is None:
         return
     try:
@@ -95,7 +138,7 @@ async def on_topic_delete_ask(
         M._confirm_row(
             "✅ Да, удалить",
             f"topic_del_yes:{assistant_id}:{topic_id}",
-            "topic:list",
+            f"topic:list:{assistant_id}",
         ),
     )
 
@@ -113,16 +156,14 @@ async def on_topic_delete_yes(
         return
     raw = (query.data or "").removeprefix("topic_del_yes:")
     chat_id = message.chat.id
-    # Новый формат: assistant_id:topic_id — персона из UI, не текущая активная.
-    if ":" in raw:
-        assistant_id, topic_id = raw.split(":", 1)
-    else:
-        topic_id = raw
-        resolved_id = await R._persona_id_for_query(query, message, assistant_storage)
-        if resolved_id is None:
-            return
-        assistant_id = resolved_id
-    if not assistant_id or not topic_id:
+    # assistant_id:topic_id — персона из UI, не текущая активная.
+    bound_id, topic_id = M._callback_persona(raw)
+    assistant_id = await _bound_assistant_id(
+        query, message, assistant_storage, bound_id
+    )
+    if assistant_id is None:
+        return
+    if not topic_id:
         await query.answer("Тема не найдена.", show_alert=True)
         return
     try:
@@ -150,7 +191,12 @@ async def on_topic_list(
     if message is None:
         await query.answer()
         return
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    assistant_id = await _bound_assistant_id(
+        query,
+        message,
+        assistant_storage,
+        _persona_suffix(query.data or "", "topic:list"),
+    )
     if assistant_id is None:
         return
     try:
@@ -165,6 +211,16 @@ async def on_topic_list(
     await query.answer()
 
 
+async def on_topics_done(query: CallbackQuery, state: FSMContext) -> None:
+    """Убирает список тем. Нижнее меню не трогает: активная тема та же."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    await query.answer()
+    await R._close_screen(message, state, _SCREEN_TOPICS)
+
+
 async def on_topic_use(
     query: CallbackQuery,
     topic_storage: TopicHistoryStorage,
@@ -176,9 +232,16 @@ async def on_topic_use(
     if message is None:
         await query.answer()
         return
-    topic_id = (query.data or "").removeprefix("topic:use:")
+    bound_id, topic_id = M._callback_persona(
+        (query.data or "").removeprefix("topic:use:")
+    )
+    if not topic_id:
+        await query.answer("Тема не найдена.", show_alert=True)
+        return
     chat_id = message.chat.id
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    assistant_id = await _bound_assistant_id(
+        query, message, assistant_storage, bound_id
+    )
     if assistant_id is None:
         return
     try:
@@ -204,8 +267,15 @@ async def on_topic_rename(
     if message is None:
         await query.answer()
         return
-    topic_id = (query.data or "").removeprefix("topic:rename:")
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    bound_id, topic_id = M._callback_persona(
+        (query.data or "").removeprefix("topic:rename:")
+    )
+    if not topic_id:
+        await query.answer("Тема не найдена.", show_alert=True)
+        return
+    assistant_id = await _bound_assistant_id(
+        query, message, assistant_storage, bound_id
+    )
     if assistant_id is None:
         return
     try:
@@ -238,7 +308,12 @@ async def on_topic_new(
     if message is None:
         await query.answer()
         return
-    assistant_id = await R._persona_id_for_query(query, message, assistant_storage)
+    assistant_id = await _bound_assistant_id(
+        query,
+        message,
+        assistant_storage,
+        _persona_suffix(query.data or "", "topic:new"),
+    )
     if assistant_id is None:
         return
     await R._drop_flow(state)
@@ -264,12 +339,17 @@ async def sg_new_topic_name(
     chat_id = message.chat.id
     data = await state.get_data()
     assistant_id = data.get("flow_assistant_id")
+    if not isinstance(assistant_id, str) or not assistant_id:
+        await R._reset_flow(state)
+        menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
+        await message.answer("Персона для новой темы не выбрана.", reply_markup=menu)
+        return
     try:
-        if not isinstance(assistant_id, str) or not assistant_id:
-            profile = await R._active_profile(chat_id, assistant_storage)
-            assistant_id = profile.id
         topic_id = await topic_storage.create_topic(chat_id, assistant_id, name)
         await topic_storage.set_active_topic(chat_id, assistant_id, topic_id)
+        stored = _stored_topic_name(
+            await topic_storage.list_topics(chat_id, assistant_id), topic_id, name
+        )
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError:
         await R._reply_profile_error(message)
@@ -280,7 +360,7 @@ async def sg_new_topic_name(
     await R._reset_flow(state)
     logger.info("Новая тема chat_id=%s topic_id=%s", chat_id, topic_id)
     await message.answer(
-        f"✅ Создана новая тема: '{name}'. Контекст обнулен.",
+        f"✅ Создана новая тема: '{stored}'. Контекст обнулен.",
         reply_markup=menu,
     )
 
@@ -291,7 +371,10 @@ async def sg_rename_topic_name(
     topic_storage: TopicHistoryStorage,
     assistant_storage: AssistantStorage,
 ) -> None:
-    """Записывает новое название выбранной темы."""
+    """Записывает новое название выбранной темы.
+
+    Без id темы или персоны шаг сбрасывается.
+    """
     name = (message.text or "").strip()
     if not name or len(name) > 100:
         await message.answer(
@@ -307,11 +390,18 @@ async def sg_rename_topic_name(
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
         await message.answer("Тема для переименования не выбрана.", reply_markup=menu)
         return
+    if not isinstance(assistant_id, str) or not assistant_id:
+        await R._reset_flow(state)
+        menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
+        await message.answer(
+            "Персона для переименования не выбрана.", reply_markup=menu
+        )
+        return
     try:
-        if not isinstance(assistant_id, str) or not assistant_id:
-            profile = await R._active_profile(chat_id, assistant_storage)
-            assistant_id = profile.id
         await topic_storage.rename_topic(chat_id, assistant_id, topic_id, name)
+        stored = _stored_topic_name(
+            await topic_storage.list_topics(chat_id, assistant_id), topic_id, name
+        )
         menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
     except AssistantStorageError:
         await R._reply_profile_error(message)
@@ -322,5 +412,5 @@ async def sg_rename_topic_name(
     await R._reset_flow(state)
     logger.info("Тема переименована chat_id=%s topic_id=%s", chat_id, topic_id)
     await R._apply_reply_menu(message, menu, state)
-    await message.answer(f"Тема переименована в «{name}».")
+    await message.answer(f"Тема переименована в «{stored}».")
     await R._open_topics(message, topic_storage, assistant_storage, state)
