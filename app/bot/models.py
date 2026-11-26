@@ -34,7 +34,21 @@ from app.bot.telegram_text import (
     clip_telegram_text,
     telegram_text_units,
 )
+from app.infra.settings import get_settings
 from app.llm.models_config import resolve_text_model, resolve_tts_model
+
+
+def _history_limit(profile: AssistantProfile) -> int:
+    """Длина истории персоны или ``MAX_HISTORY_LENGTH``, если персона молчит."""
+    custom = getattr(profile, "history_length", None)
+    if custom is not None:
+        return int(custom)
+    raw = str(get_settings().max_history_length).strip() or "20"
+    try:
+        value = int(raw)
+    except ValueError:
+        return 20
+    return value if value >= 1 else 20
 
 
 def _text_model_of(

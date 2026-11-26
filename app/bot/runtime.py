@@ -134,8 +134,12 @@ from app.bot.telegram_text import (
     telegram_text_units,
 )
 from app.infra.cost_tracker import prefer_cost_rub
+from app.infra.metrics import note_input_refused, note_input_trim
+from app.infra.settings import get_settings
+from app.llm.context import content_chars, estimate_tokens
 from app.llm.video_settings import VideoSettingsScope, video_settings_from
 from app.media.media_utils import prepare_audio_file_for_stt
+from app.storage.message_trim import shrink_to_token_limit, trim_messages
 from app.storage.s3_storage import (
     TRANSCRIPT_PREFIX,
     TRANSCRIPT_RETENTION_DAYS,
@@ -199,7 +203,7 @@ async def _prepare_messages(
     ``system``. ``stream_chat`` дописывает tool-сообщения в переданный список,
     поэтому это копия: черновики не попадают в Redis.
     """
-    limit = storage.max_length
+    limit = M._history_limit(profile)
     await storage.append_message(
         chat_id,
         assistant_id,
@@ -214,11 +218,22 @@ async def _prepare_messages(
         # занимает слот trim и расходится с активным ассистентом — убираем.
         await storage.clear_topic(chat_id, assistant_id, topic_id)
         for item in dialog:
-            await storage.append_message(chat_id, assistant_id, topic_id, item, limit)
-    return [
-        {"role": "system", "content": compose_system_prompt(profile.system_prompt)},
-        *dialog,
-    ]
+            await storage.append_message(
+                chat_id, assistant_id, topic_id, item, storage.max_length
+            )
+        stored = await storage.get_history(chat_id, assistant_id, topic_id)
+        dialog = _dialog_for_model(stored)
+    dialog = _history_for_request(dialog, profile)
+    return await _fit_turn_input(
+        [
+            {
+                "role": "system",
+                "content": compose_system_prompt(profile.system_prompt),
+            },
+            *dialog,
+        ],
+        model=profile.text_model,
+    )
 
 
 async def _prepare_messages_with_image(
@@ -231,7 +246,7 @@ async def _prepare_messages_with_image(
     profile: AssistantProfile,
 ) -> list[dict[str, Any]]:
     """Пишет текстовый заменитель в тему, а в модель отдаёт multimodal user."""
-    limit = storage.max_length
+    limit = M._history_limit(profile)
     await storage.append_message(
         chat_id,
         assistant_id,
@@ -244,16 +259,24 @@ async def _prepare_messages_with_image(
     if len(dialog) != len(stored):
         await storage.clear_topic(chat_id, assistant_id, topic_id)
         for item in dialog:
-            await storage.append_message(chat_id, assistant_id, topic_id, item, limit)
+            await storage.append_message(
+                chat_id, assistant_id, topic_id, item, storage.max_length
+            )
+        stored = await storage.get_history(chat_id, assistant_id, topic_id)
+        dialog = _dialog_for_model(stored)
+    dialog = _history_for_request(dialog, profile)
     prior = dialog[:-1] if dialog else []
-    return [
-        {
-            "role": "system",
-            "content": compose_system_prompt(profile.system_prompt),
-        },
-        *prior,
-        {"role": "user", "content": multimodal_content},
-    ]
+    return await _fit_turn_input(
+        [
+            {
+                "role": "system",
+                "content": compose_system_prompt(profile.system_prompt),
+            },
+            *prior,
+            {"role": "user", "content": multimodal_content},
+        ],
+        model=profile.text_model,
+    )
 
 
 def _strip_generation_ids(content: str) -> str:
@@ -286,6 +309,8 @@ def _dialog_for_model(stored: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if item.get("role") == "system":
             continue
         copy = dict(item)
+        # Служебный флаг обрыва не должен уйти провайдеру: незнакомое поле даёт 400.
+        copy.pop("interrupted", None)
         content = copy.get("content")
         if (
             copy.get("role") == "tool"
@@ -500,6 +525,8 @@ async def _remember_model_turn(
     *,
     answer: str,
     images: list[dict[str, Any]],
+    interrupted: bool = False,
+    history_limit: int | None = None,
 ) -> None:
     """Пишет в тему tool-раунд и финальный ответ без сырых картинок.
 
@@ -507,7 +534,7 @@ async def _remember_model_turn(
     в истории был только user, а успех инструмента терялся вместе с копией
     ``stream_chat``.
     """
-    limit = storage.max_length
+    limit = storage.max_length if history_limit is None else history_limit
     to_store: list[dict[str, Any]] = []
     for item in new_messages:
         cleaned = _sanitize_history_message(item)
@@ -530,11 +557,19 @@ async def _remember_model_turn(
     if final_index is not None:
         if final_text:
             to_store[final_index]["content"] = final_text
+            if interrupted:
+                to_store[final_index]["interrupted"] = True
         else:
             # Пустой финал без картинок в историю не пишем.
             to_store.pop(final_index)
     elif final_text:
-        to_store.append({"role": "assistant", "content": final_text})
+        final_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": final_text,
+        }
+        if interrupted:
+            final_message["interrupted"] = True
+        to_store.append(final_message)
 
     if not to_store:
         return
@@ -560,6 +595,77 @@ async def _reply_profile_error(message: Message) -> None:
 
 
 _INTERRUPTED_MARK = "…ответ прерван"
+_INPUT_TOO_LARGE = "Запрос слишком большой. Сократите текст или начните новую тему"
+_LONG_HISTORY_HINT = (
+    "История темы слишком длинная: уменьшите её в настройках персоны "
+    "или начните новую тему"
+)
+_LONG_HISTORY_TOKENS = 20_000
+
+
+def _history_for_request(
+    dialog: list[dict[str, Any]], profile: AssistantProfile
+) -> list[dict[str, Any]]:
+    """Кламп на чтении: пониженный лимит не уезжает в модель ни одним ходом."""
+    settings = get_settings()
+    limit = M._history_limit(profile)
+    before = len(dialog)
+    trimmed = trim_messages(dialog, limit, max_chars=settings.history_max_chars)
+    if len(trimmed) < before:
+        logger.info(
+            "history_trimmed",
+            kept=len(trimmed),
+            dropped=before - len(trimmed),
+        )
+    return trimmed
+
+
+async def _fit_turn_input(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None,
+) -> list[dict[str, Any]]:
+    """Обрезает вход хода и проверяет бюджет. Слишком большой ход не отправляется."""
+    settings = get_settings()
+    before = len(messages)
+    fitted = trim_messages(
+        messages,
+        max(before, 1),
+        max_chars=settings.history_max_chars,
+        protect_tail=1,
+    )
+    fitted = shrink_to_token_limit(
+        fitted,
+        token_limit=settings.turn_input_token_limit,
+        chars_per_token=settings.chars_per_token,
+        protect_tail=1,
+    )
+    tokens = estimate_tokens(fitted, chars_per_token=settings.chars_per_token)
+    if len(fitted) < before:
+        note_input_trim("preflight")
+        logger.info(
+            "input_trimmed",
+            model=model,
+            kept=len(fitted),
+            dropped=before - len(fitted),
+            tokens=tokens,
+        )
+    if tokens > settings.turn_input_token_limit:
+        note_input_refused("too_large")
+        raise AssistAIError(_INPUT_TOO_LARGE, error_code="INPUT_TOO_LARGE")
+    estimated = cost_tracker.estimate_chat_cost(
+        input_chars=max(
+            sum(content_chars(item.get("content")) for item in fitted), 200
+        ),
+        output_chars=500,
+    )
+    try:
+        await cost_tracker.check_budget(estimated=estimated)
+    except BudgetExceededError as exc:
+        if tokens > _LONG_HISTORY_TOKENS and _LONG_HISTORY_HINT not in exc.message:
+            exc.message = f"{exc.message}\n{_LONG_HISTORY_HINT}"
+        raise
+    return fitted
 
 
 def _interrupted_answer(parts: list[str]) -> str:
@@ -580,6 +686,8 @@ def _public_error(exc: BaseException) -> str:
     ):
         return MSG_TIMEOUT
     if isinstance(exc, AssistAIError):
+        if exc.error_code == "INPUT_TOO_LARGE":
+            return exc.message
         return MSG_UNAVAILABLE
     return MSG_INTERNAL
 
@@ -1600,6 +1708,16 @@ async def _process_user_message_locked(
         except TopicStorageError:
             await _reply_history_error(message)
             return
+        except BudgetExceededError as exc:
+            await message.answer(exc.message)
+            return
+        except AssistAIError as exc:
+            if exc.error_code != "INPUT_TOO_LARGE":
+                raise
+            await message.answer(exc.message)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            return
+        history_limit = M._history_limit(profile)
         text_model = M._text_model_of(profile, assistant, chat_id=chat_id)
         logger.info(
             "processing_message",
@@ -1611,6 +1729,7 @@ async def _process_user_message_locked(
         if status is None:
             status = await message.answer("Готовлю ответ…")
         parts: list[str] = []
+        notices: list[str] = []
         tool_names: list[str] = []
         shown = ""
         last_edit = 0.0
@@ -1638,15 +1757,28 @@ async def _process_user_message_locked(
                             )
                             last_edit = asyncio.get_running_loop().time()
                             continue
+                        if delta.kind == "notice":
+                            if delta.text:
+                                notices.append(delta.text)
+                                shown = await _edit_stream(
+                                    status,
+                                    "".join(parts) + "".join(notices),
+                                    shown,
+                                )
+                                last_edit = asyncio.get_running_loop().time()
+                            continue
                         if delta.kind != "content" or not delta.text:
                             continue
                         parts.append(delta.text)
                         now = asyncio.get_running_loop().time()
                         if now - last_edit < STREAM_EDIT_INTERVAL:
                             continue
-                        shown = await _edit_stream(status, "".join(parts), shown)
+                        shown = await _edit_stream(
+                            status, "".join(parts) + "".join(notices), shown
+                        )
                         last_edit = now
             answer = "".join(parts).strip()
+            display = answer + "".join(notices)
             images = scope.images
             outbound = media_scope.bucket.items
             if not answer and not images and not outbound:
@@ -1658,12 +1790,12 @@ async def _process_user_message_locked(
                 await _append_chrome(state, [status.message_id])
                 return
             if answer:
-                visible = await _edit_stream(status, answer, shown)
-                head = clip_telegram_text(answer, TELEGRAM_TEXT_SAFE)
+                visible = await _edit_stream(status, display, shown)
+                head = clip_telegram_text(display, TELEGRAM_TEXT_SAFE)
                 if visible == head:
-                    await _send_overflow(message, answer)
+                    await _send_overflow(message, display)
                 else:
-                    await _send_text(message, answer)
+                    await _send_text(message, display)
             else:
                 await _delete_bot_message(status)
             keep = _release_outgoing(keep)
@@ -1676,6 +1808,7 @@ async def _process_user_message_locked(
                     history_copy[turn_start:],
                     answer=answer,
                     images=images,
+                    history_limit=history_limit,
                 )
             except TopicStorageError:
                 fallback = answer.strip()
@@ -1690,7 +1823,7 @@ async def _process_user_message_locked(
                             profile.id,
                             topic_id,
                             {"role": "assistant", "content": fallback},
-                            topic_storage.max_length,
+                            history_limit,
                         )
                     except TopicStorageError:
                         await _reply_history_error(message)
@@ -1721,6 +1854,7 @@ async def _process_user_message_locked(
                 topic_storage=topic_storage,
                 new_messages=history_copy[turn_start:],
                 images=scope.images,
+                history_limit=history_limit,
             )
             if not kept:
                 keep = _release_outgoing(keep)
@@ -1746,6 +1880,7 @@ async def _process_user_message_locked(
                 topic_storage=topic_storage,
                 new_messages=history_copy[turn_start:],
                 images=scope.images,
+                history_limit=history_limit,
             )
             if not kept:
                 keep = _release_outgoing(keep)
@@ -2169,7 +2304,7 @@ async def _process_s3_upload_session(
                             "content": history_body,
                         },
                     ],
-                    topic_storage.max_length,
+                    M._history_limit(profile),
                 )
         except Exception:
             logger.exception("upload_history_append_failed", chat_id=chat_id)
@@ -2342,6 +2477,16 @@ async def _process_vision_message_locked(
         except TopicStorageError:
             await _reply_history_error(message)
             return
+        except BudgetExceededError as exc:
+            await message.answer(exc.message)
+            return
+        except AssistAIError as exc:
+            if exc.error_code != "INPUT_TOO_LARGE":
+                raise
+            await message.answer(exc.message)
+            await _rollback_user(chat_id, profile.id, topic_storage, topic_id, message)
+            return
+        history_limit = M._history_limit(profile)
         vision_model = M._vision_model_of(profile, assistant, chat_id=chat_id)
         logger.info(
             "Vision, chat_id=%s topic_id=%s, модель=%s, сообщений в запросе=%s",
@@ -2353,6 +2498,7 @@ async def _process_vision_message_locked(
         keep = _KEEP_OUTGOING.set(True)
         status = await message.answer(status_text)
         parts: list[str] = []
+        notices: list[str] = []
         tool_names: list[str] = []
         shown = ""
         last_edit = 0.0
@@ -2379,15 +2525,28 @@ async def _process_vision_message_locked(
                             )
                             last_edit = asyncio.get_running_loop().time()
                             continue
+                        if delta.kind == "notice":
+                            if delta.text:
+                                notices.append(delta.text)
+                                shown = await _edit_stream(
+                                    status,
+                                    "".join(parts) + "".join(notices),
+                                    shown,
+                                )
+                                last_edit = asyncio.get_running_loop().time()
+                            continue
                         if delta.kind != "content" or not delta.text:
                             continue
                         parts.append(delta.text)
                         now = asyncio.get_running_loop().time()
                         if now - last_edit < STREAM_EDIT_INTERVAL:
                             continue
-                        shown = await _edit_stream(status, "".join(parts), shown)
+                        shown = await _edit_stream(
+                            status, "".join(parts) + "".join(notices), shown
+                        )
                         last_edit = now
             answer = "".join(parts).strip()
+            display = answer + "".join(notices)
             images = scope.images
             outbound = media_scope.bucket.items
             if not answer and not images and not outbound:
@@ -2399,12 +2558,12 @@ async def _process_vision_message_locked(
                 await _append_chrome(state, [status.message_id])
                 return
             if answer:
-                visible = await _edit_stream(status, answer, shown)
-                head = clip_telegram_text(answer, TELEGRAM_TEXT_SAFE)
+                visible = await _edit_stream(status, display, shown)
+                head = clip_telegram_text(display, TELEGRAM_TEXT_SAFE)
                 if visible == head:
-                    await _send_overflow(message, answer)
+                    await _send_overflow(message, display)
                 else:
-                    await _send_text(message, answer)
+                    await _send_text(message, display)
             else:
                 await _delete_bot_message(status)
             keep = _release_outgoing(keep)
@@ -2417,6 +2576,7 @@ async def _process_vision_message_locked(
                     history_copy[turn_start:],
                     answer=answer,
                     images=images,
+                    history_limit=history_limit,
                 )
             except TopicStorageError:
                 fallback = answer.strip()
@@ -2431,7 +2591,7 @@ async def _process_vision_message_locked(
                             profile.id,
                             topic_id,
                             {"role": "assistant", "content": fallback},
-                            topic_storage.max_length,
+                            history_limit,
                         )
                     except TopicStorageError:
                         await _reply_history_error(message)
@@ -2462,6 +2622,7 @@ async def _process_vision_message_locked(
                 topic_storage=topic_storage,
                 new_messages=history_copy[turn_start:],
                 images=scope.images,
+                history_limit=history_limit,
             )
             if not kept:
                 keep = _release_outgoing(keep)
@@ -2486,6 +2647,7 @@ async def _process_vision_message_locked(
                 topic_storage=topic_storage,
                 new_messages=history_copy[turn_start:],
                 images=scope.images,
+                history_limit=history_limit,
             )
             if not kept:
                 keep = _release_outgoing(keep)
@@ -2544,12 +2706,14 @@ async def _keep_partial_stream(
     topic_storage: TopicHistoryStorage,
     new_messages: list[dict[str, Any]],
     images: list[dict[str, Any]],
+    history_limit: int | None = None,
 ) -> bool:
     """Пишет усечённый ответ в чат и в тему. False — текста не было, нужен откат."""
-    answer = _interrupted_answer(parts)
-    if not answer:
+    display = _interrupted_answer(parts)
+    if not display:
         return False
-    await _show_interrupted_answer(message, status, answer)
+    clean = "".join(parts).strip()
+    await _show_interrupted_answer(message, status, display)
     try:
         await _remember_model_turn(
             chat_id,
@@ -2557,8 +2721,10 @@ async def _keep_partial_stream(
             topic_id,
             topic_storage,
             new_messages,
-            answer=answer,
+            answer=clean,
             images=images,
+            interrupted=True,
+            history_limit=history_limit,
         )
     except TopicStorageError:
         try:
@@ -2566,8 +2732,12 @@ async def _keep_partial_stream(
                 chat_id,
                 assistant_id,
                 topic_id,
-                {"role": "assistant", "content": answer},
-                topic_storage.max_length,
+                {
+                    "role": "assistant",
+                    "content": clean,
+                    "interrupted": True,
+                },
+                topic_storage.max_length if history_limit is None else history_limit,
             )
         except TopicStorageError:
             await _reply_history_error(message)

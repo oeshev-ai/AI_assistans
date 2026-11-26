@@ -144,7 +144,7 @@ async def test_stream_chat_marks_length_finish(
     assist_client: AssistAIClient,
     respx_mock: MockRouter,
 ) -> None:
-    """Обрезка по max_tokens дописывает одну строку и в чат, и в историю хода."""
+    """Обрезка по max_tokens — пометка только в notice, content хода остаётся чистым."""
     respx_mock.post(CHAT_URL).mock(
         return_value=httpx.Response(
             200,
@@ -156,8 +156,11 @@ async def test_stream_chat_marks_length_finish(
         delta async for delta in assist_client.stream_chat(messages, use_tools=False)
     ]
     text = "".join(delta.text for delta in deltas if delta.kind == "content")
-    assert text == "Фраза обрывает\n…ответ обрезан по лимиту длины"
+    notice = "".join(delta.text for delta in deltas if delta.kind == "notice")
+    assert text == "Фраза обрывает"
+    assert notice == "\n…ответ обрезан по лимиту длины"
     assert messages[-1] == {"role": "assistant", "content": text}
+    assert "обрезан по лимиту" not in messages[-1]["content"]
 
 
 @pytest.mark.asyncio

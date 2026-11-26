@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from app.infra.settings import get_settings
+from app.infra.rate_limiter import effective_limits
 
 
 class _UserImageGate:
@@ -38,7 +38,7 @@ async def image_user_slot(user_id: int | None) -> AsyncIterator[None]:
     if user_id is None:
         yield
         return
-    limit = get_settings().image_max_concurrent_per_user
+    limit = effective_limits(user_id).concurrency
     async with _image_gates_guard:
         gate = _image_gates.get(user_id)
         if gate is None:

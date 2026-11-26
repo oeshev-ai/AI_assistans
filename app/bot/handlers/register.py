@@ -62,8 +62,10 @@ from app.bot.handlers.presets import (
     on_presets_page,
 )
 from app.bot.handlers.settings import (
+    on_history_menu,
     on_menu_settings,
     on_picker_done,
+    on_set_history,
     on_set_image_file,
     on_set_image_menu,
     on_set_image_model,
@@ -216,6 +218,12 @@ def _register_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.callback_query.register(on_voice_menu, F.data == "voice_menu")
     dispatcher.callback_query.register(
         on_set_persona_size, F.data.startswith("set_size:")
+    )
+    dispatcher.callback_query.register(
+        on_history_menu, F.data.startswith("history_menu:")
+    )
+    dispatcher.callback_query.register(
+        on_set_history, F.data.startswith("set_history:")
     )
     dispatcher.callback_query.register(
         on_set_persona_background, F.data.startswith("set_bg:")

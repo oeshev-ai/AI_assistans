@@ -76,6 +76,40 @@ REDIS_EVICTED = Gauge(
     ["role"],
 )
 
+INPUT_TRIM = Counter(
+    "input_trim_total",
+    "History or input shortened before a provider call",
+    ["stage"],
+)
+
+INPUT_REFUSED = Counter(
+    "input_refused_total",
+    "Provider call skipped because the input did not fit",
+    ["reason"],
+)
+
+RATE_LIMIT_DENIED = Counter(
+    "rate_limit_denied_total",
+    "User action denied by a rate limit",
+    ["kind", "tier"],
+)
+
+
+def note_input_trim(stage: str) -> None:
+    """``input_trim_total{stage}``: preflight, round или reactive."""
+    INPUT_TRIM.labels(stage=stage).inc()
+
+
+def note_input_refused(reason: str) -> None:
+    """``input_refused_total{reason}``."""
+    INPUT_REFUSED.labels(reason=reason).inc()
+
+
+def note_rate_limit_denied(kind: str, tier: str) -> None:
+    """``rate_limit_denied_total{kind,tier}``."""
+    RATE_LIMIT_DENIED.labels(kind=kind, tier=tier).inc()
+
+
 ARQ_ENQUEUE_FAILED = Counter(
     "arq_enqueue_failed_total",
     "Queue refused a job before the paid call (full memory, pool error, duplicate id).",

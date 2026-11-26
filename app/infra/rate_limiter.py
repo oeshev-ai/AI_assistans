@@ -69,6 +69,9 @@ else
   end
   tokens = math.min(capacity, tokens + elapsed * rate)
 end
+if tokens > capacity then
+  tokens = capacity
+end
 
 local allow = 0
 local retry_after = 0
@@ -103,6 +106,78 @@ return {allow, retry_after}
 _IMAGE_BUCKET_OPS = frozenset({"image_generate", "image_edit"})
 
 
+class EffectiveLimits:
+    """Лимиты пользователя. Power-тир умножает пять величин."""
+
+    __slots__ = (
+        "capacity",
+        "concurrency",
+        "media_limit",
+        "media_window",
+        "refill_per_min",
+        "text_limit",
+        "text_window",
+        "tier",
+    )
+
+    def __init__(
+        self,
+        *,
+        text_limit: int,
+        text_window: float,
+        media_limit: int,
+        media_window: float,
+        capacity: float,
+        refill_per_min: float,
+        concurrency: int,
+        tier: str,
+    ) -> None:
+        self.text_limit = text_limit
+        self.text_window = text_window
+        self.media_limit = media_limit
+        self.media_window = media_window
+        self.capacity = capacity
+        self.refill_per_min = refill_per_min
+        self.concurrency = concurrency
+        self.tier = tier
+
+
+def _scale_limit(value: float, multiplier: float) -> int:
+    return max(1, int(value * multiplier))
+
+
+def effective_limits(user_id: int) -> EffectiveLimits:
+    """Ёмкость, refill, часовой и текстовый лимиты, concurrency."""
+    from app.infra.settings import get_settings
+
+    settings = get_settings()
+    text_limit = settings.text_rate_limit
+    text_window = float(settings.text_rate_window_sec)
+    media_limit = settings.media_hourly_limit
+    capacity = float(settings.image_bucket_capacity)
+    refill = float(settings.image_bucket_refill_per_min)
+    concurrency = settings.image_max_concurrent_per_user
+    tier = "default"
+    if user_id in settings.power_user_ids:
+        multiplier = settings.power_limits_multiplier
+        text_limit = _scale_limit(text_limit, multiplier)
+        media_limit = _scale_limit(media_limit, multiplier)
+        capacity = float(_scale_limit(capacity, multiplier))
+        refill = float(_scale_limit(refill, multiplier))
+        concurrency = _scale_limit(concurrency, multiplier)
+        tier = "power"
+    return EffectiveLimits(
+        text_limit=text_limit,
+        text_window=text_window,
+        media_limit=media_limit,
+        media_window=MEDIA_WINDOW_SECONDS,
+        capacity=capacity,
+        refill_per_min=refill,
+        concurrency=concurrency,
+        tier=tier,
+    )
+
+
 class RateLimiter:
     """Sliding window for text and media. Images use a token bucket.
 
@@ -130,19 +205,24 @@ class RateLimiter:
 
     async def check_text_limit(self, user_id: int) -> bool:
         """Return True and consume a slot if under the text/LLM limit."""
-        return await self._allow(
+        limits = effective_limits(user_id)
+        allowed = await self._allow(
             user_id,
             operation="text",
-            limit=TEXT_LIMIT,
-            window=TEXT_WINDOW_SECONDS,
+            limit=limits.text_limit,
+            window=limits.text_window,
         )
+        if not allowed:
+            self._note_denied("text", limits.tier)
+        return allowed
 
     async def consume_image_bucket(self, user_id: int, operation: str) -> bool:
         """Забирает один токен ``image_generate`` или ``image_edit``.
 
         В production сбой Redis — отказ, без перехода на память процесса.
         """
-        capacity, refill, _ttl = self._bucket_params()
+        limits = effective_limits(user_id)
+        capacity, refill = limits.capacity, limits.refill_per_min
         now = time.time()
         if self._redis is not None:
             try:
@@ -154,6 +234,8 @@ class RateLimiter:
                     now=now,
                     consume=True,
                 )
+                if not allowed:
+                    self._note_denied(operation, limits.tier)
                 return allowed
             except Exception as exc:
                 from app.infra.access import is_production
@@ -165,6 +247,7 @@ class RateLimiter:
                         operation=operation,
                         user_id=user_id,
                     )
+                    self._note_denied(operation, limits.tier)
                     return False
                 logger.warning(
                     "rate_limiter_redis_failed_fallback_memory",
@@ -180,16 +263,22 @@ class RateLimiter:
             now=now,
             consume=True,
         )
+        if not allowed:
+            self._note_denied(operation, limits.tier)
         return allowed
 
     async def check_media_limit(self, user_id: int) -> bool:
         """Return True and consume a slot if under the STT/TTS/video limit."""
-        return await self._allow(
+        limits = effective_limits(user_id)
+        allowed = await self._allow(
             user_id,
             operation="media",
-            limit=MEDIA_LIMIT,
-            window=MEDIA_WINDOW_SECONDS,
+            limit=limits.media_limit,
+            window=limits.media_window,
         )
+        if not allowed:
+            self._note_denied("media", limits.tier)
+        return allowed
 
     async def check_upload_limit(self, identity: str, *, write: bool) -> bool:
         """Скользящее окно на IP HTTP-загрузки. ``write`` — POST файла или presign."""
@@ -232,10 +321,11 @@ class RateLimiter:
         """Seconds until the oldest hit leaves the window (0 if capacity free)."""
         if operation in _IMAGE_BUCKET_OPS:
             return await self._image_bucket_retry_after(user_id, operation)
+        limits = effective_limits(user_id)
         if operation == "text":
-            window, limit = TEXT_WINDOW_SECONDS, TEXT_LIMIT
+            window, limit = limits.text_window, limits.text_limit
         elif operation == "media":
-            window, limit = MEDIA_WINDOW_SECONDS, MEDIA_LIMIT
+            window, limit = limits.media_window, limits.media_limit
         else:
             raise ValueError(f"unknown rate limit operation {operation}")
         now = time.time()
@@ -264,7 +354,8 @@ class RateLimiter:
             return max(0.0, hits[0] + window - now)
 
     async def _image_bucket_retry_after(self, user_id: int, operation: str) -> float:
-        capacity, refill, _ttl = self._bucket_params()
+        limits = effective_limits(user_id)
+        capacity, refill = limits.capacity, limits.refill_per_min
         now = time.time()
         if self._redis is not None:
             try:
@@ -313,7 +404,7 @@ class RateLimiter:
         redis = self._redis
         if redis is None:
             raise RuntimeError("Redis лимитера не подключён")
-        _capacity, _refill, ttl = self._bucket_params()
+        ttl = self._bucket_ttl(capacity, refill_per_min)
         raw = await redis.eval(
             _BUCKET_LUA,
             1,
@@ -349,6 +440,7 @@ class RateLimiter:
                 tokens, ts = stored
                 elapsed = max(0.0, now - ts)
                 tokens = min(capacity, tokens + elapsed * rate)
+            tokens = min(tokens, capacity)
             allowed = tokens >= 1.0
             retry = 0.0
             if consume and allowed:
@@ -360,15 +452,17 @@ class RateLimiter:
             return allowed, retry
 
     @staticmethod
-    def _bucket_params() -> tuple[float, float, int]:
-        from app.infra.settings import get_settings
+    def _bucket_ttl(capacity: float, refill_per_min: float) -> int:
+        rate = refill_per_min / 60.0
+        if rate <= 0:
+            return 3600
+        return math.ceil(capacity / rate) + 3600
 
-        settings = get_settings()
-        capacity = float(settings.image_bucket_capacity)
-        refill = float(settings.image_bucket_refill_per_min)
-        rate = refill / 60.0
-        ttl = math.ceil(capacity / rate) + 3600 if rate > 0 else 3600
-        return capacity, refill, ttl
+    @staticmethod
+    def _note_denied(kind: str, tier: str) -> None:
+        from app.infra.metrics import note_rate_limit_denied
+
+        note_rate_limit_denied(kind, tier)
 
     @staticmethod
     def _bucket_retry(deficit: float, refill_per_min: float) -> float:
