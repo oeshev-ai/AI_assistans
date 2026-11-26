@@ -329,6 +329,11 @@ async def _start_background(
 
     upload_store = UploadSessionStore(shared_redis)
     s3_storage = get_storage()
+    if s3_storage is not None:
+        try:
+            await s3_storage.ensure_transcript_lifecycle()
+        except Exception:
+            logger.exception("transcript_lifecycle_failed")
     from app.bot.file_retry import bind_file_delivery, file_delivery_loop
     from app.storage.file_delivery import open_file_delivery_store
 

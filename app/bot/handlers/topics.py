@@ -149,7 +149,11 @@ async def on_topic_delete_yes(
     assistant_storage: AssistantStorage,
     state: FSMContext,
 ) -> None:
-    """Удаляет тему и историю, затем обновляет тот же список тем."""
+    """Удаляет тему и обновляет тот же список.
+
+    Нижнее меню переставляется только у активной персоны. Тема другой
+    персоны подпись кнопок не меняет.
+    """
     message = query.message
     if not isinstance(message, Message):
         await query.answer()
@@ -177,7 +181,8 @@ async def on_topic_delete_yes(
     await query.answer("Тема удалена")
     await R._edit_inline(message, text, markup)
     await state.update_data({_SCREEN_TOPICS: message.message_id})
-    await R._apply_reply_menu(message, menu, state)
+    if menu is not None:
+        await R._apply_reply_menu(message, menu, state)
 
 
 async def on_topic_list(

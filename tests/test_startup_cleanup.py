@@ -110,7 +110,14 @@ async def test_health_server_failure_closes_started_clients(
         "create_pending_media_storage",
         lambda url: _make(_Closable, "pending", url),
     )
-    monkeypatch.setattr(main, "get_storage", lambda: None)
+    lifecycle = {"calls": 0}
+
+    class _Storage:
+        async def ensure_transcript_lifecycle(self) -> None:
+            lifecycle["calls"] += 1
+            raise RuntimeError("lifecycle denied")
+
+    monkeypatch.setattr(main, "get_storage", lambda: _Storage())
     monkeypatch.setattr(main, "start_metrics_server", lambda **_k: None)
     monkeypatch.setattr(main, "start_health_server", _health)
     monkeypatch.setattr(
@@ -154,3 +161,4 @@ async def test_health_server_failure_closes_started_clients(
     assert image_task.cancelled() or image_task.done()
     assert video_task.cancelled() or video_task.done()
     assert file_task.cancelled() or file_task.done()
+    assert lifecycle["calls"] == 1

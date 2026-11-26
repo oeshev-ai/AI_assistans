@@ -224,31 +224,36 @@ async def on_preset_apply(
         return
     text, _markup = screens._preset_preview_parts(preset, assistant)
     await R._edit_inline(message, text, _preset_pending_markup(preset.id))
+    # update_data читает и пишет state отдельно. Лок чата не пускает второй
+    # callback в claim, пока первый не сохранил персону и метку preset_apply:
+    # _reset_flow стирает flow_id, и без метки ожидание снова создало бы персону.
     try:
-        profiles = await assistant_storage.list_assistants(chat_id)
-        profile = await _claim_preset_profile(
-            state, preset, profiles, message.message_id
-        )
-        if profile is None:
-            await query.answer("Персона создана")
-            return
-        await assistant_storage.save_assistant(chat_id, profile)
-        await assistant_storage.set_active_assistant(chat_id, profile.id)
-        menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
+        async with R._chat_turn(chat_id):
+            profiles = await assistant_storage.list_assistants(chat_id)
+            profile = await _claim_preset_profile(
+                state, preset, profiles, message.message_id
+            )
+            if profile is not None:
+                await assistant_storage.save_assistant(chat_id, profile)
+                await assistant_storage.set_active_assistant(chat_id, profile.id)
+                menu = await R._menu_for(chat_id, assistant_storage, topic_storage)
+                await R._reset_flow(state)
+                await state.update_data(
+                    preset_apply={
+                        "message_id": message.message_id,
+                        "preset_id": preset.id,
+                        "assistant_id": profile.id,
+                    }
+                )
     except AssistantStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
     except TopicStorageError as exc:
         await query.answer(exc.message, show_alert=True)
         return
-    await R._reset_flow(state)
-    await state.update_data(
-        preset_apply={
-            "message_id": message.message_id,
-            "preset_id": preset.id,
-            "assistant_id": profile.id,
-        }
-    )
+    if profile is None:
+        await query.answer("Персона создана")
+        return
     await query.answer("Персона создана")
     await R._close_screen(message, state, _SCREEN_PRESETS)
     await R._apply_reply_menu(message, menu, state)
