@@ -140,8 +140,9 @@ async def test_partial_stream_stores_closed_prefix_and_text() -> None:
         topic_id,
         storage,
         new_messages,
-        answer="Начал и оборвался\n…ответ прерван",
+        answer="Начал и оборвался",
         images=[],
+        interrupted=True,
     )
 
     history = await storage.get_history(1, AID, topic_id)
@@ -154,7 +155,8 @@ async def test_partial_stream_stores_closed_prefix_and_text() -> None:
     assert history[1]["tool_calls"][0]["id"] == "done"
     assert "reasoning_content" not in history[1]
     assert "tool_calls" not in history[3]
-    assert history[3]["content"] == "Начал и оборвался\n…ответ прерван"
+    assert history[3]["content"] == "Начал и оборвался"
+    assert history[3]["interrupted"] is True
     await storage.close()
 
 

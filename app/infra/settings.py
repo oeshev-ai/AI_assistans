@@ -110,6 +110,22 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _int_at_least(name: str, default: int, minimum: int) -> int:
+    """Целое не меньше ``minimum``. Пусто — дефолт. Опечатка — ``ValueError``."""
+    value = _positive_int(name, default)
+    if value < minimum:
+        raise ValueError(f"{name}={value} должен быть не меньше {minimum}")
+    return value
+
+
+def _float_in(name: str, default: float, low: float, high: float) -> float:
+    """Число в отрезке ``[low, high]``. Пусто — дефолт."""
+    value = _positive_float(name, default)
+    if value < low or value > high:
+        raise ValueError(f"{name}={value} должен быть от {low} до {high}")
+    return value
+
+
 def _positive_float(name: str, default: float) -> float:
     raw = _stripped(name)
     if not raw:
@@ -455,6 +471,63 @@ class Settings:
     def image_max_concurrent_per_user(self) -> int:
         """Сколько генераций и правок одного пользователя идут одновременно."""
         return _positive_int("IMAGE_MAX_CONCURRENT_PER_USER", 3)
+
+    @property
+    def text_rate_limit(self) -> int:
+        """Сколько текстовых ходов за ``text_rate_window_sec``."""
+        return _int_at_least("TEXT_RATE_LIMIT", 10, 1)
+
+    @property
+    def text_rate_window_sec(self) -> int:
+        return _int_at_least("TEXT_RATE_WINDOW_SEC", 60, 1)
+
+    @property
+    def media_hourly_limit(self) -> int:
+        """STT, TTS и видео за час."""
+        return _int_at_least("MEDIA_HOURLY_LIMIT", 10, 1)
+
+    @property
+    def power_limits_multiplier(self) -> float:
+        """Множитель лимитов для ``POWER_USER_IDS``. 1.0 — как у остальных."""
+        return _float_in("POWER_LIMITS_MULTIPLIER", 1.0, 1.0, 20.0)
+
+    @property
+    def power_user_ids(self) -> frozenset[int]:
+        """Свои пользователи. Пусто — никого. Чужой id вне allowlist роняет старт."""
+        raw = _stripped("POWER_USER_IDS")
+        if not raw:
+            return frozenset()
+        from app.infra.access import parse_allowed_user_ids
+
+        parsed = parse_allowed_user_ids(raw)
+        allowed = parse_allowed_user_ids(self.telegram_allowed_user_ids)
+        extra = parsed - allowed
+        if extra:
+            logger.error("power_user_ids_outside_allowlist", ids=sorted(extra))
+            raise SystemExit(1)
+        return parsed
+
+    @property
+    def history_max_chars(self) -> int:
+        """Потолок символов истории после обрезки по числу сообщений."""
+        return _int_at_least("HISTORY_MAX_CHARS", 200_000, 2000)
+
+    @property
+    def turn_input_token_limit(self) -> int:
+        """Оценка входа одного хода. Выше — история дорезается или ход отклоняется."""
+        return _int_at_least("TURN_INPUT_TOKEN_LIMIT", 64_000, 1000)
+
+    @property
+    def chars_per_token(self) -> float:
+        value = _positive_float("CHARS_PER_TOKEN", 2.5)
+        if value > 6:
+            raise ValueError(f"CHARS_PER_TOKEN={value} должен быть не больше 6")
+        return value
+
+    @property
+    def image_token_estimate(self) -> int:
+        """Фиксированная оценка одной картинки. Длина base64 не считается."""
+        return _int_at_least("IMAGE_TOKEN_ESTIMATE", 1_200, 100)
 
     @property
     def text_legacy_aliases(self) -> bool:

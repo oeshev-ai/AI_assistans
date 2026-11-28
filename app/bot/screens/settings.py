@@ -121,11 +121,75 @@ def _video_picker_parts(
     return M._fit_screen(text), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+_HISTORY_CHOICES: tuple[int, ...] = (10, 20, 40, 80, 120)
+_HISTORY_TOKENS_PER_MESSAGE = 300
+
+
+def _history_cost_line(length: int) -> str:
+    tokens = length * _HISTORY_TOKENS_PER_MESSAGE
+    if tokens >= 1000 and tokens % 1000 == 0:
+        shown = f"{tokens // 1000}K"
+    else:
+        shown = str(tokens)
+    return f"История: {length} сообщений ≈ {shown} токенов на ход"
+
+
+def _history_picker_parts(
+    profile: AssistantProfile,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Длина истории этой персоны. Понижение обрезает старые сообщения."""
+    current = profile.history_length
+    rows: list[list[InlineKeyboardButton]] = []
+    choice_row: list[InlineKeyboardButton] = []
+    for value in _HISTORY_CHOICES:
+        mark = "✅ " if current == value else ""
+        choice_row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{value}",
+                callback_data=f"set_history:{profile.id}:{value}",
+            )
+        )
+    rows.append(choice_row)
+    default_mark = "✅ " if current is None else ""
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"{default_mark}По умолчанию",
+                callback_data=f"set_history:{profile.id}:default",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Готово",
+                callback_data=f"picker:done:{profile.id}",
+                style="success",
+            )
+        ]
+    )
+    shown = M._history_limit(profile)
+    if current is None:
+        headline = f"Сейчас: по умолчанию ({shown})"
+    else:
+        headline = f"Сейчас: {shown} сообщений"
+    text = (
+        f"История — «{profile.name}»\n"
+        f"{headline}\n"
+        f"{_history_cost_line(shown)}\n\n"
+        "Понижение обрезает старые сообщения безвозвратно. "
+        "Повышение не возвращает уже обрезанное."
+    )
+    return M._fit_screen(text), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _model_picker_parts(
     profile: AssistantProfile, assistant: AssistAIClient, kind: str
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Текст и кнопки выбора модели. В callback — id этой персоны, не активной."""
     rows: list[list[InlineKeyboardButton]] = []
+    if kind == "chat":
+        return _history_picker_parts(profile)
     if kind == "video":
         return _video_picker_parts(profile)
     if kind == "image":
@@ -375,6 +439,11 @@ def _settings_persona_view(
         "Получать результат файлом: "
         f"{M._image_file_label(M._image_as_file(profile, image_model))}"
     )
+    history = M._history_limit(profile)
+    if profile.history_length is None:
+        lines.append(f"История: по умолчанию ({history})")
+    else:
+        lines.append(f"История: {history} сообщений")
     lines.extend(
         [
             f"Видео: {video_settings_summary(video_settings_from(profile))}",
@@ -398,6 +467,12 @@ def _settings_persona_view(
             InlineKeyboardButton(
                 text="Промпт",
                 callback_data=f"asst_edit:{profile.id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="История",
+                callback_data=f"history_menu:{profile.id}",
             )
         ],
         [

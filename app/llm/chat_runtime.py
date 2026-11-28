@@ -16,9 +16,18 @@ from app.infra.cost_tracker import (
     cost_tracker,
     isolated_budget_reservation,
 )
-from app.infra.metrics import note_provider_fallback
+from app.infra.metrics import (
+    note_input_refused,
+    note_input_trim,
+    note_provider_fallback,
+)
+from app.llm.context import content_chars
 from app.llm.errors import AssistAIError, fallback_reason
-from app.llm.models_config import resolve_polza_text_model, resolve_text_model
+from app.llm.models_config import (
+    clamp_max_tokens,
+    resolve_polza_text_model,
+    resolve_text_model,
+)
 from app.llm.providers import ProviderConfig
 from app.llm.tooling import ToolRegistry
 from app.llm.transport import _CHAT_PATH, ProviderTransportMixin
@@ -108,6 +117,7 @@ def _apply_generation_options(
     temperature: float | None,
     max_tokens: int | None,
     reasoning: dict[str, Any] | None = None,
+    catalog_model: str | None = None,
 ) -> None:
     """Добавляет необязательные поля генерации, не трогая tools."""
     if response_format is not None:
@@ -115,9 +125,31 @@ def _apply_generation_options(
     if temperature is not None:
         payload["temperature"] = temperature
     if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+        model_id = catalog_model if catalog_model is not None else payload.get("model")
+        payload["max_tokens"] = clamp_max_tokens(
+            model_id if isinstance(model_id, str) else None,
+            max_tokens,
+        )
     if reasoning is not None:
         payload["reasoning"] = reasoning
+
+
+_INPUT_TOO_LARGE = "Запрос слишком большой. Сократите текст или начните новую тему"
+_CONTEXT_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "too many tokens",
+    "context window",
+    "input too long",
+)
+
+
+def _needs_input_retry(exc: AssistAIError) -> bool:
+    """400 из-за длины входа: один повтор с урезанной историей, без fallback."""
+    if exc.status_code not in (400, None):
+        return False
+    text = (exc.message or "").casefold()
+    return any(marker in text for marker in _CONTEXT_MARKERS)
 
 
 def _needs_max_completion_tokens_retry(exc: AssistAIError) -> bool:
@@ -277,7 +309,7 @@ class _ToolCallBuilder:
         return slot
 
 
-ChatDeltaKind = Literal["content", "tool"]
+ChatDeltaKind = Literal["content", "tool", "notice"]
 
 
 @dataclass(frozen=True)
@@ -286,6 +318,8 @@ class ChatDelta:
 
     ``content`` — кусок итогового текста.
     ``tool`` — инструмент сейчас вызывается; в ``text`` имя и аргументы.
+    ``notice`` — служебная пометка только для чата. В ``messages`` и в историю
+    не пишется, иначе модель увидит её как часть своего ответа.
     Чат успевает показать статус, пока вызов ещё идёт.
     Рассуждения модели в чат не отдаются.
     """
@@ -443,8 +477,10 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         catalog_model = self._catalog_chat_model(model)
         tools = self.get_tools_schema()
         active_provider: ProviderConfig | None = None
+        input_anchor = self._input_anchor(messages)
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
+            input_retried = False
             if iteration > 1:
                 await self._ensure_round_budget(messages)
             selected_model = self._provider_chat_model(
@@ -458,12 +494,21 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 _attach_chat_tools(payload, tools, selected_model)
                 if tool_choice is not None:
                     payload["tool_choice"] = tool_choice
+            if iteration > 1:
+                payload["messages"] = self._messages_for_provider(
+                    messages,
+                    protect_tail=self._turn_protect_tail(messages, input_anchor),
+                    token_limit=None,
+                    stage="round",
+                    model=catalog_model,
+                )
             _apply_generation_options(
                 payload,
                 response_format=response_format,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 reasoning=reasoning,
+                catalog_model=catalog_model,
             )
 
             logger.info(
@@ -480,7 +525,24 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                     stick_to=active_provider,
                 )
             except AssistAIError as exc:
-                if "max_tokens" in payload and _needs_max_completion_tokens_retry(exc):
+                if not input_retried and _needs_input_retry(exc):
+                    input_retried = True
+                    payload["messages"] = self._messages_for_provider(
+                        messages,
+                        protect_tail=self._turn_protect_tail(messages, input_anchor),
+                        token_limit=self._half_input_budget(),
+                        stage="reactive",
+                        model=catalog_model,
+                    )
+                    logger.info("chat_input_retry", model=catalog_model)
+                    data, active_provider = await self._chat_post_with_fallback(
+                        payload,
+                        catalog_model=catalog_model,
+                        stick_to=active_provider,
+                    )
+                elif "max_tokens" in payload and _needs_max_completion_tokens_retry(
+                    exc
+                ):
                     swapped = _swap_max_tokens_to_completion(payload)
                     logger.info(
                         "chat_max_tokens_remapped",
@@ -598,8 +660,10 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         catalog_model = self._catalog_chat_model(model)
         tools = self.get_tools_schema()
         active_provider: ProviderConfig | None = None
+        input_anchor = self._input_anchor(messages)
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
+            input_retried = False
             if iteration > 1:
                 await self._ensure_round_budget(messages)
             selected_model = self._provider_chat_model(
@@ -617,11 +681,20 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                 _attach_chat_tools(payload, tools, selected_model)
                 if tool_choice is not None:
                     payload["tool_choice"] = tool_choice
+            if iteration > 1:
+                payload["messages"] = self._messages_for_provider(
+                    messages,
+                    protect_tail=self._turn_protect_tail(messages, input_anchor),
+                    token_limit=None,
+                    stage="round",
+                    model=catalog_model,
+                )
             _apply_generation_options(
                 payload,
                 response_format=response_format,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                catalog_model=catalog_model,
             )
 
             logger.info(
@@ -694,7 +767,27 @@ class ChatRuntimeMixin(ProviderTransportMixin):
                         allow_remap_max_tokens=not remapped_max_tokens,
                     )
                     if adapted is None:
-                        raise
+                        if saw_chunk or input_retried or not _needs_input_retry(exc):
+                            raise
+                        input_retried = True
+                        payload["messages"] = self._messages_for_provider(
+                            messages,
+                            protect_tail=self._turn_protect_tail(
+                                messages, input_anchor
+                            ),
+                            token_limit=self._half_input_budget(),
+                            stage="reactive",
+                            model=catalog_model,
+                        )
+                        logger.info("chat_input_retry", model=catalog_model)
+                        reasoning_parts.clear()
+                        content_parts.clear()
+                        tool_builder = _ToolCallBuilder()
+                        finish_reason = ""
+                        last_usage = None
+                        billed_model = None
+                        saw_chunk = False
+                        continue
                     dropped_now, remapped_now = adapted
                     if dropped_now:
                         dropped_stream_options = True
@@ -789,9 +882,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             if finish_reason == "length":
                 suffix = _length_mark_suffix(content_text)
                 if suffix:
-                    content_text += suffix
-                    messages[-1]["content"] = content_text
-                    yield ChatDelta("content", suffix)
+                    yield ChatDelta("notice", suffix)
             logger.info(
                 "stream_chat: финальный ответ, finish_reason=%s, символов=%s",
                 finish_reason,
@@ -803,6 +894,68 @@ class ChatRuntimeMixin(ProviderTransportMixin):
             f"Превышен лимит вызовов инструментов: {self.config.max_tool_iterations}"
         )
 
+    @staticmethod
+    def _input_anchor(messages: list[dict[str, Any]]) -> int:
+        """Индекс текущего user: всё после него — этот ход, его не режем."""
+        if messages and messages[-1].get("role") == "user":
+            return len(messages) - 1
+        return len(messages)
+
+    @staticmethod
+    def _turn_protect_tail(messages: list[dict[str, Any]], anchor: int) -> int:
+        return max(0, len(messages) - anchor)
+
+    @staticmethod
+    def _half_input_budget() -> int:
+        from app.infra.settings import get_settings
+
+        return max(1, get_settings().turn_input_token_limit // 2)
+
+    def _messages_for_provider(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protect_tail: int,
+        token_limit: int | None,
+        stage: str,
+        model: str,
+    ) -> list[dict[str, Any]]:
+        """Копия входа для провайдера. Общий список хода не сдвигается."""
+        from app.infra.settings import get_settings
+        from app.llm.context import estimate_tokens
+        from app.storage.message_trim import shrink_to_token_limit, trim_messages
+
+        settings = get_settings()
+        limit = settings.turn_input_token_limit if token_limit is None else token_limit
+        before = len(messages)
+        fitted = trim_messages(
+            messages,
+            max(before, 1),
+            max_chars=settings.history_max_chars,
+            protect_tail=protect_tail,
+        )
+        fitted = shrink_to_token_limit(
+            fitted,
+            token_limit=limit,
+            chars_per_token=settings.chars_per_token,
+            protect_tail=protect_tail,
+        )
+        tokens = estimate_tokens(fitted, chars_per_token=settings.chars_per_token)
+        if tokens > limit:
+            note_input_refused("too_large")
+            raise AssistAIError(_INPUT_TOO_LARGE, error_code="INPUT_TOO_LARGE")
+        dropped = before - len(fitted)
+        if dropped > 0:
+            note_input_trim(stage)
+            logger.info(
+                "input_trimmed",
+                model=model,
+                kept=len(fitted),
+                dropped=dropped,
+                tokens=tokens,
+            )
+        return fitted
+
     async def _ensure_round_budget(self, messages: list[dict[str, Any]]) -> None:
         """Reserve headroom for the next tool-loop round after the hold is burned.
 
@@ -810,7 +963,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         ``min(reserved, actual)``. Later rounds may need a fresh hold so the
         daily cap is checked again before another paid LLM call.
         """
-        input_chars = sum(len(_as_text(m.get("content"))) for m in messages)
+        input_chars = sum(content_chars(m.get("content")) for m in messages)
         estimated = cost_tracker.estimate_chat_cost(
             input_chars=max(input_chars, 200), output_chars=400
         )
@@ -906,7 +1059,7 @@ class ChatRuntimeMixin(ProviderTransportMixin):
         provider: ProviderConfig | None = None,
     ) -> None:
         """Estimate stream_chat spend when usage chunks are unavailable."""
-        input_chars = sum(len(_as_text(m.get("content"))) for m in messages[:-1])
+        input_chars = sum(content_chars(m.get("content")) for m in messages[:-1])
         amount, source, rub = chat_cost_usd(
             usage=None,
             provider=provider,

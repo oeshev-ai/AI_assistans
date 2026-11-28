@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict, Field
+
 AVAILABLE_TEXT_MODELS: tuple[str, ...] = (
     "deepseek/deepseek-v4.1-flash-1017",
     "google/gemini-3.8-flash",
@@ -150,6 +152,70 @@ def model_hint(model_id: str | None) -> str:
     return MODEL_HINTS.get(model_id, "")
 
 
+class ModelLimits(BaseModel):
+    """Окно и потолок вывода для ``/chat/completions``.
+
+    Ключ таблицы — каталожный id, не провайдерский. Interactions API не используется.
+    Позиционные аргументы: ``ModelLimits(context_window, max_output)``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    context_window: int = Field(ge=1024)
+    max_output: int = Field(ge=256)
+    chars_per_token: float = Field(default=2.5, gt=0, le=6)
+
+    def __init__(
+        self,
+        context_window: int,
+        max_output: int,
+        chars_per_token: float = 2.5,
+    ) -> None:
+        super().__init__(
+            context_window=context_window,
+            max_output=max_output,
+            chars_per_token=chars_per_token,
+        )
+
+
+# Лимиты для /chat/completions. Interactions API (длинное декодирование
+# Gemini 4) не используется: у ProxyAPI его нет, у Polza он вне нашего маршрута.
+MODEL_LIMITS: dict[str, ModelLimits] = {
+    "deepseek/deepseek-v4.1-flash-1017": ModelLimits(1_000_000, 384_000),
+    "google/gemini-3.8-flash": ModelLimits(1_000_000, 66_000),
+    "google/gemini-4-argon": ModelLimits(1_000_000, 66_000),
+    "anthropic/claude-sonnet-5-5": ModelLimits(1_000_000, 128_000),
+    "openai/gpt-6-luna": ModelLimits(1_000_000, 128_000),
+    "openai/gpt-6.1-terra": ModelLimits(1_000_000, 128_000),
+    "openai/gpt-6-sol": ModelLimits(1_000_000, 128_000),
+    "qwen/qwen4-max": ModelLimits(1_000_000, 131_000),
+}
+DEFAULT_LIMITS = ModelLimits(context_window=128_000, max_output=8_192)
+
+
+def limits_for(model_id: str | None) -> ModelLimits:
+    """Лимиты каталожного id. Неизвестная модель — ``DEFAULT_LIMITS``."""
+    if model_id and model_id in MODEL_LIMITS:
+        return MODEL_LIMITS[model_id]
+    resolved = resolve_text_model(model_id)
+    if resolved and resolved in MODEL_LIMITS:
+        return MODEL_LIMITS[resolved]
+    return DEFAULT_LIMITS
+
+
+def clamp_max_tokens(model_id: str | None, requested: int) -> int:
+    """Не просит у провайдера больше, чем модель умеет отдать."""
+    return min(requested, limits_for(model_id).max_output)
+
+
+def validate_model_limits(limits: dict[str, ModelLimits] | None = None) -> None:
+    """Нет записи для id из ``AVAILABLE_TEXT_MODELS`` — ``RuntimeError``."""
+    table = MODEL_LIMITS if limits is None else limits
+    missing = [model_id for model_id in AVAILABLE_TEXT_MODELS if model_id not in table]
+    if missing:
+        raise RuntimeError("MODEL_LIMITS: нет записи для " + ", ".join(missing))
+
+
 def validate_hints() -> None:
     """Проверяет, что у каждой text/image-модели есть подсказка 1..60 символов.
 
@@ -171,3 +237,4 @@ def validate_hints() -> None:
 
 
 validate_hints()
+validate_model_limits()

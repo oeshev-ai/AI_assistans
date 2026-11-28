@@ -30,6 +30,7 @@ NO_FALLBACK_CODES = frozenset(
         "PAYLOAD_TOO_LARGE",
         "API_KEY_REVOKED",
         "UNOFFICIAL_PROVIDERS_DISABLED",
+        "INPUT_TOO_LARGE",
     }
 )
 NO_FALLBACK_STATUSES = frozenset({400, 401, 403, 404, 413})

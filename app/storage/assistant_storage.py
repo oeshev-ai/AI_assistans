@@ -144,6 +144,7 @@ class AssistantProfile(BaseModel):
     tts_role: str | None = None
     tts_format: str | None = None
     stt_language: str | None = None
+    history_length: int | None = Field(default=None, ge=4, le=200)
 
     @field_validator("image_background", mode="before")
     @classmethod

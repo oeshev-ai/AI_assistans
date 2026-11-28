@@ -21,6 +21,7 @@ def test_welcome_and_help_are_different_texts() -> None:
     assert "5/час" not in HELP_TEXT
     assert "до 15 за раз" in HELP_TEXT
     assert "одновременно до 3" in HELP_TEXT
+    assert "напишите „продолжи“" in HELP_TEXT
 
 
 def test_help_command_is_not_wired_to_start() -> None:

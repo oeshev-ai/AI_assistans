@@ -8,6 +8,7 @@ import app.bot.screens as screens
 from app.bot import models as M
 from app.bot import runtime as R
 from app.bot.constants import (
+    _SCREEN_PICKER,
     _SCREEN_PRESETS,
     _SCREEN_SETTINGS,
     _VOICE_MODE_LABELS,
@@ -250,6 +251,67 @@ async def on_set_persona_size(
         return
     await query.answer("Размер обновлён")
     text, markup = screens._model_picker_parts(updated, assistant, "image")
+    await R._edit_or_answer(query, text, markup)
+
+
+async def on_history_menu(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+    state: FSMContext,
+) -> None:
+    """Открывает длину истории персоны с кнопки, не активной."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    raw = (query.data or "").removeprefix("history_menu:")
+    assistant_id = raw or None
+    profile = await R._profile_for_ui(query, message, assistant_storage, assistant_id)
+    if profile is None:
+        return
+    await state.update_data({_SCREEN_SETTINGS: message.message_id})
+    text, markup = screens._model_picker_parts(profile, assistant, "chat")
+    await query.answer()
+    sent = await message.answer(text, reply_markup=markup)
+    await state.update_data({_SCREEN_PICKER: sent.message_id})
+
+
+async def on_set_history(
+    query: CallbackQuery,
+    assistant: AssistAIClient,
+    assistant_storage: AssistantStorage,
+) -> None:
+    """Записывает длину истории персоны с кнопки."""
+    message = R._query_message(query)
+    if message is None:
+        await query.answer()
+        return
+    assistant_id, raw_value = M._callback_persona(
+        (query.data or "").removeprefix("set_history:")
+    )
+    profile = await R._profile_for_ui(query, message, assistant_storage, assistant_id)
+    if profile is None:
+        return
+    if raw_value == "default":
+        value: int | None = None
+    else:
+        try:
+            value = int(raw_value)
+        except ValueError:
+            await query.answer("Некорректное значение", show_alert=True)
+            return
+    try:
+        updated = profile.validated_update({"history_length": value})
+        await assistant_storage.save_assistant(message.chat.id, updated)
+    except ValidationError:
+        await query.answer("Некорректное значение", show_alert=True)
+        return
+    except AssistantStorageError as exc:
+        await query.answer(exc.message, show_alert=True)
+        return
+    await query.answer("История обновлена")
+    text, markup = screens._model_picker_parts(updated, assistant, "chat")
     await R._edit_or_answer(query, text, markup)
 
 

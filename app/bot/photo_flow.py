@@ -1012,7 +1012,7 @@ async def _remember_pair(turn: Any, topic_id: str, user_text: str, answer: str) 
         profile = await R._active_profile(chat_id, turn.assistant_storage)
     except Exception:
         return
-    limit = storage.max_length
+    limit = M._history_limit(profile)
     try:
         await storage.append_messages(
             chat_id,
